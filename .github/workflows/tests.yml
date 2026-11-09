@@ -1,0 +1,37 @@
+name: Portable baseline
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install '.[build,dev]'
+      - run: python tests/run.py portable
+      - run: python tests/check_evaluation.py
+      - run: python tests/check_http.py
+      - run: python tests/check_collections.py
+      - run: python tests/check_catalog.py
+      - run: python -m unittest discover -s tests -p 'test_citation_neighborhood.py' -v
+      - run: python -m unittest discover -s tests -p 'test_project_library.py' -v
+      - run: python tests/check_install.py
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install '.[build,dev]'
+      - run: docker build -t istopmm-evidence:ci .
+      - run: python tests/check_container.py --engine docker --image istopmm-evidence:ci

@@ -1,0 +1,12 @@
+**
+!Dockerfile
+!pyproject.toml
+!README.md
+!src/
+!src/**
+!tools/
+!tools/*.py
+!deploy/
+!deploy/runtime-requirements.txt
+**/__pycache__/**
+**/*.pyc

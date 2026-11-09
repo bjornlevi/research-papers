@@ -1,0 +1,29 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Licensed sources, extracted full text, rendered pages, and local provenance.
+/papers/**
+!/papers/supplements/
+/papers/supplements/**
+!/papers/supplements/README.md
+/evidence/**
+!/evidence/README.md
+!/evidence/knowledge/
+/evidence/knowledge/**
+!/evidence/knowledge/README.md
+
+# Local credentials, runtime state, and deployment data.
+.env
+.env.*
+!.env.example
+.mcp.json
+/releases/
+/docs/titles/
+/docs/titles-comparison.csv
+/dist/
+/build/
+*.egg-info/
+
+# Machine-local make settings (e.g. LAN_HOST).
+/local.mk

@@ -1,0 +1,219 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:istopmm:evidence:contract:2",
+  "$defs": {
+    "id": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "\\S"},
+    "text": {"type": "string", "maxLength": 4096},
+    "quote": {"type": "string", "maxLength": 2048},
+    "caveats": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/text"}},
+    "hash": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$"},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10},
+    "offset": {"type": "integer", "minimum": 0, "maximum": 1000000, "default": 0},
+    "nullableNumber": {"type": ["number", "null"]},
+    "interval": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}}
+      ]
+    },
+    "locator": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "pdf_page"],
+          "properties": {
+            "kind": {"const": "pdf"},
+            "pdf_page": {"type": "integer", "minimum": 1},
+            "section": {"$ref": "#/$defs/text"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "body_element"],
+          "properties": {
+            "kind": {"enum": ["word_paragraph", "word_table"]},
+            "body_element": {"type": "integer", "minimum": 1},
+            "table_id": {"$ref": "#/$defs/id"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "package_member"],
+          "properties": {
+            "kind": {"const": "word_package"},
+            "package_member": {
+              "type": "string",
+              "pattern": "^word/(header[0-9]+|footer[0-9]+|footnotes|endnotes|comments)\\.xml$",
+              "maxLength": 256
+            }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "worksheet", "row"],
+          "properties": {
+            "kind": {"const": "worksheet"},
+            "worksheet": {"$ref": "#/$defs/id"},
+            "row": {"type": "integer", "minimum": 1},
+            "cell_range": {"$ref": "#/$defs/id"}
+          }
+        }
+      ]
+    },
+    "citation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_id", "doi", "source_sha256", "locator", "source_url", "provenance", "availability"],
+      "properties": {
+        "source_id": {"$ref": "#/$defs/id"},
+        "doi": {"$ref": "#/$defs/id"},
+        "source_sha256": {"$ref": "#/$defs/hash"},
+        "locator": {"$ref": "#/$defs/locator"},
+        "source_url": {"type": ["string", "null"], "maxLength": 2048, "pattern": "^https?://\\S+$"},
+        "provenance": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "availability": {"enum": ["authorized", "metadata_only", "unavailable"]}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["id", "citation", "verification_status", "human_verification", "caveats"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "citation": {"$ref": "#/$defs/citation"},
+        "verification_status": {"enum": ["machine_extracted", "source_checked_by_ai", "source_checked_by_human", "not_reviewed"]},
+        "human_verification": {"enum": ["reviewed", "not_reviewed"]},
+        "caveats": {"$ref": "#/$defs/caveats"}
+      },
+      "if": {"properties": {"verification_status": {"const": "source_checked_by_human"}}},
+      "then": {"properties": {"human_verification": {"const": "reviewed"}}}
+    },
+    "number": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "label", "value", "reported_value", "measure", "unit", "numerator", "denominator", "ci_95", "reference_interval", "population", "adjustment", "context", "citation", "supporting_quote"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "label": {"$ref": "#/$defs/text"},
+        "value": {"$ref": "#/$defs/nullableNumber"},
+        "reported_value": {"$ref": "#/$defs/text"},
+        "measure": {"$ref": "#/$defs/id"},
+        "unit": {"$ref": "#/$defs/id"},
+        "numerator": {"type": ["integer", "null"], "minimum": 0},
+        "denominator": {"type": ["integer", "null"], "minimum": 1},
+        "ci_95": {"$ref": "#/$defs/interval"},
+        "reference_interval": {"$ref": "#/$defs/interval"},
+        "population": {"$ref": "#/$defs/text"},
+        "adjustment": {"type": ["string", "null"], "maxLength": 4096},
+        "context": {"type": ["string", "null"], "maxLength": 4096},
+        "citation": {"$ref": "#/$defs/citation"},
+        "supporting_quote": {"$ref": "#/$defs/quote"}
+      }
+    },
+    "hit": {
+      "allOf": [{"$ref": "#/$defs/evidence"}],
+      "type": "object",
+      "properties": {
+        "snippet": {"$ref": "#/$defs/quote"},
+        "source_issue_ids": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/id"}}
+      },
+      "required": ["snippet", "source_issue_ids"],
+      "unevaluatedProperties": false
+    },
+    "claim": {
+      "allOf": [{"$ref": "#/$defs/evidence"}],
+      "type": "object",
+      "properties": {
+        "statement": {"$ref": "#/$defs/text"},
+        "claim_kind": {"enum": ["observed_result", "secondary_evidence", "recommendation", "mechanistic_inference", "correction", "study_design"]},
+        "population": {"$ref": "#/$defs/text"},
+        "study_design": {"$ref": "#/$defs/text"},
+        "cohort_family": {"$ref": "#/$defs/text"},
+        "comparator": {"type": ["string", "null"], "maxLength": 4096},
+        "follow_up": {"type": ["string", "null"], "maxLength": 4096},
+        "adjustment": {"type": ["string", "null"], "maxLength": 4096},
+        "numbers": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/number"}},
+        "supporting_quote": {"$ref": "#/$defs/quote"},
+        "supporting_citations": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/citation"}},
+        "source_issue_ids": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/id"}}
+      },
+      "required": ["statement", "claim_kind", "population", "study_design", "cohort_family", "comparator", "follow_up", "adjustment", "numbers", "supporting_quote", "supporting_citations", "source_issue_ids"],
+      "unevaluatedProperties": false
+    },
+    "context": {
+      "allOf": [{"$ref": "#/$defs/evidence"}],
+      "type": "object",
+      "properties": {
+        "text": {"$ref": "#/$defs/quote"},
+        "truncated": {"type": "boolean"},
+        "source_issue_ids": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/id"}}
+      },
+      "required": ["text", "truncated", "source_issue_ids"],
+      "unevaluatedProperties": false
+    },
+    "table": {
+      "allOf": [{"$ref": "#/$defs/evidence"}],
+      "type": "object",
+      "properties": {
+        "title": {"$ref": "#/$defs/text"},
+        "headers": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"$ref": "#/$defs/text"}},
+        "units": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": ["string", "null"], "maxLength": 256}},
+        "rows": {"type": "array", "maxItems": 100, "items": {"type": "array", "maxItems": 100, "items": {"type": ["string", "number", "boolean", "null"], "maxLength": 4096}}},
+        "footnotes": {"$ref": "#/$defs/caveats"},
+        "truncated": {"type": "boolean"},
+        "next_offset": {"anyOf": [{"$ref": "#/$defs/offset"}, {"type": "null"}]}
+      },
+      "required": ["title", "headers", "units", "rows", "footnotes", "truncated", "next_offset"],
+      "unevaluatedProperties": false
+    },
+    "issue": {
+      "allOf": [{"$ref": "#/$defs/evidence"}],
+      "type": "object",
+      "properties": {
+        "status": {"enum": ["unresolved", "clarification", "resolved"]},
+        "category": {"enum": ["conflict", "arithmetic", "ambiguity", "definition_difference", "acquisition", "reuse_clarification"]},
+        "context": {"$ref": "#/$defs/text"},
+        "explanation": {"$ref": "#/$defs/text"},
+        "evidence": {
+          "type": "array", "minItems": 1, "maxItems": 100,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["quote", "citation"],
+            "properties": {"quote": {"$ref": "#/$defs/quote"}, "citation": {"$ref": "#/$defs/citation"}}
+          }
+        }
+      },
+      "required": ["status", "category", "context", "explanation", "evidence"],
+      "unevaluatedProperties": false
+    },
+    "relationship": {
+      "allOf": [{"$ref": "#/$defs/evidence"}],
+      "type": "object",
+      "properties": {
+        "target_id": {"$ref": "#/$defs/id"},
+        "relationship": {"enum": ["review_reuse", "shared_cohort", "independent_evidence", "correction", "related"]},
+        "explanation": {"$ref": "#/$defs/text"}
+      },
+      "required": ["target_id", "relationship", "explanation"],
+      "unevaluatedProperties": false
+    },
+    "status": {
+      "type": "object", "additionalProperties": false,
+      "required": ["paper_count", "claim_count", "content_unit_count", "coverage", "retrieval", "rights_profile", "source_assets_available"],
+      "properties": {
+        "paper_count": {"type": "integer", "minimum": 0},
+        "claim_count": {"type": "integer", "minimum": 0},
+        "content_unit_count": {"type": "integer", "minimum": 0},
+        "coverage": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "retrieval": {"const": "lexical_fts5"},
+        "rights_profile": {"$ref": "#/$defs/id"},
+        "source_assets_available": {"type": "boolean"}
+      }
+    },
+    "error": {
+      "type": "object", "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {"enum": ["invalid_input", "not_found", "unavailable", "permission_denied", "invalid_release", "response_too_large", "internal_error"]},
+        "message": {"type": "string", "minLength": 1, "maxLength": 4096}
+      }
+    }
+  }
+}

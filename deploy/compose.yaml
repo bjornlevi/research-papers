@@ -1,0 +1,30 @@
+services:
+  evidence:
+    image: ${ISTOPMM_IMAGE:?Set ISTOPMM_IMAGE to a verified image digest}
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 2
+    restart: unless-stopped
+    stop_grace_period: 10s
+    environment:
+      ISTOPMM_HEALTH_HOST: ${ISTOPMM_PUBLIC_HOST:?Set host including port if nondefault}
+    command:
+      - --host
+      - 0.0.0.0
+      - --behind-tls-proxy
+      - --base-url
+      - https://${ISTOPMM_PUBLIC_HOST}/mcp
+      - --store
+      - /data/store
+      - --allow-profile
+      - private_context
+      - --token-registry
+      - /run/credentials/tokens.json
+    ports: ["127.0.0.1:8000:8000"]
+    volumes:
+      - ${ISTOPMM_STORE:?Set authorized store directory}:/data/store:ro
+      - ${ISTOPMM_CREDENTIALS:?Set private credential directory}:/run/credentials:ro

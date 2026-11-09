@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77,<83"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "istopmm-evidence"
+version = "0.1.0"
+description = "Private, source-linked research evidence retrieval"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["Flask>=3.1,<4", "jsonschema>=4.23,<5", "mcp>=1.30,<1.31", "uvicorn>=0.35,<0.42"]
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3",
+]
+
+[project.optional-dependencies]
+build = ["PyMuPDF==1.26.7"]
+dev = ["build>=1.2,<2", "pip>=23"]
+
+[project.scripts]
+istopmm-evidence = "istopmm_evidence.cli:main"
+istopmm-build = "istopmm_evidence.build_cli:main"
+istopmm-release = "istopmm_evidence.release_cli:main"
+istopmm-mcp = "istopmm_evidence.server:main"
+istopmm-evaluate = "istopmm_evidence.evaluation:main"
+istopmm-check-cards = "istopmm_evidence.research_cards:main"
+istopmm-http = "istopmm_evidence.http_server:main"
+istopmm-http-token = "istopmm_evidence.http_auth:main"
+istopmm-collections = "istopmm_evidence.collections:main"
+istopmm-literature = "istopmm_evidence.literature:main"
+istopmm-web = "istopmm_evidence.web_server:main"
+istopmm-mcp-check = "istopmm_evidence.connection_check:main"
+research-project = "istopmm_evidence.build.project_library:main"
+
+[tool.setuptools]
+packages = ["istopmm_evidence", "istopmm_evidence.build"]
+package-dir = {istopmm_evidence = "src/istopmm_evidence", "istopmm_evidence.build" = "tools"}
+
+[tool.setuptools.package-data]
+istopmm_evidence = ["schemas/*.json"]
