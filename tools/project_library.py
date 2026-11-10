@@ -6,9 +6,11 @@ from contextlib import closing
 from copy import deepcopy
 import csv
 from datetime import datetime, timezone
+import io
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 
@@ -27,6 +29,101 @@ def store(root):
     return collections.CollectionStore(
         Path(root) / "registry", allowed_profiles=["private_context"],
         allowed_collections=["core"], defaults=["core"])
+
+
+def openalex_key_path(root):
+    return Path(root).absolute().parent / "openalex-api-key"
+
+
+def save_openalex_key(root, key):
+    key = key.strip()
+    if not key or len(key) > 512 or not key.isascii() or any(character.isspace() for character in key):
+        raise ValueError("Enter a nonempty OpenAlex API key without whitespace (maximum 512 characters)")
+    path = openalex_key_path(root)
+    if path.parent.resolve() != path.parent or path.is_symlink():
+        raise ValueError("OpenAlex API key path cannot contain symlinks")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".openalex-key-")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(key + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def metadata_collections(root):
+    registry = Path(root) / "registry"
+    if not (registry / "active.json").exists():
+        return []
+    current = store(root).current()
+    return [entry["id"] for entry in current.document["collections"] if entry.get("kind") == "catalog"]
+
+
+def configure_metadata(root, *, progress=None):
+    root = Path(root)
+    if progress:
+        progress("Reading saved discovery searches")
+    with literature_update.writer_lock(root):
+        project = load(root)
+        registry = store(root)
+        if not (root / "registry/active.json").exists():
+            raise ValueError("Attach at least one core PDF before configuring the metadata catalog")
+        current = registry.current()
+        discovery = root / "discovery"
+        if discovery.resolve() != discovery.absolute():
+            raise ValueError("Discovery directory cannot contain a symlinked path")
+        graphs = []
+        for folder in sorted(discovery.iterdir()) if discovery.exists() else []:
+            if (not folder.is_dir() or folder.is_symlink() or len(folder.name) != 32
+                    or any(c not in "0123456789abcdef" for c in folder.name)
+                    or not (folder / "job.json").is_file()):
+                continue
+            job = releases.read_json(releases.safe_file(folder, "job.json").read_bytes())
+            if job["status"] == "complete":
+                graphs.append(releases.read_json(releases.safe_file(folder, "neighborhood.json").read_bytes()))
+        if not graphs:
+            raise ValueError("Complete a Find related papers search before configuring the metadata catalog")
+        graph = {
+            "schema_version": 1, "acquired_at": max(g["acquired_at"] for g in graphs),
+            "scope": "Saved project reference/citation searches: " + "; ".join(sorted({g["scope"] for g in graphs})),
+            "limitations": sorted({text for g in graphs for text in g["limitations"]}),
+            "seeds": [seed for g in graphs for seed in g["seeds"]],
+            "nodes": {}, "edges": [edge for g in graphs for edge in g["edges"]],
+            "unresolved": [item for g in graphs for item in g["unresolved"]],
+            "resolution_issues": [item for g in graphs for item in g["resolution_issues"]],
+        }
+        for saved in graphs:
+            for key, node in saved["nodes"].items():
+                merged = graph["nodes"].setdefault(key, deepcopy(node))
+                for source in node["sources"]:
+                    if source not in merged["sources"]:
+                        merged["sources"].append(source)
+        if progress:
+            progress(f"Building catalog from {len(graphs)} searches and {len(graph['nodes'])} provider records")
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            collections.atomic_json(output, "neighborhood.json", graph)
+            report = citation_neighborhood.publish_metadata(output, project_scope=True)
+            if progress:
+                progress("Validating and installing the catalog")
+            from istopmm_evidence import catalog
+            release_id = catalog.install(root / "registry", output / "catalog-001.sqlite")
+        document = deepcopy(current.document)
+        document["collections"] = [entry for entry in document["collections"] if entry["id"] != "metadata"]
+        now = datetime.now(timezone.utc)
+        document["collections"].append({
+            "id": "metadata", "kind": "catalog", "title": project["name"] + " publication metadata",
+            "version": release_id[:16], "updated_at": now.date().isoformat(),
+            "coverage": "Saved provider-indexed references and citations; coverage may be incomplete.",
+            "release_id": release_id, "publications": {},
+        })
+        if progress:
+            progress("Activating the updated metadata catalog")
+        registry.publish(document)
+        return {"searches": len(graphs), "catalog_id": report["catalog_id"]}
 
 
 def write_text_views(root, bundle):
@@ -69,14 +166,33 @@ def validated_papers(rows, existing=None):
 
 def read_csv(path):
     with Path(path).open(newline="", encoding="utf-8-sig") as stream:
-        reader = csv.DictReader(stream)
-        if not reader.fieldnames or not {"doi", "title"} <= set(reader.fieldnames):
-            raise ValueError("CSV must have doi and title columns")
-        return list(reader)
+        return read_csv_stream(stream)
+
+
+def read_csv_bytes(data):
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as error:
+        raise ValueError("CSV must be UTF-8 encoded") from error
+    return read_csv_stream(io.StringIO(text, newline=""))
+
+
+def read_csv_stream(stream):
+    reader = csv.DictReader(stream)
+    if not reader.fieldnames or not {"doi", "title"} <= set(reader.fieldnames):
+        raise ValueError("CSV must have doi and title columns")
+    return list(reader)
 
 
 def read_manifest(path):
-    document = literature_ingest.read(path)
+    return read_manifest_data(literature_ingest.read(path))
+
+
+def read_manifest_bytes(data):
+    return read_manifest_data(releases.read_json(data))
+
+
+def read_manifest_data(document):
     if (not isinstance(document, dict) or set(document) != {"schema_version", "papers"}
             or type(document["schema_version"]) is not int or document["schema_version"] != 1
             or not isinstance(document["papers"], list)):
@@ -110,6 +226,20 @@ def initialize(root, name, authorization, rows=None):
     papers = validated_papers(rows)[0] if rows is not None else {}
     collections.atomic_json(root, "project.json", {
         "schema_version": 1, "name": name.strip(), "authorization": authorization.strip(), "papers": papers})
+
+
+def reset(root):
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("Project root is missing or is a symlink")
+    resolved = root.resolve()
+    if resolved != root.absolute():
+        raise ValueError("Refusing to reset a project root containing a symlinked path")
+    cwd = Path.cwd().resolve()
+    if resolved == Path(resolved.anchor) or resolved == cwd or cwd.is_relative_to(resolved):
+        raise ValueError("Refusing to reset a filesystem root or an ancestor of the working directory")
+    load(root)
+    shutil.rmtree(root)
 
 
 def register(root, rows):
@@ -197,7 +327,9 @@ def attach(root, doi, pdf, *, identity_confirmed, license=None):
         evidence_id = releases.export(bundle, destination, profile="private_context", authorization=grants)
         installed = registry.releases.install(destination)
         version = "core-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-        document = {"schema_version": 1, "collections": [{
+        document = {"schema_version": 1, "collections": [
+            *([deepcopy(entry) for entry in current.document["collections"] if entry["id"] != "core"]
+              if current else []), {
             "id": "core", "title": project["name"], "version": version,
             "updated_at": now[:10], "coverage": "Operator-selected core papers; not exhaustively reviewed.",
             "release_id": installed, "publications": {},
@@ -266,7 +398,7 @@ def export_citations(output):
     return target
 
 
-def discover(root, output):
+def discover(root, output, *, directions=None):
     with literature_update.writer_lock(root):
         project = load(root)
         rows = [{"number": str(index), "doi": doi, "title": paper["title"], "filename": ""}
@@ -287,9 +419,19 @@ def discover(root, output):
             writer = csv.DictWriter(stream, fieldnames=["number", "doi", "title", "filename"])
             writer.writeheader()
             writer.writerows(rows)
-    with closing(literature.MetadataClient()) as client:
+    key_path = openalex_key_path(root)
+    client_options = {}
+    if key_path.exists() or key_path.is_symlink():
+        if key_path.is_symlink() or key_path.stat().st_mode & 0o077:
+            raise ValueError("OpenAlex API key file must be private (chmod 600) and not a symlink")
+        key = key_path.read_text(encoding="utf-8").strip()
+        if not key or any(character.isspace() for character in key):
+            raise ValueError("OpenAlex API key file must contain one nonempty key")
+        client_options["openalex_api_key"] = key
+    with closing(literature.MetadataClient(**client_options)) as client:
         graph = citation_neighborhood.discover(
-            output, manifest, citation_neighborhood.CachedAPI(output / "responses", client), project_scope=True)
+            output, manifest, citation_neighborhood.CachedAPI(output / "responses", client), project_scope=True,
+            **({"directions": directions} if directions is not None else {}))
     csv_path = export_citations(output)
     failures = sum(any(provider["status"] not in {"complete_indexed_neighborhood", "complete_deposited_references"}
                        for provider in seed["providers"].values()) for seed in graph["seeds"])

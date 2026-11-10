@@ -439,6 +439,10 @@ class CollectionStore:
     def current(self):
         return self.load(self._state()["active"])
 
+    def clear_cache(self):
+        with self._lock:
+            self._cached = None
+
     def call(self, tool, arguments):
         selected = contracts.request(tool, arguments)
         snapshot = self.load(selected["snapshot_id"]) if "snapshot_id" in selected else self.current()

@@ -10,6 +10,7 @@ import hmac
 from html import escape
 from importlib.metadata import version
 import json
+import re
 import secrets
 import shlex
 from pathlib import Path
@@ -20,31 +21,130 @@ import time
 from urllib.parse import quote, urlencode, urlsplit
 
 from jsonschema import ValidationError
-from flask import Flask, Response, jsonify, redirect, request
+from flask import Flask, Response, has_request_context, jsonify, redirect, request
 
-from . import __version__, catalog, collections, contracts, library_api, quality, releases, retrieval
+from . import __version__, catalog, collections, contracts, library_api, literature, quality, releases, retrieval
 from .http_auth import resource_url
 from .server import DESCRIPTIONS, diagnostic
 
 
+NAVIGATION = (
+    ("Research", (("/", "Overview"), ("/search", "Search evidence"), ("/discovery", "Find related papers"),
+                  ("/connect", "Connect your AI"))),
+    ("Library", (("/library", "Library &amp; download status"), ("/sources", "Sources available to AI"),
+                 ("/publications", "Publication metadata"), ("/coverage", "Discovery coverage &amp; gaps"))),
+    ("Manage", (("/quality", "Data quality"), ("/settings", "Project settings"))),
+)
+
+
 def page(title, body, *, reader_script=False):
+    current = request.path if has_request_context() else ""
+    groups = "".join(
+        f'<p class="nav-group">{group}</p>' + "".join(
+            f'<a href="{href}"' + (' aria-current="page"' if href == current else "") + f">{label}</a>"
+            for href, label in links)
+        for group, links in NAVIGATION)
+    quick_search = ("" if current == "/search" else
+                    '<form class="quick-search" method="get" action="/search" role="search">'
+                    '<label class="visually-hidden" for="quick-query">Search evidence</label>'
+                    '<input id="quick-query" name="query" type="search" placeholder="Search papers" required>'
+                    '<button type="submit" class="secondary">Go</button></form>')
     return Response(
         '<!doctype html><html lang="en"><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        '<meta name="color-scheme" content="light dark">'
         '<link rel="stylesheet" href="/style.css">'
         + ('<script src="/reader.js" defer></script>' if reader_script else "")
         + f'<title>{escape(title)} | Evidence</title>'
-        '<body><header><h1>Research Evidence</h1><nav><a href="/">Overview</a> | '
-        '<a href="/search">Search evidence</a> | '
-        '<a href="/connect">Connect your AI</a> | '
-        '<a href="/library">Library &amp; download status</a> | <a href="/sources">Sources available to AI</a> | <a href="/publications">Publication metadata</a> | '
-        '<a href="/coverage">Discovery coverage &amp; gaps</a> | <a href="/quality">Data quality</a></nav></header><main>'
-        f'<h2>{escape(title)}</h2>{body}</main></body></html>', mimetype="text/html")
+        '<body><a class="skip-link" href="#main">Skip to content</a>'
+        '<div class="shell"><header class="rail">'
+        '<h1 class="brand"><a href="/">Research Evidence</a></h1>'
+        + quick_search + f'<nav class="sidenav" aria-label="Main">{groups}</nav></header>'
+        f'<div class="content"><main id="main"><h2>{escape(title)}</h2>{body}</main>'
+        '<footer class="site-footer">Local, read-only evidence library. Original files are never served; '
+        "machine extraction is not scientific validation.</footer></div></div></body></html>", mimetype="text/html")
+
+
+def status_tone(label):
+    """Visual tone for a status label; the label text itself is always shown."""
+    text = label.casefold()
+    if any(word in text for word in ("fail", "no licensed", "no native", "unsupported", "could not", "removed")):
+        return "bad"
+    if any(word in text for word in ("awaiting", "partial", "ocr", "review", "not extracted", "being added",
+                                      "waiting", "required")):
+        return "warn"
+    if any(word in text for word in ("extracted", "downloaded", "provided", "original", "added")):
+        return "ok"
+    return "neutral"
+
+
+def badge(label):
+    """Status pill around already-escaped label HTML."""
+    return f'<span class="badge {status_tone(label)}">{label}</span>'
+
+
+def metadata_value(value, *, project_scope=False):
+    if value is None:
+        return '<span class="metadata-empty">Unknown / not recorded</span>'
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, dict):
+        if not value:
+            return '<span class="metadata-empty">None recorded</span>'
+        return '<dl class="metadata-fields">' + "".join(
+            f"<dt>{escape(('core_library_overlap' if project_scope and key == 'istopmm_overlap' else key).replace('_', ' ').capitalize())}</dt>"
+            f"<dd>{metadata_value(item, project_scope=project_scope)}</dd>"
+            for key, item in value.items()
+            if not (project_scope and key in {"disease", "diseases"})) + "</dl>"
+    if isinstance(value, list):
+        if not value:
+            return '<span class="metadata-empty">None recorded</span>'
+        return '<ul class="metadata-list">' + "".join(
+            f"<li>{metadata_value(item, project_scope=project_scope)}</li>" for item in value) + "</ul>"
+    text = str(value)
+    if not text:
+        return '<span class="metadata-empty">Not recorded</span>'
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return escape(text)
+    if parsed.scheme in {"http", "https"} and parsed.hostname and not parsed.username and not parsed.password:
+        return f'<a href="{escape(text, quote=True)}">Open link ({escape(parsed.hostname)})</a>'
+    return escape(text)
+
+
+def discovery_titles(graph):
+    titles_by_doi = {
+        catalog.alias("doi", node["record"]["identifiers"]["doi"]): node["record"]["title"]
+        for node in graph["nodes"].values()
+        if node["record"]["title"] and node["record"]["identifiers"].get("doi")
+    }
+    return {
+        key: (node["record"]["title"]
+              or (titles_by_doi.get(catalog.alias("doi", node["record"]["identifiers"]["doi"]), "")
+                  if node["record"]["identifiers"].get("doi") else "")
+              or node.get("reference", {}).get("unstructured") or "")
+        for key, node in graph["nodes"].items()
+    }
+
+
+def highlight(text, query):
+    """Escape text and mark whole query words without touching HTML entities."""
+    words = sorted({word for word in query.split() if len(word) > 1}, key=len, reverse=True)
+    if not words:
+        return escape(text)
+    pattern = re.compile("|".join(re.escape(word) for word in words), re.IGNORECASE)
+    parts, last = [], 0
+    for match in pattern.finditer(text):
+        parts.append(escape(text[last:match.start()]) + "<mark>" + escape(match.group()) + "</mark>")
+        last = match.end()
+    return "".join(parts) + escape(text[last:])
 
 
 def copy_field(key, label, value, *, rows=5):
-    return (f'<label for="{key}">{label}</label><textarea id="{key}" readonly rows="{rows}">{escape(value)}</textarea>'
-            f'<button type="button" data-copy="{key}">Copy {label.lower()}</button>')
+    return (f'<div class="copy-field"><div class="copy-head"><label for="{key}">{label}</label>'
+            f'<button type="button" class="secondary" data-copy="{key}">Copy {label.lower()}</button></div>'
+            f'<textarea id="{key}" readonly rows="{rows}">{escape(value)}</textarea></div>')
 
 
 def publication_titles(current, identifiers):
@@ -95,6 +195,8 @@ QUALITY_LABELS = {
     "reported_defect": "Operator reported incorrect text",
     "original_included": "Original files included in candidate",
 }
+PROJECT_AUTHORIZATION_DEFAULT = "I am authorized to extract and retrieve these PDFs privately."
+PROJECT_UPLOAD_MAX_BYTES = 4 * 1024 * 1024
 
 
 def quality_location(locator):
@@ -326,28 +428,457 @@ def library_rows(data_root):
         not row["title"].strip(), row["title"].strip().casefold(), row["id"]))
 
 
+STYLESHEET = """
+:root{
+  --paper:#fff;--rail:#eef1f5;--raised:#f6f8fa;--ink:#1c232b;--muted:#596472;--line:#dce1e7;--line-strong:#b9c1cb;
+  --accent:#2350a0;--accent-hover:#183c7d;--accent-ink:#fff;--accent-soft:#e7edf8;
+  --ok:#2e6b36;--ok-soft:#e6f1e6;--warn:#8a5600;--warn-soft:#fbf0d6;--bad:#a8291c;--bad-soft:#fbe6e3;
+  --mark:#fde68a;--mark-ink:#1c232b;--code:#1e2630;--code-ink:#e6ebf0;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --serif:Charter,"Bitstream Charter","Sitka Text",Cambria,Georgia,serif;
+  --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root{
+  --paper:#16191d;--rail:#1d2126;--raised:#1f2328;--ink:#e3e7eb;--muted:#9aa5b1;--line:#2e343b;--line-strong:#46505b;
+  --accent:#8fb2f0;--accent-hover:#b4ccf6;--accent-ink:#0f1a2e;--accent-soft:#1f2b40;
+  --ok:#8ccf94;--ok-soft:#1c2e1f;--warn:#e9bf62;--warn-soft:#33290f;--bad:#f2968a;--bad-soft:#3a1d19;
+  --mark:#6b5a12;--mark-ink:#fff7d6;--code:#0f1215;--code-ink:#dfe5ea;
+}}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;font:15.5px/1.6 var(--sans);color:var(--ink);background:var(--paper);overflow-wrap:break-word}
+a{color:var(--accent);text-underline-offset:.15em;text-decoration-thickness:1px}
+a:hover{color:var(--accent-hover);text-decoration-thickness:2px}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.skip-link{position:absolute;left:1rem;top:-3rem;z-index:10;background:var(--accent);color:var(--accent-ink);padding:.5rem .9rem}
+.skip-link:focus{top:.75rem}
+
+/* Layout: a fixed side rail with the name, search and navigation; the page itself is plain paper */
+.shell{display:grid;grid-template-columns:15.5rem minmax(0,1fr);min-height:100vh}
+.rail{background:var(--rail);border-right:1px solid var(--line);padding:1.25rem 0 1.5rem;
+  position:sticky;top:0;height:100vh;overflow-y:auto;display:flex;flex-direction:column;gap:1rem}
+.brand{margin:0;padding:0 1.25rem;font-size:1rem;font-weight:700;letter-spacing:-.005em}
+.brand a{color:var(--ink);text-decoration:none}
+.quick-search{display:flex;gap:.3rem;margin:0;padding:0 1rem}
+.quick-search input{flex:1;min-width:0;margin:0;padding:.35rem .55rem;font-size:.92rem}
+.quick-search button{margin:0;padding:.3rem .6rem;font-size:.88rem}
+.sidenav{display:flex;flex-direction:column}
+.nav-group{margin:1rem 1.25rem .25rem;font-size:.8rem;font-weight:600;color:var(--muted)}
+.nav-group:first-child{margin-top:0}
+.sidenav a{display:block;padding:.3rem 1.25rem;color:var(--ink);text-decoration:none;font-size:.93rem;
+  border-left:3px solid transparent}
+.sidenav a:hover{background:color-mix(in srgb,var(--ink) 5%,transparent);color:var(--ink)}
+.sidenav a[aria-current="page"]{background:var(--paper);border-left-color:var(--accent);font-weight:600}
+.content{min-width:0;display:flex;flex-direction:column}
+main{flex:1;min-width:0;width:100%;max-width:68rem;padding:2rem 3rem 3rem}
+main>h2:first-child{margin:0 0 1.25rem;font-size:1.65rem;line-height:1.2;font-weight:700;letter-spacing:-.015em}
+main h3{font-size:1.12rem;line-height:1.35;font-weight:650;margin:2rem 0 .5rem}
+main h4{font-size:1rem;margin:1.25rem 0 .4rem}
+main>p,main>ul,main>ol,.panel>p,.panel>ul,main>dl{max-width:75ch}
+.site-footer{padding:1rem 3rem 1.5rem;color:var(--muted);font-size:.83rem;max-width:68rem}
+
+/* Sections: separated by a rule and space rather than boxed */
+article,.panel{margin:0;padding:1.25rem 0;border-top:1px solid var(--line)}
+article h3,.panel h3{margin-top:0}
+.panel+.panel,article+article{margin-top:0}
+.panel.danger{border:1px solid color-mix(in srgb,var(--bad) 40%,var(--line));border-left:4px solid var(--bad);
+  padding:1rem 1.25rem;margin-top:2rem;border-radius:4px}
+.panel.danger h3{color:var(--bad)}
+.two-col{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,22rem),1fr));gap:0 2.5rem}
+.callout,.alert,.note{padding:.7rem 1rem;max-width:75ch;border-radius:3px}
+.callout{background:var(--accent-soft);border-left:3px solid var(--accent)}
+.alert{background:var(--bad-soft);border-left:3px solid var(--bad)}
+.note{background:var(--raised);color:var(--muted);font-size:.92rem}
+.meta{color:var(--muted);font-size:.9rem;margin:.25rem 0}
+.lead{font-size:1.08rem;font-weight:600;margin:.2rem 0}
+.summary{margin-bottom:.5rem}
+.empty-state{padding:1.5rem 0;color:var(--muted);max-width:60ch}
+.result-count{color:var(--muted);font-size:.92rem}
+.result-count strong{color:var(--ink)}
+small{display:block;color:var(--muted);font-size:.82rem;overflow-wrap:anywhere}
+
+/* Overview */
+.hero-search{display:block;margin:0 0 1rem}
+.hero-search>label{display:block;font-weight:600;margin-bottom:.35rem}
+.input-row{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center}
+.input-row input[type="search"]{flex:1 1 18rem;font-size:1.05rem;padding:.55rem .75rem;margin:0;border-color:var(--line-strong)}
+.input-row label{display:inline-flex;align-items:center;gap:.4rem;color:var(--muted);font-size:.9rem}
+.input-row select,.input-row button{margin:0}
+.input-row button{padding:.55rem 1rem}
+.tally{font-size:1.05rem;margin:1.5rem 0 .2rem}
+.tally strong{font-variant-numeric:tabular-nums}
+.destinations{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:.45rem 1.5rem;margin:0;max-width:62rem}
+dl.destinations dt{font-weight:500}
+.destinations dd{margin:0;color:var(--muted)}
+.steps{padding-left:1.25rem}.steps li{margin:.4rem 0}
+.tool-list{display:grid;grid-template-columns:minmax(11rem,max-content) 1fr;gap:.45rem 1.25rem;margin:0}
+.tool-list dd{margin:0}
+
+/* Progress: a real sequence, so it keeps its numbers */
+.progress-steps{list-style:none;padding:0;margin:.75rem 0 1.25rem;display:flex;flex-wrap:wrap;gap:.35rem 1.5rem;counter-reset:step}
+.progress-steps li{counter-increment:step;display:flex;align-items:center;gap:.45rem;color:var(--muted);font-size:.92rem}
+.progress-steps li::before{content:counter(step);display:grid;place-items:center;width:1.4rem;height:1.4rem;border-radius:50%;
+  border:1px solid var(--line-strong);font-size:.78rem;font-weight:600}
+.progress-steps li.active{color:var(--ink);font-weight:600}
+.progress-steps li.active::before{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.progress-steps li.done::before{content:"\\2713";color:var(--ok);border-color:var(--ok)}
+
+/* Forms */
+input,select,textarea,button{font:inherit;color:inherit;max-width:100%}
+input,select,textarea{background:var(--paper);border:1px solid var(--line-strong);border-radius:4px;padding:.4rem .6rem;margin:.3rem 0}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var(--accent)}
+input[type="file"]{padding:.3rem;border-style:dashed}
+button,.button{display:inline-flex;align-items:center;gap:.4rem;background:var(--accent);color:var(--accent-ink);border:1px solid var(--accent);
+  border-radius:4px;padding:.4rem .9rem;margin:.3rem 0;font-weight:600;cursor:pointer;text-decoration:none;line-height:1.4}
+button:hover,.button:hover{background:var(--accent-hover);border-color:var(--accent-hover);color:var(--accent-ink);text-decoration:none}
+button.secondary,.button.secondary{background:var(--paper);color:var(--ink);border-color:var(--line-strong);font-weight:500}
+button.secondary:hover,.button.secondary:hover{background:var(--raised);border-color:var(--muted);color:var(--ink)}
+button.danger{background:var(--bad);border-color:var(--bad);color:#fff}
+button.danger:hover{filter:brightness(1.1)}
+form{margin:1rem 0}
+form[method="post"]{display:flex;flex-direction:column;align-items:flex-start;gap:.15rem;max-width:40rem}
+form[method="post"] label{font-weight:600;margin-top:.6rem}
+form[method="post"] input:not([type="file"]),form[method="post"] textarea{width:100%}
+.filters{display:flex;flex-wrap:wrap;align-items:flex-end;gap:.6rem 1rem;padding:0 0 1rem;border-bottom:1px solid var(--line)}
+.filters label{display:flex;flex-direction:column;font-size:.85rem;font-weight:600;color:var(--muted);gap:.1rem}
+.filters input,.filters select{margin:0;min-width:12rem;font-size:.95rem;color:var(--ink);font-weight:400}
+.filters button{margin:0}
+textarea{display:block;width:100%;font:.88rem/1.5 var(--mono);resize:vertical}
+.copy-field{margin:1rem 0;max-width:62rem}
+.copy-head{display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap}
+.copy-head label{font-weight:600}
+.copy-head button{padding:.2rem .65rem;font-size:.85rem}
+button.copied{background:var(--ok-soft);color:var(--ok);border-color:var(--ok)}
+#copy-status:empty{display:none}
+#copy-status{color:var(--muted);font-size:.9rem}
+
+/* Tables */
+.table-scroll{overflow-x:auto;margin:1rem 0}
+table{border-collapse:collapse;width:100%;font-size:.93rem}
+th,td{text-align:left;vertical-align:top;padding:.6rem .75rem;border-bottom:1px solid var(--line)}
+th:first-child,td:first-child{padding-left:0}
+th{font-size:.85rem;font-weight:600;color:var(--muted);white-space:nowrap;border-bottom:1px solid var(--line-strong)}
+tbody tr:hover td{background:var(--raised)}
+td>a:first-child{font-weight:600}
+.library-records{list-style:none;padding:0;margin:1rem 0;max-width:none;border-top:1px solid var(--line-strong)}
+.library-record{padding:1rem 0;min-width:0;border-bottom:1px solid var(--line)}
+.library-record h3{margin:0 0 .6rem;font-size:1.02rem;overflow-wrap:anywhere}
+.library-record dl{display:flex;flex-wrap:wrap;gap:.6rem 2rem;margin:0}
+.library-record dl>div{min-width:0;max-width:100%}
+.library-record dt{font-size:.82rem;color:var(--muted);font-weight:600}
+.library-record dd{margin:.15rem 0 0}
+.library-record code{overflow-wrap:anywhere;word-break:normal}
+.library-record .badge{white-space:normal}
+.library-record details{margin:.75rem 0 0;overflow-wrap:anywhere}
+
+/* Status labels */
+.badge{display:inline-block;padding:.05rem .45rem;border-radius:3px;font-size:.82rem;font-weight:600;line-height:1.55;
+  white-space:nowrap;background:var(--raised);color:var(--muted);border:1px solid var(--line)}
+.badge.ok{background:var(--ok-soft);color:var(--ok);border-color:color-mix(in srgb,var(--ok) 25%,transparent)}
+.badge.warn{background:var(--warn-soft);color:var(--warn);border-color:color-mix(in srgb,var(--warn) 25%,transparent)}
+.badge.bad{background:var(--bad-soft);color:var(--bad);border-color:color-mix(in srgb,var(--bad) 25%,transparent)}
+.chip{display:inline-block;color:var(--muted);font-size:.85rem;font-weight:600}
+
+/* Disclosure */
+details{margin:.5rem 0}
+summary{cursor:pointer;font-weight:600;list-style:none;display:flex;gap:.5rem;align-items:baseline}
+summary::-webkit-details-marker{display:none}
+summary::before{content:"";flex:none;width:.4rem;height:.4rem;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);
+  transform:rotate(-45deg) translateY(-.05rem);transition:transform .12s}
+details[open]>summary::before{transform:rotate(45deg) translateY(-.15rem)}
+summary:hover{color:var(--accent)}
+main>details,.notes{border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:.65rem 0;margin:1.25rem 0}
+main>details+details{border-top:0;margin-top:-1.25rem}
+.notes{color:var(--muted);font-size:.93rem}
+.notes summary{color:var(--ink)}
+.notes h3{color:var(--ink)}
+.source-entry{padding:0;margin:0;border-top:0;border-bottom:1px solid var(--line)}
+.source-entry summary{padding:.7rem 0;overflow-wrap:anywhere}
+.source-entry details{margin:0}
+.source-entry dl{padding:.25rem 0 .75rem 1rem}
+td>details{margin:0}
+td details.provide{margin-top:0}
+td details.provide summary{font-size:.85rem;color:var(--accent)}
+td details.provide form{display:flex;flex-direction:column;gap:.25rem;margin:.5rem 0;padding:.75rem;background:var(--raised);
+  border:1px solid var(--line);border-radius:4px;min-width:16rem}
+td details.provide label{display:flex;flex-direction:column;font-size:.82rem;font-weight:600;margin:0}
+
+/* Definition lists */
+article dl{display:grid;grid-template-columns:minmax(9rem,max-content) minmax(0,1fr);gap:.3rem 1.25rem;margin:.5rem 0}
+article dt{color:var(--muted);font-size:.88rem;font-weight:600}
+article dd{margin:0;overflow-wrap:anywhere}
+.metadata-list{margin:0;padding-left:1.25rem}
+.metadata-list>li+li{margin-top:.65rem}
+article dl.metadata-fields{display:block;margin:0;padding:.65rem .85rem;
+  border-left:2px solid var(--line);background:var(--surface-2);border-radius:4px}
+.metadata-fields>dt:not(:first-child){margin-top:.5rem}
+.metadata-empty{color:var(--muted)}
+main>details dl dt,dl:not(.tool-list) dt{font-weight:600}
+
+/* Text from the papers is set in a reading serif; everything else stays in the interface face */
+code{font:.85em/1.4 var(--mono);background:var(--raised);border:1px solid var(--line);border-radius:3px;padding:.05em .3em;overflow-wrap:anywhere}
+pre{font:.85rem/1.55 var(--mono);background:var(--code);color:var(--code-ink);border-radius:4px;padding:.85rem 1rem;
+  white-space:pre-wrap;overflow-wrap:anywhere;max-width:62rem}
+pre.reading{font:1.06rem/1.75 var(--serif);background:none;color:var(--ink);border-left:3px solid var(--line-strong);
+  border-radius:0;padding:.25rem 0 .25rem 1.5rem;max-width:70ch}
+blockquote{margin:.6rem 0;padding:.1rem 0 .1rem 1rem;border-left:3px solid var(--line-strong);
+  white-space:pre-wrap;overflow-wrap:anywhere;font:1.02rem/1.65 var(--serif);max-width:none}
+mark{background:var(--mark);color:var(--mark-ink);padding:0 .08em;border-radius:1px}
+.hit-title{font-size:1.05rem;margin-bottom:.15rem}
+.hit-title+.meta code{margin-left:.5rem}
+.hit-title+.meta .chip{margin-right:.4rem}
+.reader-head{margin-bottom:.75rem}
+.reader-head h3{margin:0 0 .25rem;font-size:1.35rem}
+.actions{display:flex;flex-wrap:wrap;gap:.5rem;margin:.6rem 0 0}
+.actions .button{margin:0}
+
+/* Pagination */
+.pager,main>nav{display:flex;flex-wrap:wrap;gap:.5rem;margin:1.25rem 0}
+.pager:empty{display:none}
+.pager a,main>nav a{display:inline-block;padding:.35rem .85rem;border:1px solid var(--line-strong);border-radius:4px;
+  text-decoration:none;font-weight:500;font-size:.92rem;color:var(--ink)}
+.pager a:hover,main>nav a:hover{background:var(--raised);border-color:var(--muted);color:var(--ink)}
+
+/* Data quality */
+.quality-status{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem .75rem;margin:0 0 1.25rem;color:var(--muted)}
+.tabs{display:flex;gap:1.5rem;margin:0 0 1rem;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.tabs a{padding:.4rem 0;margin-bottom:-1px;border-bottom:2px solid transparent;text-decoration:none;color:var(--muted);font-weight:600}
+.tabs a:hover{color:var(--ink)}
+.tabs a[aria-current="page"]{color:var(--ink);border-bottom-color:var(--accent)}
+.kind-chips{list-style:none;padding:0;margin:0 0 .5rem;display:flex;flex-wrap:wrap;gap:.4rem;max-width:none}
+.kind-chip{display:inline-block;padding:.15rem .6rem;border:1px solid var(--line-strong);border-radius:4px;
+  color:var(--ink);text-decoration:none;font-size:.88rem}
+.kind-chip:hover{background:var(--raised);color:var(--ink)}
+.kind-chip.active{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
+.finding-group{margin:2rem 0}
+.group-head{display:flex;align-items:baseline;gap:.75rem;flex-wrap:wrap}
+.group-head h3{margin:0}
+.finding-group>.meta{margin:.3rem 0 .6rem;max-width:75ch}
+.finding-list{list-style:none;padding:0;margin:0;border-top:1px solid var(--line-strong);max-width:none}
+.finding-list li{border-bottom:1px solid var(--line)}
+.finding-row{display:flex;align-items:center;gap:1rem;padding:.6rem .25rem;text-decoration:none;color:var(--ink)}
+.finding-row::after{content:"";flex:none;width:.4rem;height:.4rem;border-right:2px solid var(--muted);
+  border-top:2px solid var(--muted);transform:rotate(45deg);margin-right:.25rem}
+.finding-row:hover{background:var(--raised);color:var(--ink)}
+.finding-row:hover strong{color:var(--accent);text-decoration:underline}
+.finding-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:.1rem}
+.finding-main strong{font-weight:600;overflow-wrap:anywhere}
+.finding-main .meta{margin:0}
+.back-link{margin:0 0 .5rem}
+.back-link a{text-decoration:none;font-weight:600}
+
+@media (max-width:900px){
+  .shell{display:block}
+  .rail{position:static;height:auto;padding:.85rem 0 .5rem;gap:.6rem;border-right:0;border-bottom:1px solid var(--line)}
+  .brand{padding:0 1rem}
+  .sidenav{flex-direction:row;overflow-x:auto;padding:0 1rem .25rem;gap:.25rem;scrollbar-width:thin}
+  .nav-group{display:none}
+  .sidenav a{white-space:nowrap;border:1px solid var(--line);border-radius:4px;background:var(--paper);font-size:.88rem;padding:.25rem .6rem}
+  .sidenav a[aria-current="page"]{border-color:var(--accent);color:var(--accent)}
+  main{padding:1.25rem 1rem 2rem}
+  .site-footer{padding:1rem}
+  main>h2:first-child{font-size:1.4rem}
+  .panel.danger{padding:1rem}
+  article dl,.tool-list,.destinations{grid-template-columns:1fr;gap:.1rem}
+  article dd,.tool-list dd,.destinations dd{margin-bottom:.55rem}
+  .filters input,.filters select{min-width:0;width:100%}
+  .filters label{flex:1 1 100%}
+  pre.reading{padding-left:1rem}
+  th:first-child,td:first-child{padding-left:.5rem}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+@media print{
+  .rail,.site-footer,.pager,button{display:none!important}
+  .shell{display:block}body{background:#fff}
+}
+"""
+
+READER_SCRIPT = """
+for (const button of document.querySelectorAll("[data-copy]")) {
+  const label = button.textContent;
+  button.addEventListener("click", async () => {
+    const field = document.getElementById(button.dataset.copy);
+    const status = document.getElementById("copy-status");
+    try {
+      await navigator.clipboard.writeText(field.value);
+      status.textContent = "Copied.";
+      button.textContent = "Copied";
+      button.classList.add("copied");
+      setTimeout(() => { button.textContent = label; button.classList.remove("copied"); }, 1800);
+    } catch (error) {
+      field.focus(); field.select();
+      status.textContent = "Clipboard unavailable. Text selected: use Ctrl+C or Command+C to copy.";
+    }
+  });
+}
+"""
+
+
 def create_app(*, release=None, registry=None, profiles, allowed_collections=None,
                default_collections=None, port=8080, mcp_url="http://127.0.0.1:8000/mcp",
-               data_root=None, quality_root=None):
+               data_root=None, quality_root=None, project_root=None, pdf_data_root=None):
     if not 1 <= port <= 65535:
         raise ValueError("Invalid website port")
     mcp_url = resource_url(mcp_url)
     if bool(release) == bool(registry):
         raise ValueError("Select exactly one release or collection registry")
+    if project_root and not registry:
+        raise ValueError("Project settings require a collection registry")
     if not registry and (allowed_collections or default_collections):
         raise ValueError("Collection selection requires a registry")
+    project_root = Path(project_root).absolute() if project_root else None
+    pdf_data_root = Path(pdf_data_root or "releases/pdf-data").absolute()
+    if project_root and project_root.resolve() != project_root:
+        raise ValueError("Project root cannot contain a symlinked path")
+    if project_root and Path(registry).absolute() != project_root / "registry":
+        raise ValueError("Project settings must use that project's registry")
     store = (collections.CollectionStore(registry, allowed_profiles=profiles,
                                         allowed_collections=allowed_collections or [],
                                         defaults=default_collections) if registry else None)
     pinned = None if store else releases.validate(release, allowed_profiles=profiles)
-    if store:
+    if store and not project_root:
         store.current()
-    data_root = Path(data_root) if data_root else (Path(registry).absolute().parent.parent if registry else None)
+    data_root = (Path(data_root) if data_root else
+                 project_root or (Path(registry).absolute().parent.parent if registry else None))
     quality_root = Path(quality_root) if quality_root else (data_root or Path.cwd()) / "releases/data-quality"
 
     provide_token = secrets.token_urlsafe(32)
     provider_state = {"thread": None, "again": False}
     provider_lock = threading.Lock()
+    discovery_lock = threading.Lock()
+    discovery_state = {"thread": None, "run": None}
+    metadata_state = {"thread": None}
+
+    def metadata_running():
+        return metadata_state["thread"] is not None and metadata_state["thread"].is_alive()
+
+    def discovery_root():
+        root = project_root / "discovery"
+        if root.resolve() != root:
+            raise ValueError("Discovery directory cannot contain a symlinked path")
+        return root
+
+    def discovery_page():
+        if not project_root or not (project_root / "project.json").is_file():
+            return page("Find related papers",
+                        '<p><a href="/settings">Initialize a project</a> and register core papers first.</p>')
+        if set(request.args) - {"run", "offset"}:
+            raise ValueError("Unknown discovery parameter")
+        body = (
+            "<p>Discover metadata for papers referenced by your core library, or papers that cite it. "
+            "References use OpenAlex and Crossref; citing papers use OpenAlex. These are provider-indexed "
+            "relationships, not an exhaustive bibliography or proof of scientific support. "
+            "No PDFs are downloaded and your core library is not changed.</p>"
+            '<form method="post" action="/discovery">'
+            f'<input type="hidden" name="token" value="{provide_token}">'
+            '<button name="direction" value="background">Find referenced papers</button>'
+            '<button name="direction" value="impact">Find papers that reference my core library</button>'
+            '</form>')
+        root = discovery_root()
+        jobs = {p.name: releases.read_json(releases.safe_file(p, "job.json").read_bytes())
+                for p in root.iterdir()
+                if p.is_dir() and not p.is_symlink() and len(p.name) == 32
+                and all(c in "0123456789abcdef" for c in p.name) and (p / "job.json").is_file()} if root.exists() else {}
+        runs = sorted(jobs, key=lambda name: (jobs[name]["started_at"], name), reverse=True)
+        run = request.args.get("run", runs[0] if runs else "")
+        if run:
+            if len(run) != 32 or any(c not in "0123456789abcdef" for c in run):
+                raise ValueError("Invalid discovery run")
+            folder = root / run
+            job = releases.read_json(releases.safe_file(folder, "job.json").read_bytes())
+            body += (f"<h3>{escape(job['label'])}</h3>"
+                     f"<p>Started: {escape(job['started_at'])}. Status: <strong>{escape(job['status'])}</strong>.</p>")
+            if job["status"] == "running":
+                thread = discovery_state["thread"]
+                if discovery_state["run"] != run or thread is None or not thread.is_alive():
+                    body += "<p>The process was interrupted. Start a new search; partial provider responses remain on disk.</p>"
+                else:
+                    body += '<p>Discovery is running. <a href="/discovery?run=' + run + '">Refresh progress</a>.</p>'
+                progress = folder / "discovery-progress.json"
+                if progress.is_file():
+                    body += "<pre>" + escape(json.dumps(releases.read_json(
+                        releases.safe_file(folder, progress.name).read_bytes()), indent=2)) + "</pre>"
+            elif job["status"] == "failed":
+                body += f'<p role="alert">{escape(job["error"])}</p>'
+            else:
+                report = job["report"]
+                body += (f"<p>{report['edges']} provider relationships; "
+                         f"{report['unresolved']} unresolved references; "
+                         f"{report['seeds_with_provider_gaps']} core papers with provider gaps. "
+                         "Results are provider occurrences, not deduplicated publications.</p>")
+                graph = releases.read_json(releases.safe_file(folder, "neighborhood.json").read_bytes())
+                titles = discovery_titles(graph)
+                body += "<h4>Coverage and limitations</h4><pre>" + escape(
+                    json.dumps({"limitations": graph["limitations"], "seeds": graph["seeds"]}, indent=2)) + "</pre>"
+                offset = int(request.args.get("offset", "0"))
+                if not 0 <= offset <= 1000000:
+                    raise ValueError("Invalid discovery offset")
+                edges = [edge for edge in graph["edges"] if edge["direction"] == job["direction"]]
+                body += "<table><thead><tr><th>Paper</th><th>DOI</th><th>Core paper DOI</th></tr></thead><tbody>"
+                for edge in edges[offset:offset + 50]:
+                    node = graph["nodes"][edge["target_provider_record"]]
+                    record = node["record"]
+                    title = titles[edge["target_provider_record"]] or "[Unresolved title]"
+                    doi = record["identifiers"].get("doi", "")
+                    body += (f"<tr><td>{escape(title)}</td><td>{escape(doi)}</td>"
+                             f"<td>{escape(edge['seed_doi'])}</td></tr>")
+                body += "</tbody></table>"
+                if not edges:
+                    body += "<p>No indexed relationships returned. Check provider gaps; this is not proof that none exist.</p>"
+                if offset:
+                    body += f'<a href="/discovery?run={run}&amp;offset={max(0, offset - 50)}">Previous</a> '
+                if offset + 50 < len(edges):
+                    body += f'<a href="/discovery?run={run}&amp;offset={offset + 50}">Next</a>'
+            body += f"<p>Saved locally: <code>{escape(str(folder))}</code>. Resetting the project deletes these results.</p>"
+        if runs:
+            body += "<h3>Saved searches</h3><ul>"
+            for name in runs[:20]:
+                job = jobs[name]
+                body += (f'<li><a href="/discovery?run={name}">{escape(job["started_at"])}: '
+                         f'{escape(job["label"])}</a> ({escape(job["status"])})</li>')
+            body += "</ul>"
+        return page("Find related papers", body)
+
+    def start_discovery():
+        if not project_root:
+            raise ValueError("Project discovery is not enabled")
+        if not hmac.compare_digest(request.form.get("token", ""), provide_token):
+            return Response("Discovery form expired; reload the page.", status=403, mimetype="text/plain")
+        direction = request.form.get("direction")
+        labels = {"background": "Find referenced papers",
+                  "impact": "Find papers that reference my core library"}
+        if direction not in labels:
+            raise ValueError("Invalid discovery direction")
+        from .build import project_library
+        with discovery_lock:
+            if metadata_running():
+                return Response("Wait for the metadata catalog update to finish.", status=409, mimetype="text/plain")
+            if not project_library.load(project_root)["papers"]:
+                raise ValueError("Register at least one core paper before discovery")
+            if discovery_state["thread"] and discovery_state["thread"].is_alive():
+                return Response("Discovery is already running; wait for it to finish.", status=409, mimetype="text/plain")
+            run = secrets.token_hex(16)
+            output = discovery_root() / run
+            job = {"direction": direction, "label": labels[direction], "status": "running",
+                   "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            collections.atomic_json(output, "job.json", job)
+
+            def work():
+                try:
+                    report = project_library.discover(project_root, output, directions=[direction])
+                    job.update(status="complete", report=report)
+                except (OSError, ValueError, KeyError, TypeError, sqlite3.Error,
+                        releases.ReleaseError, ValidationError, literature.DiscoveryError) as error:
+                    diagnostic("web_discovery_failed", exception_type=type(error).__name__)
+                    job.update(status="failed", error=str(error))
+                collections.atomic_json(output, "job.json", job)
+
+            thread = threading.Thread(target=work, daemon=True)
+            discovery_state["thread"] = thread
+            discovery_state["run"] = run
+            thread.start()
+        return redirect("/discovery?run=" + run, code=303)
 
     def snapshot(request):
         if store:
@@ -361,34 +892,55 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         return pinned
 
     def overview():
+        if project_root and not (project_root / "registry/active.json").is_file():
+            return redirect("/settings")
         current = snapshot(request)
         status = current.call("corpus_status", {})["result"]
-        counts = "".join(f"<li>{escape(key.replace('_', ' '))}: {status[key]}</li>"
-                         for key in ("paper_count", "claim_count", "content_unit_count"))
+        def amount(key, one, many):
+            return f"<strong>{status[key]:,}</strong> {one if status[key] == 1 else many}"
+        counts = (f"{amount('paper_count', 'paper', 'papers')}, "
+                  f"{amount('content_unit_count', 'searchable passage', 'searchable passages')} and "
+                  f"{amount('claim_count', 'structured claim', 'structured claims')}")
         tools = "".join(f"<dt><code>{escape(name)}</code></dt><dd>{escape(description)}</dd>"
                         for name, description in DESCRIPTIONS.items())
         visible = current.call("list_collections", {})["result"]["items"]
         memberships = "".join(
-            f"<li>{escape(item['title'])}: {escape(item['coverage'])}</li>" for item in visible)
+            f"<li><strong>{escape(item['title'])}</strong>: {escape(item['coverage'])}</li>" for item in visible)
+        destinations = (
+            ("/search", "Search evidence", "Find passages, read context and copy citations without AI."),
+            ("/connect", "Connect your AI", "MCP setup, verification and credential troubleshooting."),
+            ("/library", "Library &amp; download status",
+             "Papers found, download/extraction progress and impact rankings."),
+            ("/sources", "Sources available to AI",
+             "Exact source versions published for MCP search and page-context retrieval."),
+            ("/publications", "Publication metadata", "Bibliographic records, including sources not downloaded."),
+            ("/coverage", "Discovery coverage &amp; gaps",
+             "How the metadata catalog was assembled and its known limitations."),
+        )
+        cards = "".join(f'<dt><a href="{href}">{label}</a></dt><dd>{text}</dd>'
+                        for href, label, text in destinations)
+        health = mcp_url.removesuffix("/mcp")
         return page("Overview",
-                    f"<p>Application {escape(__version__)}; tool contract {contracts.SCHEMA_VERSION}.</p>"
-                    "<h3>Explore the project</h3><ul>"
-                    '<li><a href="/search">Search evidence</a>: find passages, read context and copy citations without AI.</li>'
-                    '<li><a href="/connect">Connect your AI</a>: MCP setup, verification and credential troubleshooting.</li>'
-                    '<li><a href="/library">Library &amp; download status</a>: '
-                    "papers found, download/extraction progress and impact rankings.</li>"
-                    '<li><a href="/sources">Sources available to AI</a>: '
-                    "exact source versions published for MCP search and page-context retrieval.</li>"
-                    '<li><a href="/publications">Publication metadata</a>: '
-                    "bibliographic records, including sources not downloaded.</li>"
-                    '<li><a href="/coverage">Discovery coverage &amp; gaps</a>: '
-                    "how the metadata catalog was assembled and its known limitations.</li></ul>"
-                    "<p>Found, downloaded, extracted, available to AI and scientifically reviewed "
+                    '<form class="hero-search" method="get" action="/search" role="search">'
+                    '<label for="overview-query">Search the retained text of your papers</label>'
+                    '<div class="input-row"><input id="overview-query" name="query" type="search" required '
+                    'placeholder="Words or phrase"><button type="submit">Search evidence</button></div></form>'
+                    f'<p class="tally">The library holds {counts}.</p>'
+                    f'<p class="meta">Snapshot <code>{escape(current.release_id)}</code>; '
+                    f"application {escape(__version__)}; tool contract {contracts.SCHEMA_VERSION}.</p>"
+                    f'<h3>Pages</h3><dl class="destinations">{cards}</dl>'
+                    '<p class="callout">Found, downloaded, extracted, available to AI and scientifically reviewed '
                     "are different states.</p>"
+                    f'<section class="panel"><h3>Configured evidence</h3><p>{escape(status["coverage"])}</p>'
+                    f"<ul>{memberships}</ul>"
+                    "<p>Local authorized evidence only, not all published knowledge. "
+                    "Metadata discovery does not imply full-text acquisition. "
+                    "Machine extraction is not scientific or human validation.</p>"
                     '<p><a href="/api/collections">Read-only library JSON API</a>: list evidence papers, '
                     "documents and page locations, retrieve text, or run keyword search without an AI model "
-                    "or MCP process. See docs/library-api.md for examples. Access is local to this machine.</p>"
-                    "<h3>MCP connection</h3>"
+                    "or MCP process. See docs/library-api.md for examples. Access is local to this machine.</p></section>"
+                    '<details class="notes"><summary>Connecting an AI client (MCP)</summary>'
+                    '<div class="two-col"><section><h3>MCP connection</h3>'
                     f"<p>Configured endpoint: <code>{escape(mcp_url)}</code></p>"
                     "<p>Streamable HTTP; bearer token required. Start separately with "
                     "<code>make mcp</code>. This website does not start or probe the MCP server "
@@ -399,12 +951,12 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     "<code>make reconnect</code> replaces this local connection with a fresh token; "
                     "<code>make disconnect</code> removes it and revokes its token. "
                     "These commands do not change papers, evidence or other MCP servers. "
-                    "Override <code>CLIENT_PROJECT</code> for another project.</p>"
-                    "<h3>Verify the running MCP server</h3>"
-                    "<ol><li>Start <code>make mcp</code> with the intended release/collection configuration.</li>"
+                    "Override <code>CLIENT_PROJECT</code> for another project.</p></section>"
+                    '<section><h3>Verify the running MCP server</h3>'
+                    '<ol class="steps"><li>Start <code>make mcp</code> with the intended release/collection configuration.</li>'
                     "<li>In another terminal check liveness and readiness:<pre>"
-                    f"{escape('curl --fail-with-body ' + mcp_url.removesuffix('/mcp') + '/healthz')}\n"
-                    f"{escape('curl --fail-with-body ' + mcp_url.removesuffix('/mcp') + '/readyz')}"
+                    f"{escape('curl --fail-with-body ' + health + '/healthz')}\n"
+                    f"{escape('curl --fail-with-body ' + health + '/readyz')}"
                     "</pre>Expected: alive and ready. These checks do not validate your client token.</li>"
                     "<li>Connect an MCP client using your current bearer token; list tools "
                     f"({len(DESCRIPTIONS)} in version {escape(__version__)}), call <code>list_collections</code>, then pin its snapshot "
@@ -412,17 +964,212 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     "and <code>list_publications</code> in a metadata catalog collection.</li>"
                     "<li>See <code>docs/verify-mcp.md</code> in the project for a copy-and-run SDK "
                     "check of the live endpoint. It needs no model provider and never prints the token.</li></ol>"
-                    "<p>Opening /mcp in a browser is not a protocol test. "
+                    '<p class="note">Opening /mcp in a browser is not a protocol test. '
                     "<code>make test-catalog</code> and <code>make test-http</code> launch separate "
                     "temporary servers; they do not check this running endpoint. "
-                    "401 usually means an expired/invalid token; connection refused means no listener.</p>"
-                    f"<h3>Configured evidence</h3><ul>{counts}</ul>"
-                    f"<p>Snapshot: <code>{escape(current.release_id)}</code></p>"
-                    f"<p>{escape(status['coverage'])}</p><ul>{memberships}</ul>"
-                    "<p>Local authorized evidence only, not all published knowledge. "
-                    "Metadata discovery does not imply full-text acquisition. "
-                    "Machine extraction is not scientific or human validation.</p>"
-                    f"<h3>Read-only tools</h3><dl>{tools}</dl>")
+                    "401 usually means an expired/invalid token; connection refused means no listener.</p></section></div>"
+                    f'<h3>Read-only tools</h3><dl class="tool-list">{tools}</dl></details>')
+
+    def available_project_pdfs():
+        if pdf_data_root.resolve() != pdf_data_root:
+            raise ValueError("PDF data folder cannot contain a symlinked path")
+        if not pdf_data_root.exists():
+            return {}
+        return {path.name: path for path in sorted(pdf_data_root.iterdir())
+                if path.suffix.casefold() == ".pdf" and not path.is_symlink() and path.is_file()}
+
+    def project_settings(error=None, status_code=200):
+        if not project_root:
+            response = page("Project settings", "<p>Project settings are not enabled for this website.</p>")
+            response.status_code = 404
+            return response
+        from .build import project_library
+        initialized = (project_root / "project.json").is_file()
+        body = ("<p>Manage the independent private project configured for this website. "
+                f"Project root: <code>{escape(str(project_root))}</code>.</p>")
+        if error:
+            body += f'<p role="alert" class="alert"><strong>Could not complete the request:</strong> {escape(error)}</p>'
+        if initialized:
+            status = project_library.status(project_root)
+            body += (f'<section class="panel"><h3>{escape(status["name"])}</h3>'
+                     f"<p>{len(status['papers'])} core papers registered. "
+                     f"Evidence snapshot: <code>{escape(status['snapshot'] or 'not yet created')}</code>.</p>")
+            awaiting = [item for item in status["papers"] if item["status"] == "awaiting_pdf"]
+            searchable = status["snapshot"] is not None
+            body += ('<ol class="progress-steps"><li class="done">Register core papers</li>'
+                     f'<li class="{"done" if not awaiting else "active"}">Attach PDFs</li>'
+                     f'<li class="{"active" if searchable and not awaiting else ""}">Search and connect AI</li></ol>')
+            pdfs = {}
+            if awaiting:
+                body += ('<p class="callout"><strong>Next step:</strong> '
+                         f"{len(awaiting)} of {len(status['papers'])} papers are awaiting a PDF. "
+                         "Select a matching PDF from the awaiting_pdf status in each paper's row.</p>")
+                pdfs = available_project_pdfs()
+                body += ('<h4>Attach PDFs</h4>'
+                         f'<p>PDF data folder: <code>{escape(str(pdf_data_root))}</code>. '
+                         "Files in this shared folder are preserved when the project is reset. "
+                         "Inspect the PDF locally before confirming its identity.</p>")
+                if not pdfs:
+                    body += '<p>No PDFs found. Place .pdf files in the PDF data folder, then reload this page.</p>'
+            if status["papers"]:
+                rows = []
+                for index, item in enumerate(status["papers"]):
+                    state = badge(escape(item["status"]))
+                    if item["status"] == "awaiting_pdf" and pdfs:
+                        state = ('<details><summary>' + state + '</summary>'
+                                 '<form method="post" action="/settings/attach-pdf">'
+                                 f'<input type="hidden" name="token" value="{provide_token}">'
+                                 f'<input type="hidden" name="doi" value="{escape(item["doi"], quote=True)}">'
+                                 f'<label for="attach-pdf-{index}">PDF from data folder</label>'
+                                 f'<select id="attach-pdf-{index}" name="pdf" required>'
+                                 '<option value="">Select a PDF</option>'
+                                 + "".join(f'<option value="{escape(name, quote=True)}">{escape(name)}</option>'
+                                           for name in pdfs)
+                                 + f'</select><label for="attach-license-{index}">License or permission note (optional)</label>'
+                                 f'<input id="attach-license-{index}" name="license">'
+                                 '<label><input type="checkbox" name="confirm_identity" value="yes" required>'
+                                 ' I checked that this PDF matches this paper&#39;s title and DOI and am authorized '
+                                 'to extract it privately.</label>'
+                                 '<button type="submit">Attach and extract PDF</button></form></details>')
+                    rows.append(f"<tr><td>{escape(item['title'])}</td><td><code>{escape(item['doi'])}</code></td>"
+                                f"<td>{state}</td></tr>")
+                body += ("<table><thead><tr><th>Title</th><th>DOI</th><th>Status</th></tr></thead><tbody>"
+                         + "".join(rows)
+                         + "</tbody></table>")
+            body += "</section>"
+            body += ('<section class="panel"><h3>Discover related papers</h3>'
+                     '<p><a href="/discovery">Find referenced papers or papers that reference my core library</a>. '
+                     'Metadata-only discovery, with saved provider coverage and gaps; no PDFs are downloaded.</p>'
+                     '<p>After searches finish, <a href="/publications">configure/update the publication metadata catalog</a> '
+                     'to make saved bibliography available on Publication metadata and Discovery coverage.</p></section>')
+            body += ('<section class="panel danger"><h3>Reset to factory settings</h3>'
+                     "<p>This permanently deletes everything inside this project's root, including its PDFs, "
+                     "extracted evidence, snapshots, discovery output and settings. It cannot be undone. "
+                     "Files outside the project root are not affected.</p>"
+                     '<form method="post" action="/settings/reset">'
+                     '<label for="reset-confirm">Type RESET PROJECT to confirm</label> '
+                     '<input id="reset-confirm" name="confirmation" required autocomplete="off">'
+                     '<button type="submit" class="danger">Reset to factory settings</button></form></section>')
+        else:
+            body += ('<section class="panel"><h3>Initialize project</h3>'
+                     "<ol class=\"progress-steps\"><li class=\"active\">Register core papers</li>"
+                     "<li>Attach PDFs</li><li>Search and connect AI</li></ol>"
+                     "<p>Select a core-paper CSV (doi and title columns) or JSON manifest "
+                     "(schema_version 1 with a papers list of doi/title records). The file is validated "
+                     "before project data is created. Original PDFs are not uploaded or acquired here.</p>"
+                     '<form method="post" action="/settings/initialize" enctype="multipart/form-data">'
+                     '<label for="project-name">Project name</label> '
+                     '<input id="project-name" name="name" maxlength="256" value="My research project" required>'
+                     '<label for="project-auth">Private-use authorization basis</label>'
+                     f'<textarea id="project-auth" name="authorization" required rows="3">'
+                     f'{escape(PROJECT_AUTHORIZATION_DEFAULT)}</textarea>'
+                     '<label for="core-papers">Core papers file (.csv or .json)</label> '
+                     '<input id="core-papers" name="papers" type="file" accept=".csv,.json" required>'
+                     '<button type="submit">Initialize project</button></form>'
+                     "<p>The authorization note records your stated basis; it does not verify rights. "
+                     "Registered papers start as awaiting PDF.</p></section>")
+        key_configured = project_library.openalex_key_path(project_root).is_file()
+        body += (
+            '<section class="panel"><h3>OpenAlex API key</h3>'
+            f'<p>Status: <strong>{"Configured" if key_configured else "Not configured"}</strong>. '
+            'A key enables cursor pagination beyond 10,000 incoming citations.</p>'
+            '<p><a href="https://openalex.org/signup">Create a free OpenAlex account</a>, then '
+            '<a href="https://openalex.org/settings/api-key">copy your API key from OpenAlex settings</a>. '
+            '<a href="https://help.openalex.org/api/authentication/">API key instructions</a>.</p>'
+            '<form method="post" action="/settings/openalex-key">'
+            f'<input type="hidden" name="token" value="{provide_token}">'
+            '<label for="openalex-key">New OpenAlex API key</label>'
+            '<input id="openalex-key" name="api_key" type="password" maxlength="512" autocomplete="new-password" required>'
+            '<button>Save API key</button></form>'
+            '<p>The saved key is never displayed. It is stored privately for this installation, '
+            'survives project reset, and is sent only to OpenAlex. New searches use it automatically; '
+            'existing incomplete results are unchanged. Start a new incoming-citation search and then '
+            'update the metadata catalog.</p>'
+            + (f'<form method="post" action="/settings/openalex-key">'
+               f'<input type="hidden" name="token" value="{provide_token}">'
+               '<button name="action" value="remove">Remove saved API key</button></form>'
+               if key_configured else "") + '</section>')
+        response = page("Project settings", body)
+        response.status_code = status_code
+        return response
+
+    def save_project_openalex_key():
+        if not project_root:
+            raise ValueError("Project settings are not enabled")
+        if not hmac.compare_digest(request.form.get("token", ""), provide_token):
+            return Response("Settings form expired; reload the page.", status=403, mimetype="text/plain")
+        from .build import project_library
+        if request.form.get("action") == "remove":
+            path = project_library.openalex_key_path(project_root)
+            if path.is_symlink():
+                raise ValueError("OpenAlex API key file cannot be a symlink")
+            path.unlink(missing_ok=True)
+        else:
+            project_library.save_openalex_key(project_root, request.form.get("api_key", ""))
+        return redirect("/settings", code=303)
+
+    def initialize_project():
+        if not project_root:
+            return project_settings("Project settings are not enabled for this website.", 404)
+        if (project_root / "project.json").exists():
+            return project_settings("This project is already initialized.", 409)
+        upload = request.files.get("papers")
+        if upload is None or not upload.filename:
+            return project_settings("Choose a CSV or JSON core-papers file.", 400)
+        data = upload.stream.read(PROJECT_UPLOAD_MAX_BYTES + 1)
+        if len(data) > PROJECT_UPLOAD_MAX_BYTES:
+            return project_settings("The core-papers file exceeds the 4 MiB limit.", 400)
+        suffix = Path(upload.filename).suffix.casefold()
+        from .build import project_library
+        try:
+            if suffix == ".csv":
+                papers = project_library.read_csv_bytes(data)
+            elif suffix == ".json":
+                papers = project_library.read_manifest_bytes(data)
+            else:
+                return project_settings("Choose a .csv or .json core-papers file.", 400)
+            project_library.initialize(project_root, request.form.get("name", ""),
+                                       request.form.get("authorization", PROJECT_AUTHORIZATION_DEFAULT), papers)
+        except ValueError as error:
+            return project_settings(str(error), 400)
+        return redirect("/settings", code=303)
+
+    def reset_project():
+        if not project_root:
+            return project_settings("Project settings are not enabled for this website.", 404)
+        if request.form.get("confirmation") != "RESET PROJECT":
+            return project_settings("Type RESET PROJECT exactly to confirm deletion.", 400)
+        from .build import project_library
+        with discovery_lock:
+            if metadata_running():
+                return project_settings("Wait for the metadata catalog update to finish before resetting.", 409)
+            if discovery_state["thread"] and discovery_state["thread"].is_alive():
+                return project_settings("Wait for citation discovery to finish before resetting the project.", 409)
+            try:
+                project_library.reset(project_root)
+            except ValueError as error:
+                return project_settings(str(error), 400)
+        if store:
+            store.clear_cache()
+        return redirect("/settings", code=303)
+
+    def attach_project_pdf():
+        if not project_root:
+            return project_settings("Project settings are not enabled for this website.", 404)
+        if not hmac.compare_digest(request.form.get("token", ""), provide_token):
+            return project_settings("This form expired. Reload settings and try again.", 403)
+        from .build import project_library
+        try:
+            if request.form.get("confirm_identity") != "yes":
+                raise ValueError("Confirm that the PDF matches the selected title and DOI and private use is authorized.")
+            selected = available_project_pdfs().get(request.form.get("pdf", ""))
+            if selected is None:
+                raise ValueError("Select an available PDF from the PDF data folder.")
+            project_library.attach(project_root, request.form.get("doi", ""), selected,
+                                   identity_confirmed=True, license=request.form.get("license"))
+        except ValueError as error:
+            return project_settings(str(error), 400)
+        return redirect("/settings", code=303)
 
     def sources():
         if set(request.args) - {"offset", "paper", "collection", "snapshot_id"}:
@@ -441,14 +1188,17 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             raise ValueError("Collection selection requires a registry")
         result = current.call("list_sources", args)
         visible = current.call("list_collections", {})["result"]["items"]
-        options = '<option value="">Endpoint default</option>' + "".join(
+        options = '<option value="">Default collections</option>' + "".join(
             f'<option value="{escape(item["id"], quote=True)}"'
             f'{" selected" if item["id"] == cid else ""}>{escape(item["title"])}</option>'
             for item in visible)
-        form = ('<form method="get"><label>DOI / publication ID '
+        form = ('<form method="get" class="filters"><label>DOI / publication ID '
                 f'<input name="paper" value="{escape(paper, quote=True)}"></label> '
-                + (f'<label>Collection <select name="collection">{options}</select></label> ' if store else "")
+                + (f'<label>Collection <select name="collection">{options}</select></label> '
+                   if store and len(visible) > 1 else "")
                 + '<button type="submit">Filter</button></form>')
+        collection_note = (f"<p>Showing AI evidence from <strong>{escape(visible[0]['title'])}</strong>.</p>"
+                           if store and len(visible) == 1 else "")
         entries = []
         acquired_links = successful_supplement_links(data_root)
         refs = result.get("collection_context", {}).get("evidence_refs", [])
@@ -482,7 +1232,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             else:
                 document_label = "Source " + source["source_id"]
             details["Document"] = document_label
-            fields = "".join(f"<dt>{escape(key)}</dt><dd>{escape(str(value)) if value is not None else 'Unknown / not recorded'}</dd>"
+            fields = "".join(f"<dt>{escape(key)}</dt><dd>{metadata_value(value)}</dd>"
                              for key, value in details.items())
             entries.append(
                 '<article class="source-entry"><details>'
@@ -512,40 +1262,129 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         return page("Sources available to AI", "<p>Exact source versions in the selected active MCP evidence "
                     'collections, not the full discovered bibliography. <a href="/search">Search evidence</a> '
                     "or use Read retained text on a document below. This page is an inventory, not a chat. "
-                    "Availability does not mean scientific review.</p>" + form + "<p>Citation links are not necessarily download origins. "
+                    "Availability does not mean scientific review.</p>" + collection_note + form + "<p>Citation links are not necessarily download origins. "
                     "Unknown acquisition details are not inferred. Original files and extracted text "
                     "are not displayed on this inventory page. Authorized extracted text is available through "
                     "the local JSON API or MCP; original files are not served. This is corpus inventory, "
                     "not the sources used in a particular answer.</p>"
                     f"<p>Snapshot: <code>{escape(current.release_id)}</code></p>"
                     + ("".join(entries) or "<p>No matching sources.</p>")
-                    + "<nav>" + " | ".join(navigation) + "</nav>")
+                    + '<nav class="pager">' + "".join(navigation) + "</nav>")
 
     def stylesheet():
-        return Response(
-            "body{font:16px/1.6 system-ui,sans-serif;max-width:72rem;margin:2rem auto;"
-            "padding:0 1.5rem;color:#243447;background:#f7f9fc}a{color:#135fa3}"
-            "header{border-bottom:2px solid #d5dfeb;padding-bottom:1rem}"
-            "article{background:white;border:1px solid #d5dfeb;border-radius:.5rem;"
-            "padding:1rem 1.5rem;margin:1rem 0}dt{font-weight:600}dd{margin:0 0 .75rem;"
-            "overflow-wrap:anywhere}code{overflow-wrap:anywhere}"
-            ".source-entry{padding:0;margin:.4rem 0}"
-            ".source-entry summary{cursor:pointer;padding:.6rem 1rem;font-weight:600;"
-            "overflow-wrap:anywhere}"
-            ".source-entry summary:focus-visible{outline:2px solid #135fa3;outline-offset:2px}"
-            ".source-entry dl{margin:0;padding:.5rem 1rem 1rem}"
-            "input,select,button{font:inherit;max-width:100%;padding:.35rem;margin:.3rem}"
-            "nav{padding:.5rem 0}table{border-collapse:collapse;width:100%;background:white}"
-            "th,td{text-align:left;vertical-align:top;border-bottom:1px solid #d5dfeb;padding:.6rem}"
-            ".table-scroll{overflow-x:auto}small{display:block;overflow-wrap:anywhere}"
-            "pre{white-space:pre-wrap;overflow-wrap:anywhere}"
-            "textarea{display:block;box-sizing:border-box;width:100%;font:inherit;margin:.5rem 0}"
-            "blockquote{white-space:pre-wrap;overflow-wrap:anywhere}",
-            mimetype="text/css")
+        return Response(STYLESHEET, mimetype="text/css")
+
+    def project_library_page():
+        from .build import project_library
+        if not (project_root / "project.json").is_file():
+            return redirect("/settings")
+        if set(request.args) - {"query", "offset"}:
+            raise ValueError("Unsupported project library filter")
+        offset = int(request.args.get("offset", "0"))
+        if not 0 <= offset <= 1000000:
+            raise ValueError("Invalid library offset")
+        query = request.args.get("query", "")
+        labels = {"awaiting_pdf": "Awaiting PDF", "extracted": "Extracted",
+                  "needs_visual_review": "Needs visual review",
+                  "extracted_with_ocr": "Extracted with OCR (not human verified)"}
+        papers = {}
+        for paper in project_library.status(project_root)["papers"]:
+            key = catalog.alias("doi", paper["doi"])
+            papers[key] = {**paper, "core": True, "status": labels[paper["status"]], "relations": set(), "runs": set()}
+        core_count = len(papers)
+        root = discovery_root()
+        searches = []
+        if root.exists():
+            for folder in sorted(root.iterdir()):
+                if (not folder.is_dir() or folder.is_symlink() or len(folder.name) != 32
+                        or any(c not in "0123456789abcdef" for c in folder.name)
+                        or not (folder / "job.json").is_file()):
+                    continue
+                job = releases.read_json(releases.safe_file(folder, "job.json").read_bytes())
+                searches.append((folder.name, job))
+                if not (folder / "neighborhood.json").is_file():
+                    continue
+                graph = releases.read_json(releases.safe_file(folder, "neighborhood.json").read_bytes())
+                titles = discovery_titles(graph)
+                for edge in graph["edges"]:
+                    node = graph["nodes"][edge["target_provider_record"]]
+                    record = node["record"]
+                    doi = record["identifiers"].get("doi", "")
+                    key = catalog.alias("doi", doi) if doi else edge["target_provider_record"]
+                    title = titles[edge["target_provider_record"]]
+                    paper = papers.setdefault(key, {
+                        "doi": doi, "title": title, "core": False,
+                        "status": "Awaiting PDF" if doi else "Metadata only — DOI unresolved",
+                        "relations": set(), "runs": set(),
+                    })
+                    if not paper["title"] and title:
+                        paper["title"] = title
+                    paper["relations"].add((edge["direction"], edge["seed_doi"]))
+                    paper["runs"].add(folder.name)
+        rows = sorted(papers.values(), key=lambda row: (not row["core"], not bool(row["title"]),
+                                                       row["title"].casefold(), row["doi"]))
+        matches = [row for row in rows if all(
+            word in (row["title"] + " " + row["doi"]).casefold() for word in query.casefold().split())]
+        body = (
+            f"<p>{core_count} core papers; {len(rows) - core_count} additional discovered records. "
+            "Records with a DOI are combined across searches; records without a DOI retain provider identities.</p>"
+            "<p>References without a supplied title are listed last. Their provider metadata may contain "
+            "only a DOI or partial citation; this does not mean the PDF is unavailable.</p>"
+            "<p>Discovered papers are metadata only until a PDF is supplied and extracted. "
+            "Awaiting PDF means no PDF is attached, not that a download has been attempted. "
+            "Discovery does not add papers to your core library or make them available to AI.</p>"
+            '<p><a href="/discovery">Find related papers and inspect provider coverage, unresolved references and gaps</a>. '
+            '<a href="/settings">Manage core papers and attach their PDFs</a>.</p>'
+            '<form method="get"><label>Search title or DOI '
+            f'<input name="query" value="{escape(query, quote=True)}"></label> <button>Search</button></form>'
+            f"<p>{len(matches)} matching records.</p>"
+            '<ul class="library-records" aria-label="Library papers">')
+
+        def paper_link(title, doi):
+            if not doi:
+                return escape(title)
+            url = "https://doi.org/" + quote(doi, safe="/")
+            return f'<a href="{escape(url, quote=True)}">{escape(title)}</a>'
+
+        search_jobs = dict(searches)
+        for row in matches[offset:offset + 50]:
+            connections = ""
+            for direction, doi in sorted(row["relations"]):
+                related = papers.get(catalog.alias("doi", doi))
+                title = related["title"] if related and related["title"] else doi
+                linked = paper_link(title, doi)
+                connections += (
+                    f"<li>Core paper {linked} cites this paper.</li>" if direction == "background"
+                    else f"<li>This paper cites core paper {linked}.</li>")
+            discovery_links = "".join(
+                f'<li><a href="/discovery?run={run}">{escape(search_jobs[run]["label"])}'
+                f' — {escape(search_jobs[run]["started_at"])}</a></li>'
+                for run in sorted(row["runs"]))
+            body += (
+                f'<li class="library-record"><h3>{paper_link(row["title"] or "[Unresolved title]", row["doi"])}</h3>'
+                f'<dl><div><dt>DOI</dt><dd><code>{paper_link(row["doi"] or "Unresolved", row["doi"])}</code></dd></div>'
+                f'<div><dt>Library</dt><dd>{"Core" if row["core"] else "Discovered"}</dd></div>'
+                f'<div><dt>Status</dt><dd>{badge(row["status"])}</dd></div></dl>'
+                + (f"<details><summary>Connections to your core papers</summary><ul>{connections}</ul>"
+                   f"<p>Found in these discovery searches (including provider coverage and gaps):</p>"
+                   f"<ul>{discovery_links}</ul></details>" if connections else "") + "</li>")
+        body += "</ul>"
+        for start, label in ((max(0, offset - 50), "Previous"), (offset + 50, "Next")):
+            if (label == "Previous" and offset) or (label == "Next" and start < len(matches)):
+                body += f'<a href="/library?{escape(urlencode({"query": query, "offset": start}), quote=True)}">{label}</a> '
+        if searches:
+            body += "<h3>Discovery coverage</h3><ul>"
+            for run, job in searches:
+                body += (f'<li><a href="/discovery?run={run}">{escape(job["label"])}</a>: '
+                         f'{escape(job["status"])}. Inspect the search for provider gaps and unresolved references.</li>')
+            body += "</ul>"
+        return page("Project library", body)
 
     def library():
         if set(request.args) - {"query", "download", "extraction", "offset", "sort"}:
             raise ValueError("Unknown library parameter")
+        if project_root:
+            return project_library_page()
         project_path = Path(registry).absolute().parent / "project.json" if registry else None
         if project_path and project_path.is_file() and set(store.current().snapshots) == {"core"}:
             if request.args:
@@ -562,12 +1401,13 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                          "Needs visual review" if any("needs_visual_review" in caveat for caveat in caveats) else
                          "Extracted with OCR (not human verified)" if any(
                              caveat.startswith("Separate local OCR") for caveat in caveats) else "Extracted")
-                rows.append(f"<tr><td>{escape(item['title'])}</td><td>{escape(doi)}</td><td>{state}</td></tr>")
+                rows.append(f"<tr><td>{escape(item['title'])}</td><td><code>{escape(doi)}</code></td>"
+                            f"<td>{badge(state)}</td></tr>")
             return page("Core paper library",
                         "<p>Paper identities are supplied by the operator and are not independently verified. "
                         "Manage papers with the project command-line tool.</p>"
-                        "<table><thead><tr><th>Title</th><th>DOI</th><th>Status</th></tr></thead><tbody>"
-                        + "".join(rows) + "</tbody></table>")
+                        '<div class="table-scroll"><table><thead><tr><th>Title</th><th>DOI</th><th>Status</th></tr></thead><tbody>'
+                        + "".join(rows) + "</tbody></table></div>")
         offset = int(request.args.get("offset", "0"))
         if not 0 <= offset <= 1000000:
             raise ValueError("Invalid library offset")
@@ -604,30 +1444,31 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         counts = Counter(row["extraction"] for row in rows)
         downloaded = sum(row["acquisition_status"] in {"downloaded", "provided"} for row in rows)
         versions = {digest: version for row in rows for digest, version in row["versions"].items()}
-        body = (f"<p>{len(rows)} listed sources; {downloaded} downloaded; "
+        body = (f'<div class="summary"><p class="lead">{len(rows)} listed sources; {downloaded} downloaded; '
                 f"{counts['extracted']} extracted; {counts['partial']} partially extracted.</p>"
                 + (f"<p>{counts['extracted_with_ocr']} extracted with OCR; "
                    f"{counts['needs_visual_review']} need visual review. OCR text may contain errors; "
                    "original native text is retained unchanged.</p>"
                    if counts["extracted_with_ocr"] or counts["needs_visual_review"] else "") +
                 f"<p>{len(versions)} extracted PDF versions; "
-                f"{sum(version['pages'] for version in versions.values())} pages across retained versions.</p>"
+                f"{sum(version['pages'] for version in versions.values())} pages across retained versions.</p></div>"
+                '<details class="notes"><summary>About these numbers</summary>'
                 "<p>The downloaded count covers additional-library downloads. Extraction and PDF-version "
                 "totals also include listed papers already in the original iStopMM collection; their "
                 "main-paper pages are counted, not supplements.</p>"
                 "<p>Provider-indexed direct references and citers, not guaranteed complete worldwide. "
                 "Extraction does not mean active MCP retrieval or scientific review. "
                 "This page reads the local inventory and extraction records on each request; original files are not served.</p>"
-                + ("<p>Have a copy of a paper that could not be downloaded? Use <strong>Provide PDF or link</strong> "
-                   "on its row. The PDF is checked, extracted (with OCR for pages without text) and added to the "
-                   "library as a new snapshot; the previous snapshot is kept for rollback. Provided copies are "
-                   "private, never served, and not confirmed as the publisher version.</p>" if providing_enabled else "") +
-                '<p><a href="/library?download=awaiting&amp;sort=citations">Prioritize papers awaiting download</a></p>'
                 "<p>Impact uses saved OpenAlex citation counts, not live counts. Unknown counts sort last, "
                 "not as zero. Citations/year divides by elapsed years at capture, with a minimum age of one year. "
                 "iStopMM connections counts distinct seed papers in either citation direction. "
-                "These are prioritization aids, not measures of scientific quality or field-normalized impact.</p>"
-                '<form method="get"><label>Search title, author or DOI '
+                "These are prioritization aids, not measures of scientific quality or field-normalized impact.</p></details>"
+                + ('<p class="callout">Have a copy of a paper that could not be downloaded? Use <strong>Provide PDF or link</strong> '
+                   "on its row. The PDF is checked, extracted (with OCR for pages without text) and added to the "
+                   "library as a new snapshot; the previous snapshot is kept for rollback. Provided copies are "
+                   "private, never served, and not confirmed as the publisher version.</p>" if providing_enabled else "") +
+                '<p><a class="button secondary" href="/library?download=awaiting&amp;sort=citations">Prioritize papers awaiting download</a></p>'
+                '<form method="get" class="filters"><label>Search title, author or DOI '
                 f'<input name="query" value="{escape(query, quote=True)}"></label> ' +
                 select("download", "Download", download_labels, download) +
                 select("extraction", "Extraction", extraction_labels, extracted) +
@@ -643,8 +1484,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                       "connections": "seed_connections"}[sort]
             matches.sort(key=lambda row: (not row["title"].strip(), row[metric] is None, -(row[metric] or 0),
                                          -(row["citations"] or 0), row["title"].casefold(), row["id"]))
-        body += f"<p>{len(matches)} matching sources.</p>"
-        body += (f"<p>Citation counts available for {sum(row['citations'] is not None for row in matches)} "
+        body += f'<p class="result-count"><strong>{len(matches)} matching sources.</strong> '
+        body += (f"Citation counts available for {sum(row['citations'] is not None for row in matches)} "
                  "matching sources; others are unknown.</p>")
         entries = []
         for row in matches[offset:offset + 50]:
@@ -670,9 +1511,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             impact += f'<small>{row["seed_connections"]} iStopMM connections</small>'
             entries.append(f"<tr><td>{title}{details}</td><td>{escape(direction or 'New update source')}</td>"
                            f"<td>{impact}</td>"
-                           f"<td>{escape(download_labels.get(row['acquisition_status'], row['acquisition_status']))}"
+                           f"<td>{badge(escape(download_labels.get(row['acquisition_status'], row['acquisition_status'])))}"
                            f"{provide_cell(row, providing_enabled)}</td>"
-                           f"<td>{escape(extraction_labels.get(row['extraction'], row['extraction']))}"
+                           f"<td>{badge(escape(extraction_labels.get(row['extraction'], row['extraction'])))}"
                            f"<small>{row['pages']} pages; {len(row['versions'])} retained PDF versions</small></td></tr>")
             if row.get("ocr_review_pages"):
                 entries[-1] = entries[-1].replace("</td></tr>",
@@ -694,10 +1535,12 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     "<p>The working inventory of discovered related sources: what has been downloaded "
                     "and extracted, and what is still pending. Extraction alone does not publish a source "
                     'to MCP; see <a href="/sources">Sources available to AI</a> for the serving inventory.</p>'
-                    + body + "<nav>" + " | ".join(links) + "</nav>")
+                    + body + '<nav class="pager">' + "".join(links) + "</nav>")
 
     def can_provide():
-        if not (store and data_root) or "literature" not in store.current().snapshots:
+        if (not (store and data_root)
+                or project_root and not (project_root / "registry/active.json").is_file()
+                or "literature" not in store.current().snapshots):
             return False
         try:
             from .build import provided_sources  # noqa: F401  (requires the optional build extra)
@@ -802,7 +1645,27 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         allowed = {"query", "disease", "eligibility", "collection", "snapshot_id", "offset"}
         if set(request.args) - allowed:
             raise ValueError("Unknown query parameter")
+        if project_root and metadata_running():
+            return redirect("/settings/metadata-progress")
+        if project_root and not (project_root / "registry/active.json").exists():
+            return page("Publication metadata" if request.path == "/publications" else "Discovery coverage & gaps",
+                        '<section class="panel"><h3>Set up your metadata catalog</h3>'
+                        '<ol><li><a href="/settings">Initialize the project and attach at least one core PDF</a> '
+                        'to create its registry.</li><li>Use <a href="/discovery">Find related papers</a> '
+                        'and wait for searches to complete.</li><li>Return here and click '
+                        'Configure/update metadata catalog to publish the saved bibliography.</li></ol>'
+                        '<p>Discovery alone saves search results; it does not configure a metadata catalog. '
+                        'Catalog setup does not download PDFs or add full-text evidence.</p></section>')
         current = snapshot(request)
+        if project_root:
+            from .build import project_library
+            metadata_ids = project_library.metadata_collections(project_root)
+            if metadata_ids:
+                metadata_store = collections.CollectionStore(
+                    registry, allowed_profiles=profiles,
+                    allowed_collections=["core", *metadata_ids], defaults=["core"])
+                current = (metadata_store.load(request.args["snapshot_id"])
+                           if request.args.get("snapshot_id") else metadata_store.current())
         args = {}
         cid = request.args.get("collection")
         visible = current.call("list_collections", {})["result"]["items"]
@@ -853,16 +1716,21 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     matched_catalogs.append(catalog_id)
             result = (current.call(tool, {**args, "collections": matched_catalogs})["result"]
                       if matched_catalogs else {"items": []})
+        elif store and not cid and not catalog_collections:
+            result = {"items": [], "next_offset": None}  # No catalog configured: show the empty state.
         else:
             result = current.call(tool, args)["result"]
         options = '<option value="">All metadata catalogs</option>' + "".join(
             f'<option value="{escape(item["id"], quote=True)}"'
             f'{" selected" if item["id"] == cid else ""}>{escape(item["title"])}</option>'
             for item in visible)
-        form = ('<form method="get">' +
-                (f'<label>Collection <select name="collection">{options}</select></label>' if store else "") +
+        show_collection_filter = store and len(visible) > 1 and not project_root
+        form = ('<form method="get" class="filters">' +
+                (f'<label>Collection <select name="collection">{options}</select></label>'
+                 if show_collection_filter else "") +
                 (f'<label>Words <input name="query" value="{escape(request.args.get("query", ""), quote=True)}"></label>'
-                 if tool == "list_publications" else "") + '<button>Filter</button></form>')
+                 if tool == "list_publications" else "") + '<button>Filter</button></form>'
+                ) if show_collection_filter or tool == "list_publications" else ""
         description = (
             "Audit view of metadata discovery: providers, search dates and queries, counts, unresolved "
             "identities and incomplete searches. This is not download/extraction progress or scientific review."
@@ -871,12 +1739,51 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             "Use this page for authors, identifiers and metadata provenance, not paper-text search.")
         body = "<p>" + description + "</p>" + form + "<p>Provisional metadata only. Not researcher-approved, not full-text evidence. " \
                       "A reported abstract or full-text location is not acquisition or permission.</p>"
+        if project_root and tool == "list_publications":
+            body += (
+                '<section class="panel"><h3>Configure publication metadata</h3>'
+                '<ol><li>Use <a href="/discovery">Find related papers</a> to search references, citing papers, or both. '
+                'Wait for each search to complete.</li>'
+                '<li>Click Configure/update metadata catalog below to publish metadata from all completed searches.</li>'
+                '<li>Run this again after new searches to update Publication metadata and Discovery coverage.</li></ol>'
+                '<p>This uses saved local metadata; it makes no network requests and downloads no PDFs. '
+                'Incomplete provider coverage and unresolved references remain labelled. '
+                'Attach at least one core PDF first to create the project registry. '
+                'The catalog is preserved when you attach more PDFs; factory reset deletes it.</p>'
+                '<form method="post" action="/settings/configure-metadata">'
+                f'<input type="hidden" name="token" value="{provide_token}">'
+                '<button>Configure/update metadata catalog</button></form>'
+                '<p>To expose this metadata catalog to AI over MCP too, restart your MCP server with '
+                '<code>COLLECTIONS="core metadata"</code> and keep <code>DEFAULT_COLLECTIONS=core</code>. '
+                'The catalog contains bibliography, not full-text evidence.</p></section>')
+        elif project_root:
+            body += ('<p>To configure or update this catalog, '
+                     '<a href="/publications">open Publication metadata</a>.</p>')
+        if store and len(visible) == 1:
+            body += f"<p>Project: <strong>{escape(visible[0]['title'])}</strong>.</p>"
+        if store and not catalog_collections:
+            body += ("<p>No metadata catalog is configured. "
+                     '<a href="/library">Library &amp; download status</a> shows your core papers and saved discoveries; '
+                     '<a href="/discovery">Find related papers</a> shows saved searches and their provider coverage.</p>')
         if evidence_metadata:
             body += (f"<p>{len(ordered)} matching bibliographic records from authorized metadata catalogs "
                      "for papers in the selected evidence collection. Matches use publication identifiers, "
                      "not title guesses; sources without matching catalog metadata are not listed.</p>")
         if tool == "catalog_status":
             import json
+            if project_root:
+                from .build import project_library
+                core_papers = project_library.status(project_root)["papers"]
+                available = sum(paper["status"] != "awaiting_pdf" for paper in core_papers)
+                body += (
+                    '<section class="panel"><h3>Core full-text evidence</h3>'
+                    f'<p>{available} of {len(core_papers)} core papers have attached PDFs and retained extracted text. '
+                    'Extraction may include OCR or require visual review; '
+                    '<a href="/sources">Sources available to AI</a> lists the exact evidence versions.</p>'
+                    '<p>The discovery catalog below stores bibliography only. Its acquisition counts do not '
+                    'include separately attached core PDFs and are not project-wide full-text totals. '
+                    '<a href="/library">Library &amp; download status</a> shows individual PDF/extraction statuses.</p>'
+                    '</section>')
             if evidence_coverage:
                 info = current.info(cid)
                 body += (
@@ -890,16 +1797,29 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     "</article><h3>Related discovery catalogs</h3>"
                     "<p>The statistics below cover each entire related catalog, not just the selected "
                     "evidence collection. They do not measure missing full text or scientific validity.</p>")
-            body += "".join("<article><pre>" + escape(json.dumps(item, indent=2, ensure_ascii=False)) +
-                            "</pre></article>" for item in result["items"])
+            body += (
+                "<p><strong>Full-text availability unknown from saved metadata</strong> counts records "
+                "where providers supplied no full-text availability indication. This is not a count of "
+                "unavailable PDFs or failed downloads; availability has not been independently checked, "
+                "and separately attached core PDFs are not reflected in this metadata flag.</p>")
+            coverage_labels = {
+                "full_text_acquired_count": "Full text acquired within this metadata catalog (excludes core evidence)",
+                "full_text_not_reported_count": "Full-text availability unknown from saved metadata",
+            }
+            body += "".join("<article>" + metadata_value({
+                coverage_labels.get(key, key): value
+                for key, value in item.items()}, project_scope=bool(project_root)) +
+                            "</article>" for item in result["items"])
         else:
             for record in result["items"]:
                 body += (f"<article><h3>{escape(record['title'] or '[Title unavailable in provider metadata]')}</h3><dl>" + "".join(
-                    f"<dt>{escape(key.replace('_', ' '))}</dt><dd>{escape(str(record[key]))}</dd>"
+                    f"<dt>{escape(('core_library_overlap' if project_root and key == 'istopmm_overlap' else key).replace('_', ' ').capitalize())}</dt>"
+                    f"<dd>{metadata_value(record[key], project_scope=bool(project_root))}</dd>"
                     for key in ("id", "authors", "journal", "publication_date", "citation_url", "aliases",
                                 "diseases", "publication_types", "eligibility", "publication_state",
                                 "availability", "researcher_review", "istopmm_overlap", "selection_rationale",
-                                "relations", "provenance")) + "</dl></article>")
+                                "relations", "provenance")
+                    if not (project_root and key == "diseases")) + "</dl></article>")
             links = []
             for offset, label in ((max(0, args["offset"] - 5), "Previous"), (result["next_offset"], "Next")):
                 if offset is None or label == "Previous" and args["offset"] == 0:
@@ -909,17 +1829,77 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 if store:
                     params["snapshot_id"] = current.release_id
                 links.append(f'<a href="/publications?{escape(urlencode(params), quote=True)}">{label}</a>')
-            body += "<nav>" + " | ".join(links) + "</nav>"
+            body += '<nav class="pager">' + "".join(links) + "</nav>"
         if evidence_coverage and not result["items"]:
             body += "<p>No authorized discovery catalog has identifier-matched records for this collection.</p>"
         elif not result["items"]:
-            body += "<p>No metadata catalog records in this selection. "
+            body += "<p class=\"empty-state\">No metadata catalog records in this selection. "
             if catalog_collections:
                 body += "Choose All metadata catalogs or a metadata catalog in the Collection filter. "
             else:
                 body += "No metadata catalog is configured among the authorized collections. "
             body += 'This does not mean the <a href="/library">source library</a> is empty.</p>'
         return page("Discovery coverage & gaps" if tool == "catalog_status" else "Publication metadata", body)
+
+    def configure_project_metadata():
+        if not project_root:
+            raise ValueError("Project metadata setup is not enabled")
+        if not hmac.compare_digest(request.form.get("token", ""), provide_token):
+            return Response("Metadata form expired; reload the page.", status=403, mimetype="text/plain")
+        with discovery_lock:
+            if metadata_running():
+                return redirect("/settings/metadata-progress", code=303)
+            if discovery_state["thread"] and discovery_state["thread"].is_alive():
+                return Response("Wait for citation discovery to finish before configuring metadata.",
+                                status=409, mimetype="text/plain")
+            from .build import project_library
+            job = {"status": "running", "message": "Preparing metadata catalog update"}
+            collections.atomic_json(project_root, "metadata-job.json", job)
+
+            def progress(message):
+                job["message"] = message
+                collections.atomic_json(project_root, "metadata-job.json", job)
+
+            def work():
+                try:
+                    report = project_library.configure_metadata(project_root, progress=progress)
+                    job.update(status="complete", message="Metadata catalog updated", report=report)
+                except (OSError, ValueError, KeyError, TypeError, sqlite3.Error,
+                        releases.ReleaseError, ValidationError, literature.DiscoveryError) as error:
+                    diagnostic("web_metadata_failed", exception_type=type(error).__name__)
+                    job.update(status="failed", message=str(error))
+                collections.atomic_json(project_root, "metadata-job.json", job)
+
+            thread = threading.Thread(target=work, daemon=True)
+            metadata_state["thread"] = thread
+            thread.start()
+        return redirect("/settings/metadata-progress", code=303)
+
+    def metadata_progress():
+        if not project_root:
+            raise ValueError("Project metadata setup is not enabled")
+        path = project_root / "metadata-job.json"
+        if not path.is_file():
+            return redirect("/publications")
+        job = releases.read_json(releases.safe_file(project_root, path.name).read_bytes())
+        running = job["status"] == "running" and metadata_running()
+        message = job["message"]
+        if job["status"] == "running" and not running:
+            message = "Catalog update was interrupted. Return to Publication metadata and retry."
+        body = f'<p role="status" aria-live="polite">{escape(message)}</p>'
+        if running:
+            body += ('<progress aria-label="Updating metadata catalog"></progress>'
+                     '<p>This may take a while for large libraries. This page refreshes every two seconds; '
+                     'you can leave it and return later.</p>'
+                     '<p><a href="/settings/metadata-progress">Refresh status</a></p>')
+        elif job["status"] == "complete":
+            body += f'<p>Published metadata from {job["report"]["searches"]} saved searches.</p>'
+        body += '<p><a href="/publications">Publication metadata</a></p>'
+        response = page("Metadata catalog update", body)
+        response.headers["Cache-Control"] = "no-store"
+        if running:
+            response.headers["Refresh"] = "2"
+        return response
 
     def api(endpoint):
         return library_api.respond(snapshot(request), request)
@@ -928,19 +1908,43 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if request.args:
             raise ValueError("Connection page does not accept parameters or credentials")
         web_url = request.url_root.rstrip("/")
-        generic_project = bool(store and set(store.current().snapshots) == {"core"})
-        sample_query = "YOUR_SEARCH_TERM" if generic_project else "myeloma"
-        sample_collection = "core" if generic_project else "istopmm"
+        sample_query = "YOUR_SEARCH_TERM"
+        evidence_ids = []
+        if store:
+            if project_root and not (project_root / "registry/active.json").is_file():
+                evidence_ids = list(store.defaults)
+            else:
+                current = store.current()
+                evidence_ids = [cid for cid in store.defaults if not collections.is_catalog(current.snapshots[cid])]
+                evidence_ids += [cid for cid in sorted(current.snapshots)
+                                 if cid not in evidence_ids and not collections.is_catalog(current.snapshots[cid])]
+        sample_collection = evidence_ids[0] if evidence_ids else None
         sdk_command = shlex.join([
-            "istopmm-mcp-check", "--url", mcp_url, "--web-url", web_url,
+            "research-mcp-check", "--url", mcp_url, "--web-url", web_url,
             "--token-file", "releases/http-local/research-papers-claude-token", "--query", sample_query,
-            *(["--collection", sample_collection] if generic_project else []),
+            *(["--collection", sample_collection] if sample_collection else []),
         ])
         def command(action):
             return shlex.join(["make", action, *(["HTTP_URL=" + mcp_url]
                               if mcp_url != "http://127.0.0.1:8000/mcp" else [])])
 
         connect_command = command("connect")
+        mcp_arguments = ["make", "mcp"]
+        if project_root:
+            mcp_arguments.append("PROJECT_ROOT=" + str(project_root))
+        if store:
+            mcp_arguments.extend(["COLLECTION_REGISTRY=" + str(store.root),
+                                  "COLLECTIONS=" + " ".join(sorted(store.allowed)),
+                                  "DEFAULT_COLLECTIONS=" + " ".join(store.defaults)])
+        else:
+            mcp_arguments.extend(["COLLECTION_REGISTRY=", "RELEASE=" + str(Path(release).absolute())])
+        mcp_arguments.append("PROFILE=" + " ".join(sorted(profiles)))
+        if mcp_url != "http://127.0.0.1:8000/mcp":
+            mcp_arguments.append("HTTP_URL=" + mcp_url)
+            endpoint = urlsplit(mcp_url)
+            if endpoint.hostname in {"localhost", "127.0.0.1"}:
+                mcp_arguments.append("HTTP_PORT=" + str(endpoint.port or (443 if endpoint.scheme == "https" else 80)))
+        mcp_command = shlex.join(mcp_arguments)
         prompt = (
             "Use the research evidence MCP server, not filesystem searches. Call list_collections. If it returns "
             "collections, choose an authorized evidence collection (not a metadata catalog) and pin "
@@ -956,17 +1960,21 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         )
         body = (
             "<p>Run these commands from the research-papers project folder. "
-            "They manage the Claude Code HTTP connection named <code>istopmm-evidence-http</code> "
-            "in this project by default.</p>"
+            "They manage the Claude Code HTTP connection named <code>research-evidence-http</code> "
+            "in this project by default. The server serves the project and collections configured below.</p>"
             f"<p>MCP endpoint: <code>{escape(mcp_url)}</code>.</p>"
             "<h3>1. Set up and start</h3>"
-            "<pre>make setup\nmake mcp</pre>"
+            "<pre>make setup\n" + escape(mcp_command) + "</pre>"
+            "<p>Use this start command to serve the same evidence configuration as this website. "
+            "Initialize the project and attach at least one PDF before starting MCP. "
+            "<code>PROJECT_ROOT</code> selects research data; <code>CLIENT_PROJECT</code> selects "
+            "the directory where Claude Code's connection is registered.</p>"
             "<p>Leave MCP running. Use another terminal for the commands below.</p>"
             "<h3>2. Connect</h3>"
             + copy_field("claude-setup", "Claude setup command", connect_command, rows=2)
             + "<p>Creates the local registration and a private token (valid for 24 hours). "
             "Restart Claude Code in the target project and run <code>/mcp</code>; "
-            "expect <code>istopmm-evidence-http</code> to connect.</p>"
+            "expect <code>research-evidence-http</code> to connect.</p>"
             "<h3>3. Reset and reconnect</h3>"
             + copy_field("reset", "Reset command", command("reconnect"), rows=2)
             + "<p>Removes the old registration, revokes its token and creates a fresh connection. "
@@ -984,13 +1992,12 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             "make reconnect CLIENT_PROJECT=/absolute/path/to/your/project\n"
             "make disconnect CLIENT_PROJECT=/absolute/path/to/your/project</pre>"
             "<p>Use distinct <code>CLIENT_NAME</code> and <code>CLIENT_TOKEN_FILE</code> values for independent "
-            "connections. These commands do not remove a separate stdio registration such as "
-            "<code>istopmm-evidence</code>. Disable/remove that entry in your client's MCP configuration separately; "
+            "connections. These commands do not remove a separate stdio registration. "
+            "Disable/remove that entry in your client's MCP configuration separately; "
             "do not delete an entire configuration file containing other servers.</p></details>"
             "<details><summary>Verify retrieval without an AI model</summary>"
             + copy_field("sdk-check", "SDK check command", sdk_command, rows=3)
-            + ("<p>Replace YOUR_SEARCH_TERM with a distinctive word found in one of your papers.</p>"
-               if generic_project else "")
+            + "<p>Replace YOUR_SEARCH_TERM with a distinctive word found in one of your papers.</p>"
             + "<p>Expected: <code>passed: true</code> and <code>search_context_reader_agree: true</code>. "
             "Open the reported <code>reader_url</code> to inspect the cited passage. "
             "This page does not probe MCP or read credentials.</p></details>"
@@ -998,7 +2005,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             "<p>The same evidence is available through the local read-only JSON API. "
             "Copy <code>examples/library_json.py</code> into your application's directory and run:</p>"
             "<pre>python3 library_json.py --base-url " + escape(web_url)
-            + " --collection " + sample_collection + " --query " + sample_query + "</pre>"
+            + ((" --collection " + escape(shlex.quote(sample_collection))) if sample_collection else "")
+            + " --query " + sample_query + "</pre>"
             "<p>Expected: exact retained text slices, citation, snapshot/release and a reader_url. "
             "Omit --collection on a single-release service. Only Python's standard library is needed; "
             "no MCP client, model or API credential. Your host application makes the requests and controls "
@@ -1011,8 +2019,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             + "<h3>More things to try</h3>"
             "<p>Use the same MCP server and citation requirements for these follow-up questions:</p>"
             + copy_field("example-compare", "Compare findings",
-                         "Find retained evidence about MGUS prevalence and progression risk. Explain how the "
-                         "populations, denominators and follow-up differ. Cite the supporting source passages; "
+                         "Compare findings from two papers in this project's evidence library on a shared topic. "
+                         "Explain how their methods, populations, measurements and limitations differ. Cite the supporting source passages; "
                          "do not treat shared cohorts as independent replication.", rows=4)
             + copy_field("example-inspect", "Inspect a source",
                          "For one source you just cited, retrieve its original source context and report the "
@@ -1104,14 +2112,15 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             raise ValueError("Invalid search offset")
         if offset and not request.args.get("snapshot_id" if store else "release_id"):
             raise ValueError("Pagination requires a pinned snapshot")
-        body = ('<form method="get"><label>Words or phrase <input name="query" required '
-                f'value="{escape(query, quote=True)}"></label> {choices}<button>Search</button></form>'
-                "<p>Keyword search of retained extracted text, not an AI answer or semantic search. "
+        body = ('<form method="get" class="hero-search" role="search"><label for="search-query">Words or phrase</label>'
+                '<div class="input-row"><input id="search-query" name="query" type="search" required autofocus '
+                f'value="{escape(query, quote=True)}"> {choices}<button>Search</button></div></form>'
+                '<p class="meta">Keyword search of retained extracted text, not an AI answer or semantic search. '
                 "Metadata-only publications are not searched as full text. No match does not prove there is no evidence.</p>"
-                f"<p>Evidence snapshot: <code>{current.release_id}</code>. "
+                f'<p class="meta">Evidence snapshot: <code>{current.release_id}</code>. '
                 "OCR and extraction warnings remain attached to results.</p>")
         if "query" not in request.args:
-            return page("Search evidence", body + "<p>Enter words from a topic or passage to begin.</p>")
+            return page("Search evidence", body + '<p class="empty-state">Enter words from a topic or passage to begin.</p>')
         response = current.call("search_evidence", {**scope, "query": query, "offset": offset, "limit": 5})
         refs = response.get("collection_context", {}).get("evidence_refs", [])
         for index, result in enumerate(response["result"]["items"]):
@@ -1121,21 +2130,21 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             evidence = current.snapshots[result_cid] if store else current
             source = next(source for source in evidence._bundle["sources"]
                           if source["id"] == result["citation"]["source_id"])
-            body += ('<article><h3>' + escape(browser_title(current, result_cid, source)) + "</h3>"
-                     f"<p>{escape(quality_document(source['id'].rsplit(':', 1)[-1]))} — "
-                     f"{escape(quality_location(result['citation']['locator']))}</p>"
-                     f"<blockquote>{escape(result['snippet'])}</blockquote>"
-                     + source_warnings(result) + "<p>")
+            body += ('<article><h3 class="hit-title">' + escape(browser_title(current, result_cid, source)) + "</h3>"
+                     f'<p class="meta"><span class="chip">{escape(quality_document(source["id"].rsplit(":", 1)[-1]))}</span> '
+                     f"{escape(quality_location(result['citation']['locator']))} <code>{escape(source['doi'])}</code></p>"
+                     f"<blockquote>{highlight(result['snippet'], query)}</blockquote>"
+                     + source_warnings(result) + '<p class="actions">')
             for ref in matches:
                 member_cid = ref["collection_id"] if store else ""
                 unit = current.snapshots[member_cid]._lookup("units", ref["record_id"]) if store else result
-                body += (f'<a href="{escape(reader_url(pin, member_cid, unit), quote=True)}">Read source context'
+                body += (f'<a class="button secondary" href="{escape(reader_url(pin, member_cid, unit), quote=True)}">Read source context'
                          + (f" ({escape(current.entries[member_cid]['title'])})" if store else "") + "</a> ")
             body += "</p></article>"
         if not response["result"]["items"]:
-            body += "<p>No matching retained passages. Try fewer or different words, or another collection. This is not proof of no evidence.</p>"
+            body += '<p class="empty-state">No matching retained passages. Try fewer or different words, or another collection. This is not proof of no evidence.</p>'
         params = {**pin, "query": query, **({"collection": cid} if store else {})}
-        body += "<nav>"
+        body += '<nav class="pager">'
         for position, label in ((max(0, offset - 5) if offset else None, "Previous results"),
                                 (response["result"]["next_offset"], "Next results")):
             if position is not None:
@@ -1176,18 +2185,19 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     f"{offset + 1 if context['total_characters'] else 0}–{offset + len(unit['text'])} "
                     f"of {context['total_characters']}. {absolute_url}")
         excerpt = unit["text"] + "\n\n" + citation
-        body = (f"<h3>{escape(title)}</h3><p>{escape(role)} — {escape(location)}</p>"
-                f"<p>Collection: {escape(cid or 'Single release')}. Evidence release: <code>{evidence.release_id}</code></p>"
-                "<p>This is retained extracted text, not an AI interpretation. Original documents are accessed externally. "
+        body = (f'<div class="reader-head"><h3>{escape(title)}</h3>'
+                f'<p class="meta"><span class="chip">{escape(role)}</span> {escape(location)}</p>'
+                f'<p class="meta">Collection: {escape(cid or "Single release")}. Evidence release: <code>{evidence.release_id}</code></p></div>'
+                '<p class="note">This is retained extracted text, not an AI interpretation. Original documents are accessed externally. '
                 "OCR labels, warnings and empty locations are preserved; retained text may not capture every feature of the original.</p>"
                 + source_warnings(unit)
                 + "<h3>Retained text</h3>"
-                + (f"<pre>{escape(unit['text'])}</pre>" if unit["text"] else
+                + (f'<pre class="reading">{escape(unit["text"])}</pre>' if unit["text"] else
                    "<p>No text retained at this location. Inspect the original; this does not prove it is blank.</p>")
-                + f"<p>Showing {len(unit['text'])} of {context['total_characters']} retained characters, starting at offset {offset}.</p>")
+                + f'<p class="meta">Showing {len(unit["text"])} of {context["total_characters"]} retained characters, starting at offset {offset}.</p>')
         if evidence._lookup("units", unit_id)["truncated"]:
             body += "<p><strong>The stored extraction itself is marked incomplete.</strong></p>"
-        body += "<nav>"
+        body += '<nav class="pager">'
         for position, label in ((max(0, offset - 2048) if offset else None, "Previous text slice"),
                                 (context["next_offset"], "Next text slice")):
             if position is not None:
@@ -1197,7 +2207,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         for adjacent, label in ((position - 1, "Previous retained location"), (position + 1, "Next retained location")):
             if 0 <= adjacent < len(units):
                 body += f'<a href="{escape(reader_url(pin, cid, units[adjacent]), quote=True)}">{label}</a> '
-        body += "</nav><p>Adjacent links follow retained locations in document order; gaps are not invented pages.</p>"
+        body += '</nav><p class="meta">Adjacent links follow retained locations in document order; gaps are not invented pages.</p>'
         body += "<h3>Copy and share</h3><p>These fields are selectable even if clipboard access is unavailable. "
         body += "The excerpt includes only this text slice; follow Next text slice to read more.</p>"
         for key, label, value in (("citation", "Citation and stable link", citation), ("excerpt", "Cited excerpt", excerpt)):
@@ -1219,15 +2229,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         return page("Read source context", body, reader_script=True)
 
     def reader_script():
-        return Response(
-            'for (const button of document.querySelectorAll("[data-copy]")) {'
-            'button.addEventListener("click", async () => {'
-            'const field = document.getElementById(button.dataset.copy);'
-            'const status = document.getElementById("copy-status");'
-            'try { await navigator.clipboard.writeText(field.value); status.textContent = "Copied."; }'
-            'catch (error) { field.focus(); field.select();'
-            'status.textContent = "Clipboard unavailable. Text selected: use Ctrl+C or Command+C to copy."; }'
-            '});}', mimetype="text/javascript")
+        return Response(READER_SCRIPT, mimetype="text/javascript")
 
     def quality_page():
         if store and store.public_quality_root is not None:
@@ -1274,40 +2276,62 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         kind_options = '<option value="">All kinds</option>' + "".join(
             f'<option value="{escape(code, quote=True)}"{" selected" if kind == code else ""}>'
             f'{escape(QUALITY_LABELS[code])} ({counts[code]} pending)</option>' for code in kinds)
-        form = ('<form method="get">' + form
+        form = ('<form method="get" class="filters">' + form
                 + f'<label>Finding <select name="kind">{kind_options}</select></label> '
+                + ('<input type="hidden" name="show" value="all">' if show == "all" else "")
                 + '<button>Show</button></form>')
 
-        def link(extra, label):
-            return f'<a href="/quality?{escape(urlencode({**params, **extra}), quote=True)}">{label}</a>'
+        def href(extra):
+            return "/quality?" + escape(urlencode({**params, **extra}), quote=True)
 
-        body = (form + "<p>Development operator view. All existing evidence remains available here; "
-                "this report does not publish or hide documents. Metadata-only/unacquired publications are not "
-                "missing-text defects in these acquired source documents.</p>"
-                f"<p><strong>{'Ready for operator approval' if report['ready'] else 'Public readiness: Not ready'}</strong>"
-                f" &mdash; {report['blockers']} unresolved findings; {report['sources']} source documents; "
-                f"{report['units']} retained text units.</p>"
-                + "<p>Pending tasks include routine comparisons, not only detected errors. "
-                "A completeness review is assigned to every document; it does not mean that document is broken.</p>"
-                + "<ul>" + "".join(f"<li>{escape(QUALITY_LABELS[code])}: {count} pending</li>" for code, count in sorted(counts.items()))
-                + "</ul>"
-                f"<p>Evidence release: <code>{escape(evidence.release_id)}</code></p>"
-                f"<p>{escape(report['limitation'])}</p>"
-                "<p>Run <code>.venv/bin/python -m istopmm_evidence.quality_cli --help</code> for local "
-                "inventory, review, problem and repair commands. Follow <code>docs/data-quality.md</code>. "
-                "Reviews require comparison with the original; known errors must be repaired, not waived. "
-                "Original files are accessed at their publication source, never served here.</p>"
-                + link({"show": "all"}, "All findings (including reviewed)") + " | "
-                + link({}, "Pending findings"))
+        def link(extra, label):
+            return f'<a href="{href(extra)}">{label}</a>'
+
+        readiness = "Ready for operator approval" if report["ready"] else "Public readiness: Not ready"
+        status_line = (f'<p class="quality-status"><span class="badge {"ok" if report["ready"] else "warn"}">'
+                       f"{readiness}</span> {report['blockers']} unresolved findings; {report['sources']} source "
+                       f"documents; {report['units']} retained text units.</p>")
         selected = request.args.get("finding")
+        if selected:
+            back = {key: value for key, value in (("show", show), ("kind", kind)) if value and value != "pending"}
+            body = (f'<p class="back-link"><a href="{href(back)}">&larr; Back to findings</a></p>' + status_line)
+        else:
+            tab = lambda value, label: (f'<a href="{href({"show": value} if value == "all" else {})}"'
+                                        + (' aria-current="page"' if show == value else "") + f">{label}</a>")
+            chips = "".join(
+                f'<li><a class="kind-chip{" active" if kind == code else ""}" '
+                f'href="{href({"kind": code, **({"show": "all"} if show == "all" else {})})}">'
+                f"{escape(QUALITY_LABELS[code])}: {count} pending</a></li>"
+                for code, count in sorted(counts.items()))
+            if chips and kind:
+                chips = (f'<li><a class="kind-chip" href="{href({"show": "all"} if show == "all" else {})}">'
+                         "&times; All kinds</a></li>" + chips)
+            body = (status_line
+                    + '<div class="tabs" role="group" aria-label="Findings shown">'
+                    + tab("pending", "Pending findings") + tab("all", "All findings (including reviewed)") + "</div>"
+                    + (f'<ul class="kind-chips" aria-label="Pending by kind">{chips}</ul>' if chips else "")
+                    + form
+                    + '<details class="notes"><summary>How this report works</summary>'
+                    "<p>Development operator view. All existing evidence remains available here; "
+                    "this report does not publish or hide documents. Metadata-only/unacquired publications are not "
+                    "missing-text defects in these acquired source documents.</p>"
+                    "<p>Pending tasks include routine comparisons, not only detected errors. "
+                    "A completeness review is assigned to every document; it does not mean that document is broken.</p>"
+                    f"<p>Evidence release: <code>{escape(evidence.release_id)}</code></p>"
+                    f"<p>{escape(report['limitation'])}</p>"
+                    "<p>Run <code>.venv/bin/python -m istopmm_evidence.quality_cli --help</code> for local "
+                    "inventory, review, problem and repair commands. Follow <code>docs/data-quality.md</code>. "
+                    "Reviews require comparison with the original; known errors must be repaired, not waived. "
+                    "Original files are accessed at their publication source, never served here.</p></details>")
         if selected:
             finding = next((item for item in report["findings"] if item["id"] == selected), None)
             if finding is None:
                 raise retrieval.NotFoundError("Unknown or stale quality finding")
             body += f"<h3>{escape(finding['title'] or finding['publication_id'])}</h3>"
             status, reason, instructions = quality_guidance(finding)
-            body += (f"<p><strong>{escape(QUALITY_LABELS[finding['code']])}</strong> — "
-                     f"{escape(quality_document(finding['document_role']))}; "
+            body += (f'<p class="meta"><span class="badge {"ok" if finding["resolved"] else "warn"}">'
+                     f"{escape(QUALITY_LABELS[finding['code']])}</span> "
+                     f'<span class="chip">{escape(quality_document(finding["document_role"]))}</span> '
                      f"{escape(quality_location(finding['locator']))}</p>"
                      f"<h3>Why this is flagged</h3><p><strong>{escape(status)}</strong> {escape(reason)}</p>"
                      f"<h3>What to do</h3><p>{escape(instructions)}</p>")
@@ -1425,30 +2449,62 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 f"<dt>{escape(key)}</dt><dd>{escape(json.dumps(value, ensure_ascii=False))}</dd>"
                 for key, value in finding.items()) + "</dl></details>"
         else:
-            findings = [item for item in report["findings"]
-                        if (show == "all" or not item["resolved"]) and (not kind or item["code"] == kind)]
+            rank = {code: position for position, code in enumerate(QUALITY_LABELS)}
+            findings = sorted((item for item in report["findings"]
+                               if (show == "all" or not item["resolved"]) and (not kind or item["code"] == kind)),
+                              key=lambda item: (rank.get(item["code"], len(rank)), item["resolved"],
+                                                (item["title"] or item["publication_id"]).casefold()))
+            generic = {"coverage_review", "missing_text", "missing_unit", "ocr_review", "inventory_missing"}
+            group = None
             for finding in findings[offset:offset + 25]:
-                body += ('<article class="source-entry"><details><summary>'
-                         + link({"finding": finding["id"]}, escape(finding["title"] or finding["publication_id"]))
-                         + f" &mdash; {escape(quality_document(finding['document_role']))}; "
-                         + escape(quality_location(finding["locator"])) + f"; {escape(QUALITY_LABELS[finding['code']])}"
-                         + (" (reviewed)" if finding["resolved"] else "") + "</summary>"
-                         + f"<p>{escape(quality_guidance(finding)[0])} {escape(quality_guidance(finding)[1])}</p>"
-                         + f"<p>{escape(finding['next_action'])}</p>"
-                         + f"<p>Finding: <code>{finding['id']}</code></p></details></article>")
+                if finding["code"] != group:
+                    if group is not None:
+                        body += "</ul></section>"
+                    group = finding["code"]
+                    members = [item for item in findings if item["code"] == group]
+                    pending = sum(not item["resolved"] for item in members)
+                    tally = f"{pending} pending" + (f", {len(members) - pending} reviewed" if show == "all" and len(members) > pending else "")
+                    next_action = next((item["next_action"] for item in members if not item["resolved"]), "")
+                    body += ('<section class="finding-group"><div class="group-head">'
+                             f"<h3>{escape(QUALITY_LABELS[group])}</h3>"
+                             f'<span class="badge {"warn" if pending else "ok"}">{tally}</span></div>'
+                             f'<p class="meta"><strong>{escape(quality_guidance(finding)[0])}</strong> '
+                             f"{escape(next_action)}</p>"
+                             '<ul class="finding-list">')
+                state = ""
+                if show == "all":
+                    state = ('<span class="badge ok">Reviewed</span>' if finding["resolved"]
+                             else '<span class="badge warn">Pending</span>')
+                detail = ("" if finding["code"] in generic else f"<small>{escape(finding['message'])}</small>")
+                body += (f'<li><a class="finding-row" href="{href({"finding": finding["id"], **({"show": "all"} if show == "all" else {}), **({"kind": kind} if kind else {})})}">'
+                         f'<span class="finding-main"><strong>{escape(finding["title"] or finding["publication_id"])}</strong>'
+                         f'<span class="meta"><span class="chip">{escape(quality_document(finding["document_role"]))}</span> '
+                         f"{escape(quality_location(finding['locator']))}</span>{detail}</span>{state}</a></li>")
+            if group is not None:
+                body += "</ul></section>"
             if not findings:
-                body += "<p>No pending findings.</p>"
+                body += ('<p class="empty-state">' + ("No pending findings." if show == "pending" else
+                                                      "No findings in this selection.") + "</p>")
+            elif len(findings) > 25:
+                body += (f'<p class="meta">Showing {offset + 1}–{min(offset + 25, len(findings))} '
+                         f"of {len(findings)} findings.</p>")
+            body += '<nav class="pager">'
             if offset:
                 body += link({"offset": max(0, offset - 25), "show": show, "kind": kind}, "Previous")
             if offset + 25 < len(findings):
-                body += " | " + link({"offset": offset + 25, "show": show, "kind": kind}, "Next")
+                body += link({"offset": offset + 25, "show": show, "kind": kind}, "Next")
+            body += "</nav>"
         return page("Data quality", body)
 
     app = Flask(__name__, static_folder=None)
+    app.extensions["citation_discovery"] = discovery_state
+    app.extensions["metadata_update"] = metadata_state
     app.json.ensure_ascii = False
     app.json.sort_keys = False
     for path, endpoint, view in (
             ("/api/<endpoint>", "api", api), ("/", "overview", overview),
+            ("/settings", "project_settings", project_settings),
+            ("/discovery", "discovery", discovery_page),
             ("/library", "library", library), ("/sources", "sources", sources),
             ("/publications", "publications", catalog_page), ("/coverage", "coverage", catalog_page),
             ("/quality", "quality", quality_page),
@@ -1457,6 +2513,15 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             ("/connect", "connect", connect_page),
             ("/style.css", "stylesheet", stylesheet)):
         app.add_url_rule(path, endpoint, view, methods=["GET"])
+    app.add_url_rule("/settings/initialize", "initialize_project", initialize_project, methods=["POST"])
+    app.add_url_rule("/settings/reset", "reset_project", reset_project, methods=["POST"])
+    app.add_url_rule("/settings/attach-pdf", "attach_project_pdf", attach_project_pdf, methods=["POST"])
+    app.add_url_rule("/discovery", "start_discovery", start_discovery, methods=["POST"])
+    app.add_url_rule("/settings/configure-metadata", "configure_project_metadata",
+                     configure_project_metadata, methods=["POST"])
+    app.add_url_rule("/settings/metadata-progress", "metadata_progress", metadata_progress, methods=["GET"])
+    app.add_url_rule("/settings/openalex-key", "save_project_openalex_key",
+                     save_project_openalex_key, methods=["POST"])
     app.add_url_rule("/library/provide", "provide", provide, methods=["POST"])
     app.config["MAX_CONTENT_LENGTH"] = 65 * 1024 * 1024
     if can_provide() and (data_root / "releases/provided-sources/ledger.json").exists():
@@ -1467,10 +2532,12 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
     @app.before_request
     def local_boundary():
         host = request.headers.get("host")
-        allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
-        if host not in allowed:
+        local_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if host not in local_hosts:
             return Response("Untrusted host", status=421, mimetype="text/plain")
-        if request.headers.get("origin") not in (None, f"http://{host}"):
+        local_origins = {f"http://{local_host}" for local_host in local_hosts}
+        origin = request.headers.get("origin")
+        if origin is not None and origin not in local_origins:
             return Response("Untrusted origin", status=403, mimetype="text/plain")
 
     def error_response(message, code, status):
@@ -1523,7 +2590,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         response.headers.update({
             "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
             "Content-Security-Policy": "default-src 'none'; style-src 'self'; script-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-            "Referrer-Policy": "no-referrer",
+            "Referrer-Policy": "same-origin",
         })
         return response
 
@@ -1542,11 +2609,15 @@ def main():
     parser.add_argument("--mcp-url", default="http://127.0.0.1:8000/mcp")
     parser.add_argument("--data-root", type=Path, help="Local inventory workspace (inferred from the registry by default)")
     parser.add_argument("--quality-root", type=Path, help="Operator quality records (default: releases/data-quality)")
+    parser.add_argument("--project-root", type=Path, help="Enable project initialization and reset settings")
+    parser.add_argument("--pdf-data-root", type=Path, default=Path("releases/pdf-data"),
+                        help="Shared local PDF folder offered in project settings")
     args = parser.parse_args()
     try:
         app = create_app(release=args.release, registry=args.registry, profiles=set(args.allow_profile),
                          allowed_collections=args.allow_collection, default_collections=args.default_collection,
-                         port=args.port, mcp_url=args.mcp_url, data_root=args.data_root, quality_root=args.quality_root)
+                         port=args.port, mcp_url=args.mcp_url, data_root=args.data_root, quality_root=args.quality_root,
+                         project_root=args.project_root, pdf_data_root=args.pdf_data_root)
     except (OSError, ValueError, sqlite3.Error, ValidationError) as error:
         diagnostic("web_startup_failed", exception_type=type(error).__name__)
         return 1

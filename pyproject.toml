@@ -19,6 +19,7 @@ build = ["PyMuPDF==1.26.7"]
 dev = ["build>=1.2,<2", "pip>=23"]
 
 [project.scripts]
+research-mcp-check = "istopmm_evidence.connection_check:main"
 istopmm-evidence = "istopmm_evidence.cli:main"
 istopmm-build = "istopmm_evidence.build_cli:main"
 istopmm-release = "istopmm_evidence.release_cli:main"

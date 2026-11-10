@@ -144,7 +144,10 @@ def crossref_reference(seed, index, reference):
     }
 
 
-def discover(root, manifest, api, *, project_scope=False):
+def discover(root, manifest, api, *, project_scope=False, directions=("background", "impact")):
+    directions = frozenset(directions)
+    if not directions or not directions <= {"background", "impact"}:
+        raise ValueError("Select references, citing papers, or both")
     root = Path(root)
     with Path(manifest).open(newline="") as stream:
         seeds = list(csv.DictReader(stream))
@@ -205,12 +208,15 @@ def discover(root, manifest, api, *, project_scope=False):
                 refs = work.get("referenced_works")
                 if not isinstance(refs, list) or len(refs) != len(set(refs)):
                     raise ValueError("Invalid OpenAlex reference identifiers")
-                for value in refs:
+                for value in refs if "background" in directions else []:
                     pending.setdefault(work_id(value), []).append((seed, "background", origin))
                 page, count, total = 1, 0, None
-                while True:
+                cursor = "*" if api.client.openalex_api_key else None
+                seen_cursors = set()
+                while "impact" in directions:
                     payload, source = api.get("https://api.openalex.org/works", {
-                        "filter": "cites:" + seed_id, "select": FIELDS, "per-page": 200, "page": page,
+                        "filter": "cites:" + seed_id, "select": FIELDS, "per-page": 100,
+                        **({"cursor": cursor} if cursor is not None else {"page": page}),
                     })
                     if not payload or not isinstance(payload.get("results"), list):
                         raise ValueError("Invalid citing-work page")
@@ -230,18 +236,28 @@ def discover(root, manifest, api, *, project_scope=False):
                         break
                     if not payload["results"] or count > total:
                         raise ValueError("Nonadvancing OpenAlex citation pagination")
-                    if page * 200 >= 10000:
+                    if cursor is not None:
+                        seen_cursors.add(cursor)
+                        next_cursor = payload["meta"].get("next_cursor")
+                        if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen_cursors:
+                            raise ValueError("Nonadvancing OpenAlex citation cursor")
+                        cursor = next_cursor
+                    elif page * 100 >= 10000:
                         raise ValueError("OpenAlex numbered-page ceiling reached; credentialed cursor acquisition required")
                     page += 1
                 report["providers"]["openalex"] = {
                     "status": "complete_indexed_neighborhood", "work_id": seed_id,
                     "references_reported": len(refs), "citations_retrieved": count,
                     "citations_reported": total, "source": source_ref(origin),
+                    "requested_directions": sorted(directions),
                 }
         except (literature.DiscoveryError, ValueError, KeyError, TypeError) as error:
             report["providers"]["openalex"] = {"status": "failed", "error": str(error)}
             print(json.dumps({"event": "citation_provider_failed", "seed": seed, "provider": "openalex",
                               "error": str(error)}), file=sys.stderr, flush=True)
+        if "background" not in directions:
+            atomic_json(root, "discovery-progress.json", {"seeds": seed_reports, "nodes": len(nodes), "edges": len(edges)})
+            continue
         try:
             payload, source = api.get("https://api.crossref.org/works/" + seed)
             if payload is None:
@@ -329,6 +345,7 @@ def discover(root, manifest, api, *, project_scope=False):
                   if project_scope else
                   "Exactly one hop from the 45 iStopMM main-publication DOIs. No neighbor expansion."),
         "limitations": [
+            "Requested directions: " + ", ".join(sorted(directions)) + ". Unrequested directions were not searched.",
             "Provider-indexed citations only; zero results do not prove no citations.",
             "Crossref reference deposits and OpenAlex indexing may omit publications or unstructured references.",
             "Citation edges show reference links, not agreement, independent evidence or causal impact.",
@@ -341,11 +358,11 @@ def discover(root, manifest, api, *, project_scope=False):
     return result
 
 
-def publish_metadata(root):
+def publish_metadata(root, *, project_scope=False):
     graph = releases.read_json((root / "neighborhood.json").read_bytes())
     identifier = releases.sha256(releases.encode(graph))
     run = {"id": identifier, "provider": "openalex_crossref", "query": graph["scope"],
-           "policy_version": "istopmm-first-tier-1",
+           "policy_version": "project-first-tier-1" if project_scope else "istopmm-first-tier-1",
            "policy_sha256": releases.sha256(releases.encode(graph["limitations"])),
            "from_date": "1000-01-01", "through_date": date.today().isoformat(),
            "started_at": graph["acquired_at"], "updated_at": graph["acquired_at"],
@@ -368,7 +385,9 @@ def publish_metadata(root):
                                "requests": requests[start:start + 20]})
             report = catalog.write_sqlite(
                 output, spool, [run], as_of=date.today().isoformat(),
-                rationale="First-tier iStopMM background/impact metadata; not scientific approval or full-text evidence.",
+                rationale=("Project reference/citation metadata; not scientific approval or full-text evidence."
+                           if project_scope else
+                           "First-tier iStopMM background/impact metadata; not scientific approval or full-text evidence."),
                 authorization_basis="User-approved private local evaluation; remote redistribution requires review.",
                 istopmm_dois=[seed["seed_doi"] for seed in graph["seeds"]], relationships=())
     snapshot = catalog.open_snapshot(output, validate_records=True)

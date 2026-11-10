@@ -1,20 +1,25 @@
 import asyncio
 import csv
+import io
 import json
+import re
 from datetime import timedelta
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
+import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 import pymupdf
 
 from tools import project_library
-from istopmm_evidence import web_server
+from istopmm_evidence import collections, literature, web_server
 
 
 class ProjectLibraryTests(unittest.TestCase):
@@ -40,6 +45,36 @@ class ProjectLibraryTests(unittest.TestCase):
             ])
         self.assertEqual(len(project_library.status(self.root)["papers"]), 1)
 
+    def test_openalex_key_settings_private_storage_and_removal(self):
+        app = web_server.create_app(
+            registry=self.root / "registry", project_root=self.root,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        base = "http://localhost:8080"
+        settings = client.get("/settings", base_url=base).get_data(as_text=True)
+        self.assertIn("https://openalex.org/settings/api-key", settings)
+        self.assertIn('type="password"', settings)
+        token = re.search(r'action="/settings/openalex-key">\s*<input type="hidden" name="token" value="([^"]+)"',
+                          settings).group(1)
+        key = "synthetic-private-key"
+        self.assertEqual(client.post("/settings/openalex-key", data={"api_key": key}, base_url=base).status_code, 403)
+        response = client.post("/settings/openalex-key", data={"api_key": key, "token": token}, base_url=base)
+        self.assertEqual(response.status_code, 303)
+        path = project_library.openalex_key_path(self.root)
+        self.assertEqual(path.read_text().strip(), key)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        settings = client.get("/settings", base_url=base).get_data(as_text=True)
+        self.assertNotIn(key, settings)
+        self.assertIn("<strong>Configured</strong>", settings)
+        self.assertEqual(client.post("/settings/openalex-key", data={
+            "api_key": "bad key", "token": token}, base_url=base).status_code, 400)
+        self.assertEqual(path.read_text().strip(), key)
+        project_library.reset(self.root)
+        self.assertTrue(path.exists())
+        self.assertEqual(client.post("/settings/openalex-key", data={
+            "action": "remove", "token": token}, base_url=base).status_code, 303)
+        self.assertFalse(path.exists())
+
     def test_initial_csv_is_validated_before_creating_project(self):
         project = self.root.parent / "new-project"
         invalid = [{"doi": "10.0000/one", "title": "First"},
@@ -49,6 +84,420 @@ class ProjectLibraryTests(unittest.TestCase):
         self.assertFalse(project.exists())
         project_library.initialize(project, "New", "Private permission", invalid[:1])
         self.assertEqual(project_library.status(project)["papers"][0]["status"], "awaiting_pdf")
+
+    def test_web_settings_initialize_csv_and_confirm_factory_reset(self):
+        project = self.root.parent / "web-project"
+        app = web_server.create_app(
+            registry=project / "registry", project_root=project, profiles={"private_context"},
+            allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        base_url = "http://localhost:8080"
+        self.assertEqual(client.get("/", base_url=base_url).status_code, 302)
+        settings = client.get("/settings", base_url=base_url)
+        self.assertEqual(settings.status_code, 200)
+        self.assertIn(b"Initialize project", settings.data)
+        response = client.post("/settings/initialize", data={
+            "name": "Web project",
+            "authorization": "Authorized fictional private data",
+            "papers": (io.BytesIO(b"doi,title\n10.0000/web,Fictional web paper\n"), "papers.csv"),
+        }, base_url=base_url, headers={"Origin": "http://127.0.0.1:8080"})
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(project_library.status(project)["papers"][0]["status"], "awaiting_pdf")
+        self.assertIn(b"Fictional web paper", client.get("/settings", base_url=base_url).data)
+        pdf = self.pdf("web-project.pdf", "Fictional evidence for testing settings reset.")
+        project_library.attach(project, "10.0000/web", pdf, identity_confirmed=True)
+        self.assertEqual(client.get("/", base_url=base_url).status_code, 200)
+        rejected = client.post("/settings/reset", data={"confirmation": "yes"}, base_url=base_url)
+        self.assertEqual(rejected.status_code, 400)
+        self.assertTrue(project.exists())
+        reset = client.post("/settings/reset", data={"confirmation": "RESET PROJECT"}, base_url=base_url)
+        self.assertEqual(reset.status_code, 303)
+        self.assertFalse(project.exists())
+        self.assertTrue(pdf.exists())
+        self.assertIn(b"Initialize project", client.get("/settings", base_url=base_url).data)
+        reinitialized = client.post("/settings/initialize", data={
+            "name": "Web project restarted",
+            "authorization": "Authorized fictional private data",
+            "papers": (io.BytesIO(b"doi,title\n10.0000/web,Fictional web paper\n"), "papers.csv"),
+        }, base_url=base_url)
+        self.assertEqual(reinitialized.status_code, 303)
+        project_library.attach(project, "10.0000/web", pdf, identity_confirmed=True)
+        self.assertEqual(client.get("/", base_url=base_url).status_code, 200)
+
+    def test_web_settings_accept_json_core_manifest(self):
+        project = self.root.parent / "json-web-project"
+        app = web_server.create_app(
+            registry=project / "registry", project_root=project, profiles={"private_context"},
+            allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        response = client.post("/settings/initialize", data={
+            "name": "JSON project",
+            "authorization": "Authorized fictional private data",
+            "papers": (io.BytesIO(json.dumps({
+                "schema_version": 1,
+                "papers": [{"doi": "10.0000/json", "title": "Fictional JSON paper"}],
+            }).encode()), "papers.json"),
+        }, base_url="http://localhost:8080")
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(project_library.status(project)["papers"][0]["doi"], "10.0000/json")
+
+    def test_web_attach_pdf_from_shared_data_folder(self):
+        project_library.register(self.root, [{"doi": "10.0000/folder", "title": "Folder paper"}])
+        folder = self.root.parent / "pdf-data"
+        folder.mkdir()
+        pdf = self.pdf("folder.pdf", "Fictional finding about apricot evidence.")
+        shutil.copyfile(pdf, folder / "folder.pdf")
+        (folder / "outside.pdf").symlink_to(pdf)
+        (folder / "notes.txt").write_text("Not a PDF")
+        app = web_server.create_app(
+            registry=self.root / "registry", project_root=self.root, pdf_data_root=folder,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        base = "http://localhost:8080"
+        settings = client.get("/settings", base_url=base).get_data(as_text=True)
+        self.assertIn('value="folder.pdf"', settings)
+        self.assertNotIn('value="outside.pdf"', settings)
+        self.assertNotIn('value="notes.txt"', settings)
+        self.assertNotIn('id="attach-paper"', settings)
+        self.assertRegex(settings, r'<td><details><summary>.*?awaiting_pdf.*?</summary><form')
+        self.assertIn('type="hidden" name="doi" value="10.0000/folder"', settings)
+        token = re.search(r'name="token" value="([^"]+)"', settings).group(1)
+        form = {"doi": "10.0000/folder", "pdf": "folder.pdf", "token": token}
+        self.assertEqual(client.post("/settings/attach-pdf", data=form, base_url=base).status_code, 400)
+        form["confirm_identity"] = "yes"
+        for invalid in ("../folder.pdf", str(pdf), "outside.pdf", "absent.pdf"):
+            self.assertEqual(client.post("/settings/attach-pdf", data={**form, "pdf": invalid},
+                                         base_url=base).status_code, 400)
+        self.assertEqual(client.post("/settings/attach-pdf", data={**form, "token": "wrong"},
+                                     base_url=base).status_code, 403)
+        response = client.post("/settings/attach-pdf", data=form, base_url=base,
+                               headers={"Origin": base})
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(project_library.status(self.root)["papers"][0]["status"], "extracted")
+        self.assertNotIn('action="/settings/attach-pdf"', client.get("/settings", base_url=base).get_data(as_text=True))
+        result = project_library.store(self.root).call("search_evidence", {"query": "apricot"})
+        self.assertTrue(result["result"]["items"])
+        context = project_library.store(self.root).call("get_source_context", {
+            "unit_id": result["result"]["items"][0]["id"], "collections": ["core"],
+            "snapshot_id": result["collection_context"]["snapshot_id"],
+        })
+        self.assertIn("apricot", context["result"]["text"])
+        client.post("/settings/reset", data={"confirmation": "RESET PROJECT"}, base_url=base)
+        self.assertTrue((folder / "folder.pdf").is_file())
+
+    def test_web_attach_pdf_missing_data_folder(self):
+        project_library.register(self.root, [{"doi": "10.0000/folder", "title": "Folder paper"}])
+        app = web_server.create_app(
+            registry=self.root / "registry", project_root=self.root,
+            pdf_data_root=self.root.parent / "missing", profiles={"private_context"},
+            allowed_collections={"core"}, default_collections=["core"])
+        settings = app.test_client().get("/settings", base_url="http://localhost:8080")
+        self.assertEqual(settings.status_code, 200)
+        self.assertIn(b"No PDFs found", settings.data)
+
+    def test_connection_page_before_first_pdf_is_generic_and_pins_project(self):
+        app = web_server.create_app(
+            registry=self.root / "registry", project_root=self.root,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"])
+        response = app.test_client().get("/connect", base_url="http://localhost:8080")
+        self.assertEqual(response.status_code, 200)
+        text = response.get_data(as_text=True)
+        self.assertIn("PROJECT_ROOT=" + str(self.root), text)
+        self.assertIn("COLLECTION_REGISTRY=" + str(self.root / "registry"), text)
+        self.assertIn("--collection core", text)
+        self.assertIn("YOUR_SEARCH_TERM", text)
+        self.assertIn("attach at least one PDF", text)
+        self.assertNotIn("MGUS", text)
+        self.assertNotIn("myeloma", text)
+
+    def test_web_citation_discovery_directions_and_saved_results(self):
+        project_library.register(self.root, [{"doi": "10.0000/core", "title": "Core paper"}])
+        app = web_server.create_app(
+            registry=self.root / "registry", project_root=self.root,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        base = "http://localhost:8080"
+        text = client.get("/discovery", base_url=base).get_data(as_text=True)
+        self.assertIn("Find referenced papers", text)
+        self.assertIn("Find papers that reference my core library", text)
+        token = re.search(r'name="token" value="([^"]+)"', text).group(1)
+        self.assertEqual(client.post("/discovery", data={"direction": "impact"}, base_url=base).status_code, 403)
+
+        def discover(root, output, *, directions):
+            collections.atomic_json(output, "neighborhood.json", {
+                "limitations": ["Provider-indexed only"], "seeds": [{"providers": {"openalex": {"status": "failed"}}}],
+                "nodes": {"paper": {"record": {"title": "<script>Related paper</script>",
+                                             "identifiers": {"doi": "10.0000/related"}}}},
+                "edges": [{"direction": directions[0], "seed_doi": "10.0000/core",
+                           "target_provider_record": "paper"}],
+            })
+            return {"edges": 1, "unresolved": 0, "seeds_with_provider_gaps": 1}
+
+        with patch("istopmm_evidence.build.project_library.discover", side_effect=discover) as mocked:
+            for direction in ("background", "impact"):
+                response = client.post("/discovery", data={"direction": direction, "token": token}, base_url=base)
+                self.assertEqual(response.status_code, 303)
+                app.extensions["citation_discovery"]["thread"].join(timeout=5)
+                results = client.get(response.location, base_url=base)
+                self.assertEqual(results.status_code, 200)
+                self.assertIn(b"&lt;script&gt;Related paper&lt;/script&gt;", results.data)
+                self.assertIn(b"1 core papers with provider gaps", results.data)
+                self.assertEqual(mocked.call_args.kwargs["directions"], [direction])
+                library = client.get("/library", base_url=base)
+                self.assertEqual(library.status_code, 200)
+                self.assertIn(b"1 core papers; 1 additional discovered records", library.data)
+                self.assertIn(b"&lt;script&gt;Related paper&lt;/script&gt;", library.data)
+                self.assertIn(b"Awaiting PDF", library.data)
+                self.assertIn(b"Discovered", library.data)
+                linked = '<a href="https://doi.org/10.0000/core">Core paper</a>'
+                relation = (f"Core paper {linked} cites this paper." if direction == "background"
+                            else f"This paper cites core paper {linked}.")
+                self.assertIn(
+                    relation.encode(),
+                    library.data)
+        self.assertEqual(len(project_library.load(self.root)["papers"]), 1)
+
+    def test_project_library_discovery_persistence_pagination_and_core_status(self):
+        project_library.register(self.root, [{"doi": "10.0000/core", "title": "Core paper"}])
+        project_library.attach(self.root, "10.0000/core", self.pdf(
+            "core.pdf", "Fictional core evidence for testing the project library extraction status and discovery relationships."),
+                               identity_confirmed=True)
+        run = "a" * 32
+        output = self.root / "discovery" / run
+        nodes = {"core": {"record": {"title": "Provider core title", "identifiers": {"doi": "10.0000/core"}}}}
+        nodes.update({str(n): {"record": {"title": f"Related {n:03}", "identifiers": {"doi": f"10.0000/related-{n}"}}}
+                      for n in range(55)})
+        nodes["duplicate"] = nodes["0"]
+        nodes["unknown"] = {"record": {"title": "", "identifiers": {}},
+                            "reference": {"unstructured": "Unresolved reference <text>"}}
+        collections.atomic_json(output, "job.json", {
+            "status": "complete", "label": "Find referenced papers", "started_at": "2026-11-09T12:00:00Z"})
+        collections.atomic_json(output, "neighborhood.json", {
+            "nodes": nodes,
+            "edges": [{"target_provider_record": key, "direction": "background", "seed_doi": "10.0000/core"}
+                      for key in nodes],
+        })
+        app = web_server.create_app(
+            registry=self.root / "registry", project_root=self.root,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        base = "http://localhost:8080"
+        result = client.get("/library", base_url=base)
+        self.assertEqual(result.status_code, 200)
+        self.assertIn(b"1 core papers; 56 additional discovered records", result.data)
+        self.assertIn(b'<ul class="library-records" aria-label="Library papers">', result.data)
+        self.assertIn(b'<h3><a href="https://doi.org/10.0000/core">Core paper</a></h3><dl>', result.data)
+        self.assertIn(b'<dt>Library</dt><dd>Core</dd>', result.data)
+        self.assertIn(b'<summary>Connections to your core papers</summary>', result.data)
+        self.assertIn(b'Core paper <a href="https://doi.org/10.0000/core">Core paper</a> cites this paper.', result.data)
+        self.assertIn(b'Find referenced papers', result.data)
+        self.assertIn(b'2026-11-09T12:00:00Z</a>', result.data)
+        self.assertNotIn(b'>Search 1</a>', result.data)
+        self.assertIn(b">Extracted<", result.data)
+        self.assertIn(b">Next</a>", result.data)
+        last = client.get("/library?offset=50", base_url=base)
+        self.assertIn(b"Metadata only", last.data)
+        self.assertIn(b"Unresolved reference &lt;text&gt;", last.data)
+        filtered = client.get("/library?query=related-54", base_url=base)
+        self.assertIn(b"1 matching records", filtered.data)
+        self.assertIn(b"Related 054", filtered.data)
+        self.assertNotIn(b"Related 053", filtered.data)
+        sources = client.get("/sources", base_url=base)
+        self.assertEqual(sources.status_code, 200)
+        self.assertNotIn(b'<select name="collection">', sources.data)
+        self.assertNotIn(b"Endpoint default", sources.data)
+        self.assertIn(b"Showing AI evidence from <strong>Fictional research</strong>", sources.data)
+        for route in ("/publications", "/coverage"):
+            metadata = client.get(route, base_url=base)
+            self.assertEqual(metadata.status_code, 200)
+            self.assertNotIn(b'<select name="collection">', metadata.data)
+            self.assertIn(b"No metadata catalog is configured.", metadata.data)
+            self.assertIn(b"Project: <strong>Fictional research</strong>", metadata.data)
+        self.assertEqual(len(project_library.load(self.root)["papers"]), 1)
+
+    def test_web_discovery_failure_and_reset_guard(self):
+        project_library.register(self.root, [{"doi": "10.0000/core", "title": "Core paper"}])
+        app = web_server.create_app(
+            registry=self.root / "registry", project_root=self.root,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        base = "http://localhost:8080"
+        text = client.get("/discovery", base_url=base).get_data(as_text=True)
+        token = re.search(r'name="token" value="([^"]+)"', text).group(1)
+        event = threading.Event()
+
+        def fail(*args, **kwargs):
+            event.wait(timeout=5)
+            raise ValueError("Provider unavailable for this search")
+
+        with patch("istopmm_evidence.build.project_library.discover", side_effect=fail):
+            response = client.post("/discovery", data={"direction": "impact", "token": token}, base_url=base)
+            try:
+                self.assertEqual(client.post("/settings/reset", data={"confirmation": "RESET PROJECT"},
+                                             base_url=base).status_code, 409)
+                self.assertEqual(client.post("/discovery", data={"direction": "impact", "token": token},
+                                             base_url=base).status_code, 409)
+                self.assertEqual(client.post("/settings/configure-metadata", data={"token": token},
+                                             base_url=base).status_code, 409)
+            finally:
+                event.set()
+                app.extensions["citation_discovery"]["thread"].join(timeout=5)
+            result = client.get(response.location, base_url=base)
+            self.assertIn(b"Provider unavailable for this search", result.data)
+
+    def test_library_missing_titles_sort_last_and_use_saved_doi_metadata(self):
+        run = "b" * 32
+        output = self.root / "discovery" / run
+        collections.atomic_json(output, "job.json", {
+            "status": "complete", "label": "Find referenced papers", "started_at": "2026-11-10T12:00:00Z"})
+        collections.atomic_json(output, "neighborhood.json", {
+            "nodes": {
+                "reference": {"record": {"title": "", "identifiers": {"doi": "10.0000/resolved"}}},
+                "metadata": {"record": {"title": "Recovered <title>", "identifiers": {"doi": "10.0000/RESOLVED"}}},
+                "missing": {"record": {"title": "", "identifiers": {"doi": "10.0000/missing"}}},
+                "named": {"record": {"title": "Zebra paper", "identifiers": {"doi": "10.0000/named"}}},
+            },
+            "edges": [{"target_provider_record": key, "direction": "background", "seed_doi": "10.0000/core"}
+                      for key in ("missing", "reference", "named")],
+        })
+        app = web_server.create_app(
+            registry=self.root / "registry", project_root=self.root,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        response = client.get("/library", base_url="http://localhost:8080")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Recovered &lt;title&gt;", response.data)
+        self.assertLess(response.data.index(b"Zebra paper"), response.data.index(b"[Unresolved title]"))
+        filtered = client.get("/library?query=Recovered", base_url="http://localhost:8080")
+        self.assertIn(b"1 matching records", filtered.data)
+
+    def test_configure_metadata_from_saved_searches_and_preserve_on_attachment(self):
+        from tests.test_citation_neighborhood import work
+        project_library.register(self.root, [
+            {"doi": "10.0000/paper-1", "title": "Core one"},
+            {"doi": "10.0000/paper-2", "title": "Core two"},
+        ])
+        project_library.attach(self.root, "10.0000/paper-1", self.pdf(
+            "first.pdf", "Fictional first core evidence with enough native text for a private metadata catalog test."),
+            identity_confirmed=True)
+        with self.assertRaisesRegex(ValueError, "Complete a Find related papers search"):
+            project_library.configure_metadata(self.root)
+
+        def handler(request):
+            if request.url.host == "api.crossref.org":
+                identifier = request.url.path.removeprefix("/works/")
+                return httpx.Response(200, json={"message": {
+                    "DOI": identifier, "reference": [], "reference-count": 0}})
+            if "/https://doi.org/" in request.url.path:
+                return httpx.Response(200, json=work(int(request.url.path.rsplit("-", 1)[-1])))
+            expression = request.url.params["filter"]
+            values = ([work(101)] if expression == "cites:W1" else []
+                      if expression.startswith("cites:") else
+                      [work(int(value[1:])) for value in expression.split(":", 1)[1].split("|")])
+            return httpx.Response(200, json={"meta": {"count": len(values)}, "results": values})
+
+        client_class = literature.MetadataClient
+        for direction, name in (("background", "a" * 32), ("impact", "b" * 32)):
+            output = self.root / "discovery" / name
+            with patch.object(project_library.literature, "MetadataClient", side_effect=lambda: client_class(
+                    transport=httpx.MockTransport(handler), sleep=lambda _: None, clock=lambda: 0)):
+                project_library.discover(self.root, output, directions=[direction])
+            collections.atomic_json(output, "job.json", {
+                "status": "complete", "label": "Synthetic search", "started_at": "2026-11-10T12:00:00Z"})
+        app = web_server.create_app(
+            registry=self.root / "registry", project_root=self.root,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        base = "http://localhost:8080"
+        page = client.get("/publications", base_url=base)
+        self.assertIn(b"Configure/update metadata catalog", page.data)
+        token = re.search(r'name="token" value="([^"]+)"', page.get_data(as_text=True)).group(1)
+        self.assertEqual(client.post("/settings/configure-metadata", base_url=base).status_code, 403)
+        response = client.post("/settings/configure-metadata", data={"token": token}, base_url=base)
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.location, "/settings/metadata-progress")
+        app.extensions["metadata_update"]["thread"].join(timeout=10)
+        status = client.get(response.location, base_url=base)
+        self.assertIn(b"Metadata catalog updated", status.data)
+        self.assertNotIn("Refresh", status.headers)
+        metadata = client.get("/publications?query=Fictional", base_url=base)
+        self.assertEqual(metadata.status_code, 200)
+        self.assertIn(b"Fictional paper", metadata.data)
+        self.assertNotIn(b"No metadata catalog is configured.", metadata.data)
+        self.assertIn(b"Core library overlap", metadata.data)
+        self.assertNotIn(b"Istopmm overlap", metadata.data)
+        self.assertNotIn(b"<dt>Diseases</dt>", metadata.data)
+        self.assertNotIn(b'<select name="collection">', metadata.data)
+        coverage = client.get("/coverage", base_url=base)
+        self.assertEqual(coverage.status_code, 200)
+        self.assertNotIn(b'<button>Filter</button>', coverage.data)
+        self.assertIn(b'<button>Filter</button>', metadata.data)
+        self.assertNotIn(b'action="/settings/configure-metadata"', coverage.data)
+        self.assertIn(b'open Publication metadata</a>', coverage.data)
+        self.assertIn(b"1 of 2 core papers have attached PDFs and retained extracted text", coverage.data)
+        self.assertIn(b"excludes core evidence", coverage.data)
+        self.assertIn(b"not project-wide full-text totals", coverage.data)
+        self.assertIn(b"Full-text availability unknown from saved metadata", coverage.data)
+        self.assertIn(b"not a count of unavailable PDFs or failed downloads", coverage.data)
+        self.assertNotIn(b"Full text not reported count", coverage.data)
+        self.assertIn(b"Core library overlap", coverage.data)
+        self.assertNotIn(b"Istopmm overlap", coverage.data)
+        self.assertNotIn(b"<dt>Diseases</dt>", coverage.data)
+        self.assertNotIn(b"<dt>Disease</dt>", coverage.data)
+        self.assertIn(b'action="/settings/configure-metadata"', metadata.data)
+        before = project_library.store(self.root).current()
+        catalog_id = next(e["release_id"] for e in before.document["collections"] if e["id"] == "metadata")
+        project_library.attach(self.root, "10.0000/paper-2", self.pdf(
+            "second.pdf", "Fictional second core evidence with different native text to test catalog preservation."),
+            identity_confirmed=True)
+        after = project_library.store(self.root).current()
+        self.assertEqual(catalog_id, next(
+            e["release_id"] for e in after.document["collections"] if e["id"] == "metadata"))
+        self.assertIn(b"Fictional paper", client.get("/publications?query=Fictional", base_url=base).data)
+        self.assertEqual(client.post(
+            "/settings/configure-metadata", data={"token": token}, base_url=base).status_code, 303)
+        app.extensions["metadata_update"]["thread"].join(timeout=10)
+
+    def test_metadata_update_progress_failure_and_reset_guard(self):
+        app = web_server.create_app(
+            registry=self.root / "registry", project_root=self.root,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        base = "http://localhost:8080"
+        token = re.search(r'name="token" value="([^"]+)"',
+                          client.get("/discovery", base_url=base).get_data(as_text=True)).group(1)
+        waiting = threading.Event()
+        started = threading.Event()
+
+        def update(root, *, progress):
+            progress("Building catalog from test records")
+            started.set()
+            waiting.wait(timeout=5)
+            raise ValueError("Synthetic catalog failure")
+
+        with patch("istopmm_evidence.build.project_library.configure_metadata", side_effect=update) as mocked:
+            response = client.post("/settings/configure-metadata", data={"token": token}, base_url=base)
+            try:
+                self.assertEqual(response.status_code, 303)
+                self.assertTrue(started.wait(timeout=5))
+                status = client.get(response.location, base_url=base)
+                self.assertIn(b"Building catalog from test records", status.data)
+                self.assertIn(b"<progress", status.data)
+                self.assertEqual(status.headers["Refresh"], "2")
+                self.assertEqual(client.post("/settings/reset", data={"confirmation": "RESET PROJECT"},
+                                             base_url=base).status_code, 409)
+                self.assertEqual(client.post("/settings/configure-metadata", data={"token": token},
+                                             base_url=base).status_code, 303)
+                self.assertEqual(mocked.call_count, 1)
+                self.assertEqual(client.get("/publications", base_url=base).status_code, 302)
+            finally:
+                waiting.set()
+                app.extensions["metadata_update"]["thread"].join(timeout=5)
+        status = client.get("/settings/metadata-progress", base_url=base)
+        self.assertIn(b"Synthetic catalog failure", status.data)
+        self.assertNotIn("Refresh", status.headers)
+        collections.atomic_json(self.root, "metadata-job.json", {"status": "running", "message": "Old update"})
+        self.assertIn(b"interrupted", client.get("/settings/metadata-progress", base_url=base).data)
 
     def test_installed_cli_works_outside_source_tree(self):
         project = self.root.parent / "cli-project"

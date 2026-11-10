@@ -103,6 +103,20 @@ class CitationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "checksum"):
             api.get(url)
 
+    def test_directional_discovery_only_queries_requested_relationships(self):
+        for direction in ("background", "impact"):
+            self.requests.clear()
+            with self.subTest(direction=direction), redirect_stderr(io.StringIO()):
+                api = self.api(self.handler)
+                api.root = self.root / ("responses-" + direction)
+                graph = citation.discover(self.root / direction, self.manifest, api,
+                                          directions=[direction])
+                self.assertEqual({edge["direction"] for edge in graph["edges"]}, {direction})
+                citing_queries = [r for r in self.requests if r.url.params.get("filter", "").startswith("cites:")]
+                crossref_queries = [r for r in self.requests if r.url.host == "api.crossref.org"]
+                self.assertEqual(bool(citing_queries), direction == "impact")
+                self.assertEqual(bool(crossref_queries), direction == "background")
+
     def test_project_scope_accepts_configurable_seed_count(self):
         with self.manifest.open("w", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=["number", "doi", "title", "filename"])
@@ -143,6 +157,53 @@ class CitationTests(unittest.TestCase):
         failure = graph["seeds"][0]["providers"]["openalex"]
         self.assertEqual(failure["status"], "failed")
         self.assertIn("Repeated citing publication", failure["error"])
+
+    def test_authenticated_cursors_cross_page_limit_and_keep_key_out_of_provenance(self):
+        secret = "synthetic-openalex-test-key"
+        def handler(request):
+            if request.url.host == "api.openalex.org":
+                self.assertEqual(request.headers.get("Authorization"), "Bearer " + secret)
+            else:
+                self.assertNotIn("Authorization", request.headers)
+            self.assertNotIn(secret, str(request.url))
+            if request.url.params.get("filter") == "cites:W1":
+                cursor = request.url.params["cursor"]
+                self.assertNotIn("page", request.url.params)
+                self.assertEqual(request.url.params["per-page"], "100")
+                start = 0 if cursor == "*" else int(cursor)
+                results = []
+                for number in range(start, min(start + 100, 10001)):
+                    record = work(number + 1000)
+                    record["referenced_works"] = ["https://openalex.org/W1"]
+                    results.append(record)
+                return httpx.Response(200, json={
+                    "meta": {"count": 10001, "next_cursor": str(start + 100)}, "results": results})
+            return self.handler(request)
+
+        with self.manifest.open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=["number", "doi", "title", "filename"])
+            writer.writeheader()
+            writer.writerow({"number": 1, "doi": "10.0000/paper-1", "title": "Seed", "filename": ""})
+        api = self.api(handler)
+        api.client.openalex_api_key = secret
+        with redirect_stderr(io.StringIO()):
+            graph = citation.discover(self.root / "cursor-run", self.manifest, api, project_scope=True)
+        self.assertEqual(graph["seeds"][0]["providers"]["openalex"]["citations_retrieved"], 10001)
+        for path in self.root.rglob("*.json"):
+            self.assertNotIn(secret, path.read_text())
+
+    def test_repeated_cursor_is_explicit_provider_failure(self):
+        def handler(request):
+            if request.url.params.get("filter") == "cites:W1":
+                return httpx.Response(200, json={
+                    "meta": {"count": 2, "next_cursor": "*"}, "results": [work(101)]})
+            return self.handler(request)
+        api = self.api(handler)
+        api.client.openalex_api_key = "synthetic-test-key"
+        with redirect_stderr(io.StringIO()):
+            graph = citation.discover(self.root / "cursor-failure", self.manifest, api)
+        self.assertIn("Nonadvancing OpenAlex citation cursor",
+                      graph["seeds"][0]["providers"]["openalex"]["error"])
 
     def test_license_gate_does_not_treat_free_access_as_permission(self):
         value = work(100)

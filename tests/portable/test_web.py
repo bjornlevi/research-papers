@@ -18,6 +18,25 @@ from test_releases import fixture_bundle
 
 
 class WebTests(unittest.TestCase):
+    def test_metadata_fields_are_structured_escaped_and_safely_linked(self):
+        rendered = web_server.metadata_value([{
+            "provider_record": "<script>unsafe</script>",
+            "requests": [{"url": "https://example.org/paper?a=1&b=2", "retrieved_at": "2026-11-10"}],
+            "reviewed": False, "missing": None, "empty": [],
+        }])
+        self.assertIn('<ul class="metadata-list">', rendered)
+        self.assertIn('<dl class="metadata-fields">', rendered)
+        self.assertIn("<dt>Provider record</dt>", rendered)
+        self.assertIn("&lt;script&gt;unsafe&lt;/script&gt;", rendered)
+        self.assertIn('href="https://example.org/paper?a=1&amp;b=2"', rendered)
+        self.assertIn(">Open link (example.org)</a>", rendered)
+        self.assertNotIn(">https://example.org/", rendered)
+        self.assertIn("<dd>No</dd>", rendered)
+        self.assertIn("Unknown / not recorded", rendered)
+        self.assertIn("None recorded", rendered)
+        for unsafe in ("javascript:alert(1)", "https://[invalid", "https://user:pass@example.org/"):
+            self.assertNotIn("<a ", web_server.metadata_value(unsafe))
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -68,6 +87,7 @@ class WebTests(unittest.TestCase):
         self.assertIn("<summary>", sources.text)
         self.assertNotIn("<details open", sources.text)
         self.assertEqual(sources.headers["cache-control"], "no-store")
+        self.assertEqual(sources.headers["referrer-policy"], "same-origin")
         self.assertIn("frame-ancestors 'none'", sources.headers["content-security-policy"])
         self.assertIn("No matching sources", client.get("/sources?paper=missing").text)
         for path in ("/mcp", "/papers/file.pdf", "/state.json", "/../records.json"):
@@ -84,12 +104,19 @@ class WebTests(unittest.TestCase):
                 response = client.get("/sources?" + query)
                 self.assertEqual(response.status_code, 400)
         for headers, status in (({"Host": "evil.test:8080"}, 421),
-                                ({"Origin": "https://evil.test"}, 403)):
+                                ({"Origin": "https://evil.test"}, 403),
+                                ({"Origin": "null"}, 403)):
             response = client.get("/", headers=headers)
             self.assertEqual(response.status_code, status)
             self.assertEqual(response.headers["cache-control"], "no-store")
             self.assertEqual(response.headers["x-content-type-options"], "nosniff")
         self.assertEqual(client.get("/", headers={"Host": "localhost:8080"}).status_code, 200)
+        self.assertEqual(client.get("/", headers={
+            "Host": "127.0.0.1:8080", "Origin": "http://localhost:8080",
+        }).status_code, 200)
+        self.assertEqual(client.get("/", headers={
+            "Host": "localhost:8080", "Origin": "http://127.0.0.1:8080",
+        }).status_code, 200)
 
     def test_collection_pagination_and_retained_snapshot(self):
         root = self.root / "collections"

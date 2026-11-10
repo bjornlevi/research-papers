@@ -73,7 +73,8 @@ class ConnectionTests(unittest.TestCase):
                 page = client.get("/connect")
                 self.assertEqual(page.status_code, 200)
                 self.assertIn("https://evidence.example.test/mcp", page.text)
-                self.assertIn("istopmm-mcp-check", page.text)
+                self.assertIn("research-mcp-check", page.text)
+                self.assertNotIn("istopmm", page.text)
                 self.assertIn("Python MCP SDK", page.text)
                 self.assertIn("Claude Code 2.1.311", page.text)
                 self.assertIn("Other applications and versions are untested", page.text)
@@ -114,6 +115,11 @@ class ConnectionTests(unittest.TestCase):
             self.assertIn("releases/http-local/research-papers-claude-token", fields["sdk-check"])
             self.assertNotIn("../AI-intro", response.text)
             self.assertIn("make setup\nmake mcp", response.text)
+            self.assertNotIn("MGUS", response.text)
+            self.assertNotIn("myeloma", response.text)
+            self.assertNotIn("--collection istopmm", response.text)
+            self.assertNotIn("--collection", fields["sdk-check"])
+            self.assertIn("YOUR_SEARCH_TERM", fields["sdk-check"])
             self.assertIn("do not remove a separate stdio registration", response.text)
             self.assertIn("do not delete an entire configuration file", response.text)
             self.assertIn("Integrate an application without MCP", response.text)
@@ -144,6 +150,24 @@ class ConnectionTests(unittest.TestCase):
             self.assertIn("sdk-check", parser.hidden)
             for key in ("prompt", "example-compare", "example-inspect", "example-coverage"):
                 self.assertNotIn(key, parser.hidden)
+
+    def test_connection_page_uses_configured_collections(self):
+        root = self.root / "collections"
+        root.mkdir()
+        store, _, _, _ = registry_fixture(root)
+        app = web_server.create_app(
+            registry=store.root, profiles={"synthetic"},
+            allowed_collections={"istopmm", "test-literature"}, default_collections=["istopmm"])
+        with httpx.Client(transport=httpx.WSGITransport(app=app),
+                          base_url="http://127.0.0.1:8080") as client:
+            response = client.get("/connect")
+            fields = Links(response.text).fields
+            self.assertIn("--collection istopmm", fields["sdk-check"])
+            self.assertIn("YOUR_SEARCH_TERM", fields["sdk-check"])
+            self.assertIn("COLLECTION_REGISTRY=" + str(store.root), response.text)
+            self.assertIn("DEFAULT_COLLECTIONS=istopmm", response.text)
+            self.assertNotIn("myeloma", response.text)
+            self.assertNotIn("MGUS", response.text)
 
     def test_sdk_search_context_reader_parity_single_release_and_cli(self):
         with running_server(self.root, self.release) as (url, token, *_):

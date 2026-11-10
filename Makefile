@@ -11,28 +11,36 @@ MCP_BIND ?= $(LAN_HOST)
 HTTP_BIND = $(if $(LAN_HOST),--host "$(MCP_BIND)" --allow-plain-lan)
 LAN_TOKENS ?= releases/http-local/lan
 WEB_PORT ?= 8081
+WEB_STATE_DIR ?= releases
 TOKEN_REGISTRY ?= releases/http-local/tokens.json
 TOKEN_FILE ?= releases/http-local/client-token
 CONTAINER_ENGINE ?= podman
 IMAGE ?= localhost/istopmm-evidence:m5
-COLLECTION_REGISTRY ?= releases/project/registry
+PROJECT_ROOT ?= releases/project
+COLLECTION_REGISTRY ?= $(PROJECT_ROOT)/registry
 COLLECTIONS ?= core
 DEFAULT_COLLECTIONS ?= core
 COLLECTION_ARGS = --registry "$(COLLECTION_REGISTRY)" $(foreach c,$(COLLECTIONS),--allow-collection "$(c)") $(foreach c,$(DEFAULT_COLLECTIONS),--default-collection "$(c)")
+PROJECT_NAME ?=
+PROJECT_AUTHORIZATION ?=
+PROJECT_PAPERS ?=
+PDF_DATA_ROOT ?= releases/pdf-data
 CLIENT_PROJECT ?= .
-CLIENT_NAME ?= istopmm-evidence-http
+CLIENT_NAME ?= research-evidence-http
 CLIENT_TOKEN_FILE ?= releases/http-local/research-papers-claude-token
 CLIENT_ARGS = --project "$(CLIENT_PROJECT)" --name "$(CLIENT_NAME)" --registry "$(TOKEN_REGISTRY)" --token-file "$(CLIENT_TOKEN_FILE)" --url "$(HTTP_URL)" --profile "$(PROFILE)"
 
-.PHONY: help setup run web mcp http-token lan-token lan-revoke share cloudflared connect connect-claude disconnect reconnect test-http test-connection test-collections test-catalog test-citations test-project container-build test-container test evaluate test-install check
+.PHONY: help setup project-init project-status run web web-off mcp http-token lan-token lan-revoke share cloudflared connect connect-claude disconnect reconnect test-http test-connection test-collections test-catalog test-citations test-project container-build test-container test evaluate test-install check
 
 help:
 	@printf '%s\n' \
 		'make setup            Create the virtualenv and install development dependencies' \
-		'After setup: .venv/bin/research-project init --help (start with your core papers CSV)' \
+		'make project-init PROJECT_NAME=… PROJECT_AUTHORIZATION=… PROJECT_PAPERS=…  Initialize your private project' \
+		'make project-status  Show the current project status (PROJECT_ROOT=… to select another project)' \
 		'make run              Start the local stdio MCP server (not an interactive chat)' \
 		'make http-token       Issue a private local HTTP client token (once; expires in 24h)' \
-		'make web              Start the current information website on port $(WEB_PORT)' \
+		'make web              Start the detached local website on port $(WEB_PORT)' \
+		'make web-off          Stop the detached local website' \
 		'make mcp              Start the authenticated HTTP MCP server on port 8000 (LAN_HOST=ip: on the LAN; MCP_BIND=0.0.0.0: all interfaces)' \
 		'make lan-token NAME=… Issue a 30-day token for another LAN computer (needs LAN_HOST)' \
 		'make lan-revoke NAME=…  Revoke that computer'"'"'s token' \
@@ -60,6 +68,15 @@ setup:
 	$(PYTHON) -m venv "$(VENV)"
 	"$(PY)" -m pip install -e '.[build,dev]'
 
+project-init:
+	@test -n "$(PROJECT_NAME)" || { echo 'Set PROJECT_NAME="My research project"'; exit 2; }
+	@test -n "$(PROJECT_AUTHORIZATION)" || { echo 'Set PROJECT_AUTHORIZATION to your basis for private extraction and retrieval'; exit 2; }
+	@test -n "$(PROJECT_PAPERS)" || { echo 'Set PROJECT_PAPERS to a CSV containing doi and title columns'; exit 2; }
+	@"$(VENV)/bin/research-project" --root "$(PROJECT_ROOT)" init --name "$(PROJECT_NAME)" --authorization "$(PROJECT_AUTHORIZATION)" --papers "$(PROJECT_PAPERS)"
+
+project-status:
+	@"$(VENV)/bin/research-project" --root "$(PROJECT_ROOT)" status
+
 test:
 	"$(PY)" tests/run.py portable
 
@@ -70,11 +87,14 @@ http-token:
 	@"$(VENV)/bin/istopmm-http-token" issue --registry "$(TOKEN_REGISTRY)" --token-file "$(TOKEN_FILE)" --audience "$(HTTP_URL)" --profile "$(PROFILE)"
 
 web:
-	@"$(PY)" -m istopmm_evidence.web_server $(if $(COLLECTION_REGISTRY),$(COLLECTION_ARGS),--release "$(RELEASE)") --allow-profile "$(PROFILE)" --port "$(WEB_PORT)" --mcp-url "$(HTTP_URL)"
+	@"$(PY)" -m istopmm_evidence.web_lifecycle start --registry "$(COLLECTION_REGISTRY)" --project-root "$(PROJECT_ROOT)" --pdf-data-root "$(PDF_DATA_ROOT)" --state-dir "$(WEB_STATE_DIR)" --allow-profile "$(PROFILE)" $(foreach c,$(COLLECTIONS),--allow-collection "$(c)") $(foreach c,$(DEFAULT_COLLECTIONS),--default-collection "$(c)") --port "$(WEB_PORT)" --mcp-url "$(HTTP_URL)"
+
+web-off:
+	@"$(PY)" -m istopmm_evidence.web_lifecycle stop --registry "$(COLLECTION_REGISTRY)" --project-root "$(PROJECT_ROOT)" --state-dir "$(WEB_STATE_DIR)" --allow-profile "$(PROFILE)" $(foreach c,$(COLLECTIONS),--allow-collection "$(c)") $(foreach c,$(DEFAULT_COLLECTIONS),--default-collection "$(c)") --port "$(WEB_PORT)" --mcp-url "$(HTTP_URL)"
 
 mcp:
 	@"$(PY)" -m istopmm_evidence.local_client init --registry "$(TOKEN_REGISTRY)"
-	@"$(VENV)/bin/istopmm-http" $(if $(COLLECTION_REGISTRY),$(COLLECTION_ARGS),--release "$(RELEASE)") --allow-profile "$(PROFILE)" --token-registry "$(TOKEN_REGISTRY)" --port "$(HTTP_PORT)" --base-url "$(HTTP_URL)" $(HTTP_BIND)
+	@"$(VENV)/bin/istopmm-http" $(if $(COLLECTION_REGISTRY),$(COLLECTION_ARGS),--release "$(RELEASE)") $(foreach p,$(PROFILE),--allow-profile "$(p)") --token-registry "$(TOKEN_REGISTRY)" --port "$(HTTP_PORT)" --base-url "$(HTTP_URL)" $(HTTP_BIND)
 
 lan-token:
 	@test -n "$(LAN_HOST)" || { echo 'Set LAN_HOST (in local.mk or on the command line), e.g. LAN_HOST=192.168.1.10'; exit 2; }
