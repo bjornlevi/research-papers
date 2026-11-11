@@ -979,6 +979,23 @@ if (purgeDialog && typeof purgeDialog.showModal === 'function') {
     });
   });
 }
+const corePaperSearch = document.querySelector('#core-paper-search');
+if (corePaperSearch) {
+  const records = Array.from(document.querySelectorAll('[data-core-paper-record]'));
+  const count = document.querySelector('#core-paper-search-count');
+  const empty = document.querySelector('#core-paper-search-empty');
+  corePaperSearch.addEventListener('input', () => {
+    const query = corePaperSearch.value.trim().toLocaleLowerCase();
+    let visible = 0;
+    for (const record of records) {
+      const matches = record.textContent.toLocaleLowerCase().includes(query);
+      record.hidden = !matches;
+      if (matches) visible += 1;
+    }
+    count.textContent = `${visible} of ${records.length} core papers shown`;
+    empty.hidden = visible !== 0;
+  });
+}
 """
 
 READER_SCRIPT = """
@@ -1374,7 +1391,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             if awaiting:
                 body += ('<p class="callout"><strong>Next step:</strong> '
                          f"{len(awaiting)} of {len(status['papers'])} papers are awaiting a PDF. "
-                         "Select a matching PDF from the awaiting_pdf status in each paper's entry.</p>")
+                         "Attach them here; attached papers leave this queue and remain in the core-paper inventory below.</p>")
                 pdfs = available_project_pdfs()
                 body += ('<h4>Attach PDFs</h4>'
                          f'<p>PDF data folder: <code>{escape(str(pdf_data_root))}</code>. '
@@ -1382,14 +1399,21 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                          "Inspect the PDF locally before confirming its identity.</p>")
                 if not pdfs:
                     body += '<p>No PDFs found. Place .pdf files in the PDF data folder, then reload this page.</p>'
+                queue_rows = []
+                for index, item in enumerate(awaiting):
+                    state = badge(escape(item["status"]))
+                    state = pdf_controls(item["doi"], item["title"], prefix=f"attach-{index}",
+                                         pdfs=pdfs, summary=state)
+                    queue_rows.append('<li class="library-record">'
+                                      f"<h4>{escape(item['title'])}</h4><dl>"
+                                      f"<div><dt>DOI</dt><dd><code>{escape(item['doi'])}</code></dd></div>"
+                                      f"<div><dt>Status</dt><dd>{state}</dd></div></dl></li>")
+                body += '<ul class="library-records awaiting-papers">' + "".join(queue_rows) + "</ul>"
             if status["papers"]:
                 rows = []
-                for index, item in enumerate(status["papers"]):
+                for item in status["papers"]:
                     state = badge(escape(item["status"]))
-                    if item["status"] == "awaiting_pdf":
-                        state = pdf_controls(item["doi"], item["title"], prefix=f"attach-{index}",
-                                             pdfs=pdfs, summary=state)
-                    rows.append('<li class="library-record">'
+                    rows.append('<li class="library-record" data-core-paper-record>'
                                 f"<h4>{escape(item['title'])}</h4><dl>"
                                 f"<div><dt>DOI</dt><dd><code>{escape(item['doi'])}</code></dd></div>"
                                 f"<div><dt>Status</dt><dd>{state}</dd></div></dl>"
@@ -1398,9 +1422,14 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                                 f'<input type="hidden" name="doi" value="{escape(item["doi"], quote=True)}">'
                                 f'<button class="danger remove-core" aria-label="Remove {escape(item["title"], quote=True)}">'
                                 'Remove…</button></form></li>')
-                body += ('<ul class="library-records">'
-                         + "".join(rows)
-                         + "</ul>")
+                body += ('<details class="core-paper-inventory"><summary>All core papers '
+                         f'({len(status["papers"])})</summary>'
+                         '<p>Attached papers remain registered here. Search by title, DOI, or status.</p>'
+                         '<label for="core-paper-search">Find a core paper</label>'
+                         '<input id="core-paper-search" type="search" autocomplete="off">'
+                         f'<p id="core-paper-search-count" aria-live="polite">{len(status["papers"])} core papers shown</p>'
+                         '<p id="core-paper-search-empty" hidden>No core papers match that search.</p>'
+                         '<ul class="library-records">' + "".join(rows) + "</ul></details>")
             body += "</section>"
             body += help_note("Find PDF", '<p><strong>Find PDF</strong> looks for an explicitly licensed open-access copy using OpenAlex. '
                      'Downloads go to the PDF data folder; inspect the file and confirm identity and permission '

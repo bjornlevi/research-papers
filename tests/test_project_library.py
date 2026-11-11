@@ -175,7 +175,14 @@ class ProjectLibraryTests(unittest.TestCase):
                                headers={"Origin": base})
         self.assertEqual(response.status_code, 303)
         self.assertEqual(project_library.status(self.root)["papers"][0]["status"], "extracted")
-        self.assertNotIn('action="/settings/attach-pdf"', client.get("/settings", base_url=base).get_data(as_text=True))
+        settings = client.get("/settings", base_url=base).get_data(as_text=True)
+        self.assertNotIn('action="/settings/attach-pdf"', settings)
+        self.assertIn('<details class="core-paper-inventory"><summary>All core papers (1)</summary>', settings)
+        self.assertIn('id="core-paper-search"', settings)
+        self.assertIn('data-core-paper-record', settings)
+        self.assertIn("Attached papers remain registered here.", settings)
+        self.assertIn("const corePaperSearch = document.querySelector('#core-paper-search');",
+                      client.get("/settings.js", base_url=base).get_data(as_text=True))
         result = project_library.store(self.root).call("search_evidence", {"query": "apricot"})
         self.assertTrue(result["result"]["items"])
         context = project_library.store(self.root).call("get_source_context", {
@@ -183,6 +190,13 @@ class ProjectLibraryTests(unittest.TestCase):
             "snapshot_id": result["collection_context"]["snapshot_id"],
         })
         self.assertIn("apricot", context["result"]["text"])
+        project_library.register(self.root, [{"doi": "10.0000/pending", "title": "Pending paper"}])
+        settings = client.get("/settings", base_url=base).get_data(as_text=True)
+        queue = settings.split('<ul class="library-records awaiting-papers">', 1)[1].split("</ul>", 1)[0]
+        self.assertIn("Pending paper", queue)
+        self.assertNotIn("Folder paper", queue)
+        self.assertEqual(settings.count('action="/settings/attach-pdf"'), 1)
+        self.assertIn("Folder paper", settings)
         client.post("/settings/reset", data={"confirmation": "RESET PROJECT"}, base_url=base)
         self.assertTrue((folder / "folder.pdf").is_file())
 

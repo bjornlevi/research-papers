@@ -350,6 +350,9 @@ additional CSV/JSON papers using the initialization formats. Validation is
 atomic: duplicate DOIs or invalid rows reject the entire import. New core
 papers await PDF attachment. Existing evidence and metadata catalogs are
 preserved; rerun discovery to include new seeds.
+Project settings keeps the attachment queue limited to papers still awaiting a
+PDF. Attached papers remain registered in the collapsed, searchable core-paper
+inventory, where they can still be reviewed or removed.
 
 To permanently remove a core paper:
 
