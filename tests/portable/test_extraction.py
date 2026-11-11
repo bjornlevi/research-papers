@@ -6,9 +6,9 @@ import zipfile
 
 import pymupdf
 
-from istopmm_evidence.build import evidence, supplementary_extraction as extraction
-from istopmm_evidence.build import text_formatting as formatting
-from istopmm_evidence.build.quality_inventory import expected_locations
+from research_library.build import evidence, supplementary_extraction as extraction
+from research_library.build import text_formatting as formatting
+from research_library.build.quality_inventory import expected_locations
 
 
 class SyntheticExtractionTests(unittest.TestCase):

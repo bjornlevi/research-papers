@@ -8,7 +8,7 @@ import sqlite3
 import tempfile
 from unittest.mock import patch
 
-from istopmm_evidence.build import evidence, knowledge
+from research_library.build import evidence, knowledge
 
 DOI = "10.0000/fictional"
 PID = "10-0000-fictional"

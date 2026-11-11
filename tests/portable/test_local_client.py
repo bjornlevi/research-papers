@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from jsonschema import ValidationError
 
-from istopmm_evidence import http_auth, local_client
+from research_library import http_auth, local_client
 
 
 class LocalClientTests(unittest.TestCase):
@@ -26,8 +26,8 @@ class LocalClientTests(unittest.TestCase):
         self.commands = []
         self.failure = None
         self.addCleanup(patch.stopall)
-        patch("istopmm_evidence.local_client.shutil.which", return_value="/bin/claude").start()
-        patch("istopmm_evidence.local_client.subprocess.run", side_effect=self.run_cli).start()
+        patch("research_library.local_client.shutil.which", return_value="/bin/claude").start()
+        patch("research_library.local_client.subprocess.run", side_effect=self.run_cli).start()
 
     def run_cli(self, arguments, **kwargs):
         self.assertEqual(kwargs["cwd"], self.project)
@@ -38,7 +38,7 @@ class LocalClientTests(unittest.TestCase):
             return subprocess.CompletedProcess(arguments, 1, "", "DO_NOT_ECHO " + str(self.registration))
         if command == "get":
             return subprocess.CompletedProcess(arguments, 0 if self.registration else 1,
-                                               self.registration or 'No MCP server named "istopmm-evidence-http".', "")
+                                               self.registration or 'No MCP server named "research-library-http".', "")
         if command == "remove":
             self.assertIn("local", arguments)
             self.registration = None
@@ -50,7 +50,7 @@ class LocalClientTests(unittest.TestCase):
         return subprocess.CompletedProcess(arguments, 0, "DO_NOT_ECHO")
 
     def manage(self, action="connect"):
-        return local_client.manage(action, self.project, "istopmm-evidence-http",
+        return local_client.manage(action, self.project, "research-library-http",
                                    self.registry, self.token, self.url, ["synthetic"])
 
     def test_init_is_private_idempotent_and_rejects_corrupt_registry(self):
@@ -72,7 +72,7 @@ class LocalClientTests(unittest.TestCase):
         self.assertEqual(self.token.read_bytes(), token)
         self.assertEqual(len(http_auth.read_registry(self.registry)["tokens"]), 1)
         self.assertEqual(sum(command[2] == "remove" for command in self.commands), 1)
-        self.assertTrue(all("istopmm-evidence-http" in command for command in self.commands))
+        self.assertTrue(all("research-library-http" in command for command in self.commands))
 
     def test_reconnect_revokes_old_credentials_without_affecting_other_clients(self):
         self.manage()
@@ -131,7 +131,7 @@ class LocalClientTests(unittest.TestCase):
         self.failure = "add"
         out, err = io.StringIO(), io.StringIO()
         with patch("sys.argv", ["local_client", "reconnect", "--project", str(self.project),
-                                "--name", "istopmm-evidence-http", "--registry", str(self.registry),
+                                "--name", "research-library-http", "--registry", str(self.registry),
                                 "--token-file", str(self.token), "--url", self.url,
                                 "--profile", "synthetic"]), redirect_stdout(out), redirect_stderr(err):
             self.assertEqual(local_client.main(), 1)
@@ -139,7 +139,7 @@ class LocalClientTests(unittest.TestCase):
         self.assertNotIn(self.token.read_text().strip(), out.getvalue() + err.getvalue())
 
     def test_invalid_paths_permissions_and_missing_cli_fail_explicitly(self):
-        with patch("istopmm_evidence.local_client.shutil.which", return_value=None):
+        with patch("research_library.local_client.shutil.which", return_value=None):
             with self.assertRaisesRegex(ValueError, "CLI is required"):
                 self.manage()
         self.manage()

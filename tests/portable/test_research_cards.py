@@ -8,7 +8,7 @@ import unittest
 
 from jsonschema import ValidationError
 
-from istopmm_evidence import research_cards, releases
+from research_library import research_cards, releases
 from test_releases import fixture_bundle
 
 
@@ -75,7 +75,7 @@ class ResearchCardTests(unittest.TestCase):
     def test_card_cli_retains_audit_and_refuses_overwrite(self):
         source, target = self.root / "cards.json", self.root / "audit.json"
         source.write_text(json.dumps(self.cards))
-        command = [sys.executable, "-m", "istopmm_evidence.research_cards",
+        command = [sys.executable, "-m", "research_library.research_cards",
                    "--cards", str(source), "--release", str(self.path),
                    "--allow-profile", "synthetic", "--output", str(target)]
         result = subprocess.run(command, capture_output=True, text=True, timeout=20)

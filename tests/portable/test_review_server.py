@@ -7,7 +7,7 @@ import threading
 import unittest
 from urllib.parse import urlencode
 
-from istopmm_evidence import evaluation, review_server
+from research_library import evaluation, review_server
 from test_evaluation import specifications
 from test_releases import fixture_bundle
 

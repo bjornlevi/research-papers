@@ -13,7 +13,7 @@ import sqlite3
 import sys
 import unicodedata
 
-from istopmm_evidence.retrieval import CLAIM_KINDS, claims as query
+from research_library.retrieval import CLAIM_KINDS, claims as query
 
 if __package__:
     from .evidence import ROOT, EVIDENCE, load_jsonl, open_index, paper_id, positive_limit, write_jsonl

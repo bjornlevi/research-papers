@@ -12,9 +12,9 @@ from unittest.mock import patch
 import httpx
 import pymupdf
 
-from istopmm_evidence import web_server
-from istopmm_evidence.build import literature_text, provided_sources as provided
-from istopmm_evidence.build import literature_update as update
+from research_library import web_server
+from research_library.build import literature_text, provided_sources as provided
+from research_library.build import literature_update as update
 import test_literature_update
 
 AWAITING = "doi:10.0000/awaiting"

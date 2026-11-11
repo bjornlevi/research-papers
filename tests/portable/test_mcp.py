@@ -13,8 +13,8 @@ from mcp.client.stdio import stdio_client
 from mcp.server.lowlevel import Server
 from mcp.shared.session import RequestResponder
 
-from istopmm_evidence import releases
-from istopmm_evidence.server import EvidenceServer
+from research_library import releases
+from research_library.server import EvidenceServer
 from test_releases import fixture_bundle
 
 
@@ -92,7 +92,7 @@ class MCPTests(unittest.TestCase):
             releases.export(bundle, curated, profile="curated", authorization=grants)
 
             async def exercise():
-                server = str(Path(sys.executable).parent / "istopmm-mcp")
+                server = str(Path(sys.executable).parent / "research-mcp")
                 with tempfile.TemporaryFile(mode="w+") as diagnostics:
                     params = StdioServerParameters(command=server, args=[
                         "--store", str(store.root), "--allow-profile", "synthetic"], cwd=str(root))
@@ -147,7 +147,7 @@ class MCPTests(unittest.TestCase):
             try:
                 result = subprocess.run(
                     [sys.executable, str(Path(__file__).resolve().parents[1] / "mcp_client.py"),
-                     "--server", str(Path(sys.executable).parent / "istopmm-mcp"),
+                     "--server", str(Path(sys.executable).parent / "research-mcp"),
                      "--release", str(path), "--expected", str(expected), "--cwd", str(root)],
                     capture_output=True, text=True, timeout=120,
                 )
@@ -165,7 +165,7 @@ class MCPTests(unittest.TestCase):
             releases.export(bundle, path, profile="synthetic")
             for target, profile in ((root / "missing", "synthetic"), (path, "curated")):
                 result = subprocess.run(
-                    [sys.executable, "-m", "istopmm_evidence.server", "--release", str(target),
+                    [sys.executable, "-m", "research_library.server", "--release", str(target),
                      "--allow-profile", profile], input="", capture_output=True, text=True, timeout=20,
                 )
                 self.assertEqual(result.returncode, 1)
@@ -173,7 +173,7 @@ class MCPTests(unittest.TestCase):
                 self.assertEqual(json.loads(result.stderr)["event"], "startup_failed")
             (path / "records.json").write_text("corrupt DO_NOT_ECHO")
             result = subprocess.run(
-                [sys.executable, "-m", "istopmm_evidence.server", "--release", str(path),
+                [sys.executable, "-m", "research_library.server", "--release", str(path),
                  "--allow-profile", "synthetic"], input="", capture_output=True, text=True, timeout=20,
             )
             self.assertEqual(result.returncode, 1)

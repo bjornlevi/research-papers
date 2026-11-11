@@ -24,7 +24,7 @@ import httpx
 import pymupdf
 from jsonschema import ValidationError
 
-from istopmm_evidence import __version__, catalog, collections, literature, releases, retrieval
+from research_library import __version__, catalog, collections, literature, releases, retrieval
 from . import citation_neighborhood as citation
 from . import literature_ingest as ingest
 from . import literature_ocr
@@ -1217,7 +1217,7 @@ def benchmark(registry, output):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    data_root = Path(os.environ.get("ISTOPMM_DATA_ROOT", ".")).absolute()
+    data_root = Path(os.environ.get("RESEARCH_LIBRARY_DATA_ROOT", ".")).absolute()
     parser.add_argument("--root", type=Path, default=data_root / "releases/source-updates")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("refresh", help="Update sources now, saving progress and applying valid additions")

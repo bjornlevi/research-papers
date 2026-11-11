@@ -13,7 +13,7 @@ import anyio
 import httpx
 
 from fixtures import snapshots
-from istopmm_evidence import connection_check, releases
+from research_library import connection_check, releases
 from test_browser_library import Links
 from test_collections import registry_fixture
 from test_connection import running_web

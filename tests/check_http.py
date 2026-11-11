@@ -16,7 +16,7 @@ from mcp.client.streamable_http import streamable_http_client
 sys.path.insert(0, str(Path(__file__).resolve().parent / "portable"))
 from test_http import running_server
 from test_releases import fixture_bundle
-from istopmm_evidence import releases
+from research_library import releases
 
 
 async def measure(url, token, store, first_id, second_id):
@@ -64,7 +64,7 @@ def main():
     args = parser.parse_args()
     if args.output and args.output.exists():
         parser.error("Output must be a new file")
-    with tempfile.TemporaryDirectory(prefix="istopmm-http-check-") as directory:
+    with tempfile.TemporaryDirectory(prefix="research-http-check-") as directory:
         root = Path(directory)
         bundle, _ = fixture_bundle(root)
         release = root / "first"

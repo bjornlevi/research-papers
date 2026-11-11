@@ -13,7 +13,7 @@ from .retrieval import MAX_QUERY_LENGTH
 SCHEMA_VERSION = "2.3.0"
 MAX_RESPONSE_BYTES = 65_536
 CORPUS_SCOPE = "Matches are limited to this evidence release; no match is not global scientific absence."
-DOCUMENT = json.loads(files("istopmm_evidence").joinpath("schemas/contract-v2.json").read_text())
+DOCUMENT = json.loads(files("research_library").joinpath("schemas/contract-v2.json").read_text())
 
 ToolName = Literal["corpus_status", "list_collections", "list_sources", "search_evidence", "get_claim", "get_source_context",
                    "get_table", "get_source_issue", "get_related_evidence",

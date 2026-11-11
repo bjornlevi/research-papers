@@ -12,8 +12,8 @@ from unittest.mock import patch
 import httpx
 import pymupdf
 
-from istopmm_evidence import catalog, literature, releases
-from istopmm_evidence.build import citation_neighborhood as citation
+from research_library import catalog, literature, releases
+from research_library.build import citation_neighborhood as citation
 
 
 def work(number):

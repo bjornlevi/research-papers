@@ -5,7 +5,7 @@ import unittest
 import httpx
 
 from fixtures import snapshots
-from istopmm_evidence import releases, web_server
+from research_library import releases, web_server
 from test_collections import registry_fixture
 from test_releases import fixture_bundle
 

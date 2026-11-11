@@ -152,7 +152,7 @@ retrieval check independent of an AI model, use `make connect` as described
 there and run:
 
 ```sh
-.venv/bin/istopmm-mcp-check \
+.venv/bin/research-mcp-check \
   --url http://127.0.0.1:8000/mcp \
   --web-url http://127.0.0.1:8081 \
   --token-file releases/http-local/research-papers-claude-token \

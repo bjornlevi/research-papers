@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "portable"))
 from test_collections import registry_fixture
 from test_connection import running_web
 from test_http import running_server
-from istopmm_evidence import connection_check, http_auth, local_client
+from research_library import connection_check, http_auth, local_client
 
 
 def claude_status(project, name):

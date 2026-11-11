@@ -19,7 +19,7 @@ from mcp.client.streamable_http import streamable_http_client
 sys.path.insert(0, str(Path(__file__).resolve().parent / "portable"))
 from test_releases import fixture_bundle
 from test_mcp import protocol_cases
-from istopmm_evidence import http_auth, releases
+from research_library import http_auth, releases
 
 
 def run(engine, *args):
@@ -29,7 +29,7 @@ def run(engine, *args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", default="podman", choices=["podman", "docker"])
-    parser.add_argument("--image", default="localhost/istopmm-evidence:m5")
+    parser.add_argument("--image", default="localhost/research-library:m5")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.output and args.output.exists():
@@ -46,8 +46,8 @@ def main():
         "assert not Path('/data').exists();assert not Path('/run/credentials').exists();"
         "assert not Path('/root/.cache/pip').is_dir();"
         "assert all(Path(str(p)).suffix not in {'.pdf','.png','.docx','.xlsx','.sqlite','.jsonl'} "
-        "for p in distribution('istopmm-evidence').files)")
-    with tempfile.TemporaryDirectory(prefix="istopmm-container-") as directory:
+        "for p in distribution('research-library').files)")
+    with tempfile.TemporaryDirectory(prefix="research-library-container-") as directory:
         root = Path(directory)
         bundle, _ = fixture_bundle(root)
         release = root / "release"
@@ -62,13 +62,13 @@ def main():
         secrets.mkdir(mode=0o700)
         http_auth.issue(secrets / "tokens.json", root / "client-token", url, ["synthetic"])
         token = (root / "client-token").read_text().strip()
-        name = "istopmm-check-" + uuid4().hex[:12]
+        name = "research-library-check-" + uuid4().hex[:12]
         command = [
             "run", "--detach", "--name", name, "--network", "host",
             "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--memory", "512m", "--cpus", "2", "--pids-limit", "128",
-            "--env", f"ISTOPMM_HEALTH_HOST=127.0.0.1:{port}",
-            "--env", f"ISTOPMM_HTTP_PORT={port}",
+            "--env", f"RESEARCH_LIBRARY_HEALTH_HOST=127.0.0.1:{port}",
+            "--env", f"RESEARCH_LIBRARY_HTTP_PORT={port}",
             "--volume", f"{release}:/data/release:ro",
             "--volume", f"{secrets}:/run/credentials:ro",
         ]

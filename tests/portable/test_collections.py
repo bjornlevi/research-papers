@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 
-from istopmm_evidence import collections, contracts, releases, retrieval
+from research_library import collections, contracts, releases, retrieval
 from fixtures import snapshots
 from test_http import running_server
 from test_releases import fixture_bundle
@@ -306,7 +306,7 @@ class CollectionTests(unittest.TestCase):
         scripts = Path(__file__).resolve().parents[1]
         result = subprocess.run([
             sys.executable, str(scripts / "mcp_client.py"),
-            "--server", str(Path(sys.executable).parent / "istopmm-mcp"),
+            "--server", str(Path(sys.executable).parent / "research-mcp"),
             "--registry", str(self.store.root), "--expected", str(expected), "--cwd", str(self.root),
             "--allow-collection", "istopmm", "--allow-collection", "test-literature",
             "--default-collection", "istopmm",
@@ -334,11 +334,11 @@ class CollectionTests(unittest.TestCase):
         args = ["--registry", str(target), "--allow-profile", "synthetic",
                 "--allow-collection", "istopmm", "--allow-collection", "test-literature",
                 "--default-collection", "istopmm"]
-        result = subprocess.run([sys.executable, "-m", "istopmm_evidence.collections", *args, "publish", str(file)],
+        result = subprocess.run([sys.executable, "-m", "research_library.collections", *args, "publish", str(file)],
                                 capture_output=True, text=True, cwd=self.root)
         self.assertEqual(result.returncode, 0, result.stderr)
         result = subprocess.run([
-            sys.executable, "-m", "istopmm_evidence.cli", *args, "search", "Independent",
+            sys.executable, "-m", "research_library.cli", *args, "search", "Independent",
             "--collection", "test-literature",
         ], capture_output=True, text=True, cwd=self.root)
         self.assertEqual(result.returncode, 0, result.stderr)

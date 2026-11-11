@@ -1,6 +1,6 @@
 services:
   evidence:
-    image: ${ISTOPMM_IMAGE:?Set ISTOPMM_IMAGE to a verified image digest}
+    image: ${RESEARCH_LIBRARY_IMAGE:?Set RESEARCH_LIBRARY_IMAGE to a verified image digest}
     user: "10001:10001"
     read_only: true
     cap_drop: [ALL]
@@ -11,13 +11,13 @@ services:
     restart: unless-stopped
     stop_grace_period: 10s
     environment:
-      ISTOPMM_HEALTH_HOST: ${ISTOPMM_PUBLIC_HOST:?Set host including port if nondefault}
+      RESEARCH_LIBRARY_HEALTH_HOST: ${RESEARCH_LIBRARY_PUBLIC_HOST:?Set host including port if nondefault}
     command:
       - --host
       - 0.0.0.0
       - --behind-tls-proxy
       - --base-url
-      - https://${ISTOPMM_PUBLIC_HOST}/mcp
+      - https://${RESEARCH_LIBRARY_PUBLIC_HOST}/mcp
       - --store
       - /data/store
       - --allow-profile
@@ -26,5 +26,5 @@ services:
       - /run/credentials/tokens.json
     ports: ["127.0.0.1:8000:8000"]
     volumes:
-      - ${ISTOPMM_STORE:?Set authorized store directory}:/data/store:ro
-      - ${ISTOPMM_CREDENTIALS:?Set private credential directory}:/run/credentials:ro
+      - ${RESEARCH_LIBRARY_STORE:?Set authorized store directory}:/data/store:ro
+      - ${RESEARCH_LIBRARY_CREDENTIALS:?Set private credential directory}:/run/credentials:ro

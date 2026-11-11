@@ -10,8 +10,8 @@ import tempfile
 
 import pymupdf
 
-from istopmm_evidence import catalog, releases
-from istopmm_evidence.collections import atomic_json
+from research_library import catalog, releases
+from research_library.collections import atomic_json
 from . import literature_ingest as ingest
 
 OCR_STATUSES = ingest.OCR_STATUSES

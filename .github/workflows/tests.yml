@@ -33,5 +33,5 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install '.[build,dev]'
-      - run: docker build -t istopmm-evidence:ci .
-      - run: python tests/check_container.py --engine docker --image istopmm-evidence:ci
+      - run: docker build -t research-library:ci .
+      - run: python tests/check_container.py --engine docker --image research-library:ci

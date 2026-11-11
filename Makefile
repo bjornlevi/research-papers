@@ -15,7 +15,7 @@ WEB_STATE_DIR ?= releases
 TOKEN_REGISTRY ?= releases/http-local/tokens.json
 TOKEN_FILE ?= releases/http-local/client-token
 CONTAINER_ENGINE ?= podman
-IMAGE ?= localhost/istopmm-evidence:m5
+IMAGE ?= localhost/research-library:m5
 PROJECT_ROOT ?= releases/project
 COLLECTION_REGISTRY ?= $(PROJECT_ROOT)/registry
 COLLECTIONS ?= core
@@ -81,35 +81,35 @@ test:
 	"$(PY)" tests/run.py portable
 
 run:
-	@"$(VENV)/bin/istopmm-mcp" $(if $(COLLECTION_REGISTRY),$(COLLECTION_ARGS),--release "$(RELEASE)") --allow-profile "$(PROFILE)"
+	@"$(VENV)/bin/research-mcp" $(if $(COLLECTION_REGISTRY),$(COLLECTION_ARGS),--release "$(RELEASE)") --allow-profile "$(PROFILE)"
 
 http-token:
-	@"$(VENV)/bin/istopmm-http-token" issue --registry "$(TOKEN_REGISTRY)" --token-file "$(TOKEN_FILE)" --audience "$(HTTP_URL)" --profile "$(PROFILE)"
+	@"$(VENV)/bin/research-http-token" issue --registry "$(TOKEN_REGISTRY)" --token-file "$(TOKEN_FILE)" --audience "$(HTTP_URL)" --profile "$(PROFILE)"
 
 web:
-	@"$(PY)" -m istopmm_evidence.web_lifecycle start --registry "$(COLLECTION_REGISTRY)" --project-root "$(PROJECT_ROOT)" --pdf-data-root "$(PDF_DATA_ROOT)" --state-dir "$(WEB_STATE_DIR)" --allow-profile "$(PROFILE)" $(foreach c,$(COLLECTIONS),--allow-collection "$(c)") $(foreach c,$(DEFAULT_COLLECTIONS),--default-collection "$(c)") --port "$(WEB_PORT)" --mcp-url "$(HTTP_URL)"
+	@"$(PY)" -m research_library.web_lifecycle start --registry "$(COLLECTION_REGISTRY)" --project-root "$(PROJECT_ROOT)" --pdf-data-root "$(PDF_DATA_ROOT)" --state-dir "$(WEB_STATE_DIR)" --allow-profile "$(PROFILE)" $(foreach c,$(COLLECTIONS),--allow-collection "$(c)") $(foreach c,$(DEFAULT_COLLECTIONS),--default-collection "$(c)") --port "$(WEB_PORT)" --mcp-url "$(HTTP_URL)"
 
 web-off:
-	@"$(PY)" -m istopmm_evidence.web_lifecycle stop --registry "$(COLLECTION_REGISTRY)" --project-root "$(PROJECT_ROOT)" --state-dir "$(WEB_STATE_DIR)" --allow-profile "$(PROFILE)" $(foreach c,$(COLLECTIONS),--allow-collection "$(c)") $(foreach c,$(DEFAULT_COLLECTIONS),--default-collection "$(c)") --port "$(WEB_PORT)" --mcp-url "$(HTTP_URL)"
+	@"$(PY)" -m research_library.web_lifecycle stop --registry "$(COLLECTION_REGISTRY)" --project-root "$(PROJECT_ROOT)" --state-dir "$(WEB_STATE_DIR)" --allow-profile "$(PROFILE)" $(foreach c,$(COLLECTIONS),--allow-collection "$(c)") $(foreach c,$(DEFAULT_COLLECTIONS),--default-collection "$(c)") --port "$(WEB_PORT)" --mcp-url "$(HTTP_URL)"
 
 mcp:
-	@"$(PY)" -m istopmm_evidence.local_client init --registry "$(TOKEN_REGISTRY)"
-	@"$(VENV)/bin/istopmm-http" $(if $(COLLECTION_REGISTRY),$(COLLECTION_ARGS),--release "$(RELEASE)") $(foreach p,$(PROFILE),--allow-profile "$(p)") --token-registry "$(TOKEN_REGISTRY)" --port "$(HTTP_PORT)" --base-url "$(HTTP_URL)" $(HTTP_BIND)
+	@"$(PY)" -m research_library.local_client init --registry "$(TOKEN_REGISTRY)"
+	@"$(VENV)/bin/research-http" $(if $(COLLECTION_REGISTRY),$(COLLECTION_ARGS),--release "$(RELEASE)") $(foreach p,$(PROFILE),--allow-profile "$(p)") --token-registry "$(TOKEN_REGISTRY)" --port "$(HTTP_PORT)" --base-url "$(HTTP_URL)" $(HTTP_BIND)
 
 lan-token:
 	@test -n "$(LAN_HOST)" || { echo 'Set LAN_HOST (in local.mk or on the command line), e.g. LAN_HOST=192.168.1.10'; exit 2; }
 	@echo "$(NAME)" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_-]*$$' || { echo 'Usage: make lan-token NAME=computer-name'; exit 2; }
-	@"$(PY)" -m istopmm_evidence.local_client init --registry "$(TOKEN_REGISTRY)"
-	@"$(VENV)/bin/istopmm-http-token" issue --registry "$(TOKEN_REGISTRY)" --token-file "$(LAN_TOKENS)/$(NAME)-token" --audience "$(HTTP_URL)" --profile "$(PROFILE)" --expires-in 2592000 >/dev/null
+	@"$(PY)" -m research_library.local_client init --registry "$(TOKEN_REGISTRY)"
+	@"$(VENV)/bin/research-http-token" issue --registry "$(TOKEN_REGISTRY)" --token-file "$(LAN_TOKENS)/$(NAME)-token" --audience "$(HTTP_URL)" --profile "$(PROFILE)" --expires-in 2592000 >/dev/null
 	@echo "Token for $(NAME) (valid 30 days) saved in $(LAN_TOKENS)/$(NAME)-token. On that computer run:"
 	@echo
-	@echo "  claude mcp add --transport http --scope user istopmm-evidence $(HTTP_URL) --header \"Authorization: Bearer $$(cat '$(LAN_TOKENS)/$(NAME)-token')\""
+	@echo "  claude mcp add --transport http --scope user research-library $(HTTP_URL) --header \"Authorization: Bearer $$(cat '$(LAN_TOKENS)/$(NAME)-token')\""
 	@echo
 	@echo "Other MCP clients: URL $(HTTP_URL) with that Authorization header. Revoke with make lan-revoke NAME=$(NAME)."
 
 lan-revoke:
 	@test -f "$(LAN_TOKENS)/$(NAME)-token" || { echo 'Usage: make lan-revoke NAME=computer-name (no such token)'; exit 2; }
-	@"$(VENV)/bin/istopmm-http-token" revoke --registry "$(TOKEN_REGISTRY)" --token-file "$(LAN_TOKENS)/$(NAME)-token"
+	@"$(VENV)/bin/research-http-token" revoke --registry "$(TOKEN_REGISTRY)" --token-file "$(LAN_TOKENS)/$(NAME)-token"
 	@rm -f "$(LAN_TOKENS)/$(NAME)-token"
 
 SHARE_PORT ?= 8002
@@ -117,7 +117,7 @@ SHARE_DAYS ?= 14
 
 share:
 	@test -x "$(VENV)/bin/cloudflared" || command -v cloudflared >/dev/null || "$(MAKE)" -s cloudflared
-	@"$(PY)" -m istopmm_evidence.share --token-registry "$(TOKEN_REGISTRY)" --port "$(SHARE_PORT)" --days "$(SHARE_DAYS)" --profile "$(PROFILE)" -- $(if $(COLLECTION_REGISTRY),$(COLLECTION_ARGS),--release "$(RELEASE)")
+	@"$(PY)" -m research_library.share --token-registry "$(TOKEN_REGISTRY)" --port "$(SHARE_PORT)" --days "$(SHARE_DAYS)" --profile "$(PROFILE)" -- $(if $(COLLECTION_REGISTRY),$(COLLECTION_ARGS),--release "$(RELEASE)")
 
 cloudflared:
 	@url=https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/'); \
@@ -125,13 +125,13 @@ cloudflared:
 	curl -fsSL -o "$(VENV)/bin/cloudflared.tmp" "$$url" && chmod 755 "$(VENV)/bin/cloudflared.tmp" && mv "$(VENV)/bin/cloudflared.tmp" "$(VENV)/bin/cloudflared" && "$(VENV)/bin/cloudflared" --version
 
 connect connect-claude:
-	@"$(PY)" -m istopmm_evidence.local_client connect $(CLIENT_ARGS)
+	@"$(PY)" -m research_library.local_client connect $(CLIENT_ARGS)
 
 disconnect:
-	@"$(PY)" -m istopmm_evidence.local_client disconnect $(CLIENT_ARGS)
+	@"$(PY)" -m research_library.local_client disconnect $(CLIENT_ARGS)
 
 reconnect:
-	@"$(PY)" -m istopmm_evidence.local_client reconnect $(CLIENT_ARGS)
+	@"$(PY)" -m research_library.local_client reconnect $(CLIENT_ARGS)
 
 test-http:
 	"$(PY)" tests/check_http.py
@@ -149,7 +149,7 @@ test-citations:
 	"$(PY)" -m unittest discover -s tests -p 'test_citation_neighborhood.py' -v
 
 test-project:
-	"$(PY)" -m unittest discover -s tests -p 'test_project_library.py' -v
+	"$(PY)" -m unittest discover -s tests -p 'test_project*.py' -v
 	"$(PY)" -m unittest discover -s tests -p 'test_citation_neighborhood.py' -v
 
 container-build:

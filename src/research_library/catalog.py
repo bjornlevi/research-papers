@@ -105,7 +105,7 @@ def build(roots, *, as_of, rationale, authorization_basis, istopmm_dois=(), rela
             or not rationale.strip() or not authorization_basis.strip()):
         raise releases.ReleaseError("Supply an as-of date, selection rationale and metadata-use basis")
     if sqlite_output is not None:
-        with tempfile.TemporaryDirectory(prefix="istopmm-catalog-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="research-library-catalog-") as temporary:
             with closing(sqlite3.connect(Path(temporary) / "occurrences.sqlite")) as connection:
                 groups, runs = load_occurrences(roots, Occurrences(connection))
                 return write_sqlite(sqlite_output, groups, runs, as_of=as_of, rationale=rationale,

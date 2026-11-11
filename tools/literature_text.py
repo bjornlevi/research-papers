@@ -116,7 +116,7 @@ def build(data_root, registry=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", type=Path, default=Path(os.environ.get("ISTOPMM_DATA_ROOT", ".")))
+    parser.add_argument("--data-root", type=Path, default=Path(os.environ.get("RESEARCH_LIBRARY_DATA_ROOT", ".")))
     parser.add_argument("--registry", type=Path)
     args = parser.parse_args()
     print(json.dumps(build(args.data_root, args.registry), indent=2))

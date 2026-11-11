@@ -8,9 +8,9 @@ from unittest.mock import patch
 
 import pymupdf
 
-from istopmm_evidence import catalog, releases
-from istopmm_evidence.build import literature_ingest as ingest
-from istopmm_evidence.collections import atomic_json
+from research_library import catalog, releases
+from research_library.build import literature_ingest as ingest
+from research_library.collections import atomic_json
 
 
 class LiteratureIngestTests(unittest.TestCase):
@@ -95,6 +95,62 @@ class LiteratureIngestTests(unittest.TestCase):
         self.assertEqual(source_row["bibliography"]["title"], source["title"])
         with self.assertRaises(releases.AccessDeniedError):
             releases.validate(destination, allowed_profiles={"curated"})
+
+    def test_column_paragraphs_are_automatic_and_raw_extraction_is_retained(self):
+        source = self.source("columns")
+        path = self.papers / source["filename"]
+        with pymupdf.open() as document:
+            page = document.new_page(width=600, height=800)
+            page.insert_text((40, 100), "Left first paragraph\ncontinues on its second line.")
+            page.insert_text((330, 100), "Right first paragraph\ncontinues in the right column.")
+            page.insert_text((40, 160), "Left second paragraph\nends the left column.")
+            page.insert_text((330, 160), "Right second paragraph\nends the right column.")
+            document.save(path)
+        source.update(bytes=path.stat().st_size, sha256=catalog.file_digest(path))
+        source["source_id"] = "literature:" + source["sha256"]
+        self.manifest([source])
+        self.extract()
+        state = ingest.read(self.workspace / "extraction.json")
+        result = ingest.read(self.workspace / state["items"][source["publication_id"]]["file"])
+        extracted = result["pages"][0]
+        text = extracted["text"]
+        self.assertLess(text.index("Left second"), text.index("Right first"))
+        self.assertIn("Left first paragraph continues on its second line.", text)
+        self.assertIn("\n\n", text)
+        with pymupdf.open(path) as document:
+            self.assertEqual(extracted["raw_text"], document[0].get_text("text", sort=True))
+        self.assertEqual(extracted["raw_text_sha256"], ingest.identity(extracted["raw_text"]))
+        self.assertNotEqual(extracted["raw_text"], text)
+        self.assertEqual(ingest.POLICY["version"], "literature-pdf-3")
+        self.assertTrue(ingest.verify(self.workspace, self.papers)["exact_native_page_replay"])
+        bundle, _ = ingest.make_bundle(self.workspace, self.papers)
+        self.assertEqual(bundle["units"][0]["text"], text)
+        self.assertEqual(bundle["units"][0]["human_verification"], "not_reviewed")
+
+    def test_line_end_dehyphenation_uses_document_words_and_preserves_compounds(self):
+        source = self.source("hyphens")
+        path = self.papers / source["filename"]
+        with pymupdf.open() as document:
+            page = document.new_page()
+            page.insert_text((40, 100),
+                "A quasi-\nexperimental study found articles cov-\nered by newspapers had higher cita-\ntion rates.")
+            page.insert_text((40, 220), "Keep within-line cov- ered unchanged. Unknown zorb-\nified remains uncertain.")
+            document.new_page().insert_text((40, 100),
+                "These covered articles had higher citation rates in a quasi-experimental study.")
+            document.save(path)
+        result = ingest.extract_pdf(path, source)
+        text = result["pages"][0]["text"]
+        self.assertIn("quasi-experimental", text)
+        self.assertIn("articles covered by newspapers", text)
+        self.assertIn("higher citation rates", text)
+        self.assertIn("within-line cov- ered unchanged", text)
+        self.assertIn("zorb-ified", text)
+        self.assertIn("cov-\nered", result["pages"][0]["raw_text"])
+        self.assertEqual(result["pages"][0]["text_sha256"], ingest.identity(text))
+        self.assertEqual(ingest._join_block("soft\u00ad\nware", set()), "software")
+        self.assertEqual(ingest._join_block("long-\nterm", {"longterm", "long-term"}), "long-term")
+        self.assertEqual(ingest.paragraph_text([(0, 0, 50, 20, "cov-"), (100, 0, 150, 20, "ered")],
+                                             {"covered"}), "cov-\n\nered")
 
     def test_no_text_scanned_blank_sparse_and_corrupt_are_not_success(self):
         scanned = self.source("scanned", scanned=True)

@@ -18,7 +18,7 @@ from mcp.client.streamable_http import streamable_http_client
 from starlette.testclient import TestClient
 from starlette.responses import JSONResponse
 
-from istopmm_evidence import http_auth, http_server, releases
+from research_library import http_auth, http_server, releases
 from test_mcp import protocol_cases
 from test_releases import fixture_bundle
 
@@ -37,7 +37,7 @@ def running_server(root, release, profiles=("synthetic",), store=None, extra=(),
     identifier = http_auth.issue(registry, token_file, url, list(profiles))
     with tempfile.TemporaryFile(mode="w+") as log:
         process = subprocess.Popen([
-            python or sys.executable, "-m", "istopmm_evidence.http_server",
+            python or sys.executable, "-m", "research_library.http_server",
             *(["--registry", str(collection_registry)] if collection_registry else
               ["--store", str(store)] if store else ["--release", str(release)]),
             *(argument for cid in allowed_collections for argument in ("--allow-collection", cid)),
@@ -324,7 +324,7 @@ class HTTPTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             http_auth.read_registry(registry)
         registry.chmod(0o600)
-        result = subprocess.run([sys.executable, "-m", "istopmm_evidence.http_auth", "revoke",
+        result = subprocess.run([sys.executable, "-m", "research_library.http_auth", "revoke",
                                  "--registry", registry, "--token-id", identifier],
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -398,14 +398,14 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(client.post("/mcp", json=opening, headers={**accept, "Origin": "https://claude.ai"}
                                          ).status_code, 403)
         refused = subprocess.run([
-            sys.executable, "-m", "istopmm_evidence.http_server", "--release", self.release,
+            sys.executable, "-m", "research_library.http_server", "--release", self.release,
             "--allow-profile", "synthetic", "--token-registry", registry, "--link-tokens",
         ], capture_output=True, text=True)
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("https base URL", refused.stderr)
 
     def test_share_helpers_find_tunnel_address_and_revoke_token(self):
-        from istopmm_evidence import share
+        from research_library import share
         line = "INF |  https://three-random-words.trycloudflare.com  |"
         self.assertEqual(share.TUNNEL_URL.search(line)[0], "https://three-random-words.trycloudflare.com")
         self.assertIsNone(share.TUNNEL_URL.search("https://api.trycloudflare.com.evil.example"))
@@ -420,7 +420,7 @@ class HTTPTests(unittest.TestCase):
 
     def test_verified_tls_boundary_and_external_bind_refusal(self):
         result = subprocess.run([
-            sys.executable, "-m", "istopmm_evidence.http_server", "--release", self.release,
+            sys.executable, "-m", "research_library.http_server", "--release", self.release,
             "--allow-profile", "synthetic", "--token-registry", self.root / "unused",
             "--host", "0.0.0.0",
         ], capture_output=True, text=True)
@@ -435,7 +435,7 @@ class HTTPTests(unittest.TestCase):
                  "matching"),
         ):
             refused = subprocess.run([
-                sys.executable, "-m", "istopmm_evidence.http_server", "--release", self.release,
+                sys.executable, "-m", "research_library.http_server", "--release", self.release,
                 "--allow-profile", "synthetic", "--token-registry", self.root / "unused", *extra,
             ], capture_output=True, text=True)
             self.assertNotEqual(refused.returncode, 0, extra)

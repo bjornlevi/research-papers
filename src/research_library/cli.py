@@ -17,7 +17,7 @@ def main():
     parser.add_argument("--version", action="version", version=__version__)
     roots = parser.add_mutually_exclusive_group()
     roots.add_argument("--data-root", type=Path,
-                       help="Workspace containing evidence/index.sqlite (or ISTOPMM_DATA_ROOT)")
+                       help="Workspace containing evidence/index.sqlite (or RESEARCH_LIBRARY_DATA_ROOT)")
     roots.add_argument("--release", type=Path, help="Validated immutable release directory")
     roots.add_argument("--store", type=Path, help="Operator release store; pin active release per invocation")
     roots.add_argument("--registry", type=Path, help="Independent collection registry")

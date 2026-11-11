@@ -13,7 +13,7 @@ import httpx
 from jsonschema import ValidationError
 
 
-from istopmm_evidence import catalog, collections, contracts, literature, releases, retrieval, web_server
+from research_library import catalog, collections, contracts, literature, releases, retrieval, web_server
 from fixtures import snapshots
 from test_collections import collection_cases, registry_fixture
 from test_http import running_server
@@ -207,7 +207,7 @@ class CatalogTests(unittest.TestCase):
         links = self.root / "links.json"
         links.write_text(json.dumps(relations))
         destination = self.root / "export.json"
-        command = [sys.executable, "-m", "istopmm_evidence.literature", "catalog", "--run", str(run),
+        command = [sys.executable, "-m", "research_library.literature", "catalog", "--run", str(run),
                    "--as-of", "2026-10-19", "--rationale", "Fixture", "--metadata-authorization-basis",
                    "Authored fixture", "--relationships", str(links), "--output", str(destination)]
         result = subprocess.run(command, capture_output=True, text=True)
@@ -216,7 +216,7 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(coverage["unresolved_links"], 1)
         document = catalog.read(destination)
         self.assertEqual(len(document["publications"][0]["relations"]), 5)
-        report = subprocess.run([sys.executable, "-m", "istopmm_evidence.literature",
+        report = subprocess.run([sys.executable, "-m", "research_library.literature",
                                  "catalog-report", str(destination)], capture_output=True, text=True)
         self.assertEqual(report.returncode, 0, report.stderr)
         self.assertEqual(json.loads(report.stdout), coverage)
@@ -229,7 +229,7 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(sql_result.returncode, 0, sql_result.stderr)
         sqlite_snapshot = catalog.open_snapshot(sqlite_path, validate_records=True)
         self.assertEqual(sqlite_snapshot.get(document["publications"][0]["id"]), document["publications"][0])
-        sqlite_report = subprocess.run([sys.executable, "-m", "istopmm_evidence.literature",
+        sqlite_report = subprocess.run([sys.executable, "-m", "research_library.literature",
                                         "catalog-report", str(sqlite_path)], capture_output=True, text=True)
         self.assertEqual(sqlite_report.returncode, 0, sqlite_report.stderr)
         self.assertEqual(json.loads(sqlite_report.stdout), json.loads(sql_result.stdout))
@@ -262,7 +262,7 @@ class CatalogTests(unittest.TestCase):
         output.write_text(json.dumps(expected))
         tests = Path(__file__).resolve().parents[1]
         result = subprocess.run([sys.executable, str(tests / "mcp_client.py"), "--server",
-                                 str(Path(sys.executable).parent / "istopmm-mcp"),
+                                 str(Path(sys.executable).parent / "research-mcp"),
                                  "--registry", str(store.root), "--allow-collection", "istopmm",
                                  "--allow-collection", "test-literature", "--default-collection", "istopmm",
                                  "--expected", str(output), "--cwd", str(self.root)],

@@ -18,7 +18,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 import pymupdf
 
-from istopmm_evidence import collections, literature, releases
+from research_library import collections, literature, releases
 from . import literature_ingest as ingest
 from . import literature_update as update
 
@@ -99,7 +99,7 @@ def fetch(url, *, client=None, resolve=public_address):
     """Fetch a public http(s) link without following redirects to private networks."""
     owned = client is None
     client = client or httpx.Client(timeout=httpx.Timeout(60), follow_redirects=False, headers={
-        "User-Agent": "istopmm-evidence-provided-source/1 (operator-provided private copy)"})
+        "User-Agent": "research-library-provided-source/1 (operator-provided private copy)"})
     try:
         current = url
         for _ in range(MAX_REDIRECTS + 1):
@@ -157,7 +157,7 @@ def lookup_license(doi, *, client=None):
     """Licence reported by OpenAlex for a DOI; None when none is reported or the lookup fails."""
     owned = client is None
     client = client or httpx.Client(timeout=httpx.Timeout(20), headers={
-        "User-Agent": "istopmm-evidence-provided-source/1 (licence lookup)"})
+        "User-Agent": "research-library-provided-source/1 (licence lookup)"})
     try:
         response = client.get("https://api.openalex.org/works/https://doi.org/" + doi,
                               params={"select": "best_oa_location,primary_location,locations"})
@@ -393,7 +393,7 @@ def rollback(data_root, registry=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-root", type=Path, default=Path(os.environ.get("ISTOPMM_DATA_ROOT", ".")))
+    parser.add_argument("--data-root", type=Path, default=Path(os.environ.get("RESEARCH_LIBRARY_DATA_ROOT", ".")))
     commands = parser.add_subparsers(dest="command", required=True)
     add = commands.add_parser("add", help="Provide a PDF file or link for a listed paper and add it")
     add.add_argument("publication_id", help="Library identifier, for example doi:10.1000/example")

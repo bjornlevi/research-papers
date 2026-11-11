@@ -4,13 +4,13 @@ import unittest
 
 from jsonschema import Draft202012Validator, ValidationError
 
-from istopmm_evidence import contracts
+from research_library import contracts
 from fixtures import CLAIM, CONTEXT, HIT, ISSUE, RELATIONSHIP, STATUS, TABLE
 
 
 class ContractTests(unittest.TestCase):
     def test_all_advertised_schemas_fit_http_tool_discovery_limit(self):
-        from istopmm_evidence.server import DESCRIPTIONS
+        from research_library.server import DESCRIPTIONS
         from mcp import types
         tools = [types.Tool(name=name, description=DESCRIPTIONS[name],
                             inputSchema=contracts.schema(name, "input"),

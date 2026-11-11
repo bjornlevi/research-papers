@@ -12,7 +12,7 @@ from test_evaluation import specifications
 from test_releases import fixture_bundle
 from test_research_cards import cards
 
-from istopmm_evidence import evaluation, releases, research_cards
+from research_library import evaluation, releases, research_cards
 
 
 def check(output):
@@ -36,7 +36,7 @@ def check(output):
     try:
         for split in ("development", "held_out"):
             subprocess.run([
-                sys.executable, "-m", "istopmm_evidence.evaluation", "run",
+                sys.executable, "-m", "research_library.evaluation", "run",
                 "--benchmark", str(benchmark), "--release", str(release),
                 "--allow-profile", "synthetic", "--split", split, "--output", str(output / split),
             ], check=True, cwd=output, timeout=120)

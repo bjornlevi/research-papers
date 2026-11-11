@@ -247,7 +247,7 @@ def score(benchmark, observations, *, split):
 
 async def collect(benchmark, *, split, release, profile):
     parameters = StdioServerParameters(
-        command=sys.executable, args=["-m", "istopmm_evidence.server", "--release", str(Path(release).resolve()),
+        command=sys.executable, args=["-m", "research_library.server", "--release", str(Path(release).resolve()),
                                       "--allow-profile", profile],
     )
     rows = []

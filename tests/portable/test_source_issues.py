@@ -3,7 +3,7 @@ import unittest
 
 from jsonschema import ValidationError
 
-from istopmm_evidence import contracts
+from research_library import contracts
 from fixtures import CLAIM
 
 

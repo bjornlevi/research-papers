@@ -71,7 +71,7 @@ class EvidenceServer(Server):
 
 def create_server(snapshot: releases.Snapshot | None,
                   store: releases.ReleaseStore | collections.CollectionStore | None) -> Server:
-    server = EvidenceServer("istopmm-evidence", version=__version__, instructions=(
+    server = EvidenceServer("research-library", version=__version__, instructions=(
         "Read-only published evidence, not participant data or clinical advice. Preserve citations, "
         "denominators, uncertainty and source issues. Shared cohorts are not independent replication. "
         "No match or absent relationship is not proof of scientific absence or independence."
@@ -215,7 +215,7 @@ def main():
                     releases.validate(args.release, allowed_profiles=set(args.allow_profile)))
     except (OSError, ValueError, sqlite3.Error, ValidationError) as error:
         diagnostic("startup_failed", exception_type=type(error).__name__,
-                   message="Cannot load an authorized valid release; check configuration with istopmm-release validate.")
+                   message="Cannot load an authorized valid release; check configuration with research-release validate.")
         return 1
     diagnostic("ready", release_id=snapshot.release_id, schema_version=contracts.SCHEMA_VERSION,
                transport="stdio")

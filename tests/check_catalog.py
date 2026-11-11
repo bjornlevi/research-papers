@@ -11,7 +11,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent / "portable"))
 from test_catalog import mixed_fixture
 from test_http import running_server
-from istopmm_evidence import __version__, catalog, collections, contracts
+from research_library import __version__, catalog, collections, contracts
 
 ROOT = Path(__file__).resolve().parent
 
@@ -91,7 +91,7 @@ def acceptance(registry, *, profiles, evidence_collection, catalog_collection, t
     for cid in (evidence_collection, catalog_collection):
         arguments.extend(["--allow-collection", cid, "--default-collection", cid])
     command = [sys.executable, str(ROOT / "mcp_client.py"), "--server",
-               str(Path(sys.executable).parent / "istopmm-mcp"), "--timeout-seconds",
+               str(Path(sys.executable).parent / "research-mcp"), "--timeout-seconds",
                "120" if real else "20", *arguments]
     result = subprocess.run(command, capture_output=True, text=True, timeout=600)
     if result.returncode:

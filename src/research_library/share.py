@@ -25,7 +25,7 @@ TUNNEL_URL = re.compile(r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com(?![\w.
 WEB_ORIGINS = ("https://claude.ai", "https://chatgpt.com")
 INITIALIZE = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
     "protocolVersion": "2025-06-18", "capabilities": {},
-    "clientInfo": {"name": "istopmm-share-check", "version": "1"}}}
+    "clientInfo": {"name": "research-library-share-check", "version": "1"}}}
 
 
 def say(message):
@@ -141,7 +141,7 @@ def main():
         link = f"{public}/s/{token}/mcp"
         say(f"Tunnel {public}; starting the MCP server on 127.0.0.1:{args.port} (loading collections)")
         server = subprocess.Popen(
-            [sys.executable, "-m", "istopmm_evidence.http_server", *server_args,
+            [sys.executable, "-m", "research_library.http_server", *server_args,
              *(f"--allow-profile={profile}" for profile in args.profile),
              "--token-registry", str(args.token_registry), "--port", str(args.port), "--base-url", base,
              "--behind-tls-proxy", "--link-tokens", *(f"--allow-origin={origin}" for origin in WEB_ORIGINS)],

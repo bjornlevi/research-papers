@@ -29,6 +29,12 @@ def unit_key(unit):
     return identity({key: unit[key] for key in ("id", "citation", "text", "truncated")})
 
 
+def problem_unit_key(unit):
+    citation = unit["citation"]
+    return identity({"id": unit["id"], "text": unit["text"], "truncated": unit["truncated"],
+                     "citation": {key: citation[key] for key in ("source_id", "source_sha256", "doi", "locator")}})
+
+
 def _read(path):
     if path.is_symlink() or path.stat().st_size > releases.MAX_PAYLOAD_BYTES:
         raise releases.ReleaseError("Invalid quality record path or size")
@@ -98,7 +104,8 @@ def _events(root, section):
         expected = {"schema_version", "finding_id", "decision", "reviewer", "note", "at"} if section == "reviews" else {
             "schema_version", "source_key", "extraction_key", "unit_id", "reviewer", "note", "at"}
         if (not isinstance(record, dict) or set(record) != expected
-                or type(record["schema_version"]) is not int or record["schema_version"] != 1
+                or type(record["schema_version"]) is not int
+                or record["schema_version"] not in ({1} if section == "reviews" else {1, 2})
                 or any(not isinstance(record[field], str) or not record[field].strip()
                        for field in expected - {"schema_version"})):
             raise releases.ReleaseError("Invalid quality operator record")
@@ -193,7 +200,8 @@ def report(snapshot, root):
         for event in problems:
             if event["source_key"] == source_key(source):
                 unit = next((unit for unit in units if unit["id"] == event["unit_id"]), None)
-                if unit is not None and event["extraction_key"] == unit_key(unit):
+                if unit is not None and event["extraction_key"] == (
+                        problem_unit_key(unit) if event["schema_version"] == 2 else unit_key(unit)):
                     add(source, units, "reported_defect", event["note"], unit_id=unit["id"],
                         locator=unit["citation"]["locator"], evidence=event)
     blockers = [finding for finding in findings if not finding["resolved"]]
@@ -236,7 +244,7 @@ def problem(snapshot, root, unit_id, reviewer, note):
     _operator(reviewer, note)
     unit = snapshot._lookup("units", unit_id)
     source = next(source for source in snapshot._bundle["sources"] if source["id"] == unit["citation"]["source_id"])
-    event = {"schema_version": 1, "source_key": source_key(source), "extraction_key": unit_key(unit),
+    event = {"schema_version": 2, "source_key": source_key(source), "extraction_key": problem_unit_key(unit),
              "unit_id": unit_id, "reviewer": reviewer, "note": note, "at": datetime.now(timezone.utc).isoformat()}
     _write(root, "problems", event)
     return event

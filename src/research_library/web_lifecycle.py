@@ -14,7 +14,7 @@ from urllib.request import urlopen
 
 from . import releases
 
-MODULE = "istopmm_evidence.web_server"
+MODULE = "research_library.web_server"
 
 
 def managed_process(pid, *, port, registry):

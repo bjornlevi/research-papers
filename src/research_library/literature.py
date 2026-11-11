@@ -127,7 +127,7 @@ class MetadataClient:
         self.last_request = None
         self.http = httpx.Client(
             timeout=httpx.Timeout(30), follow_redirects=False, transport=transport,
-            headers={"User-Agent": "istopmm-evidence-literature/0.2 (metadata-discovery)"},
+            headers={"User-Agent": "research-library-literature/0.2 (metadata-discovery)"},
         )
 
     def close(self):
@@ -346,7 +346,7 @@ def fetch_page(client, config, cursor):
         expression = query(provider, disease, window["start"], window["end"], config.get("focus", "all"))
         search, raw = client.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi", {
             "db": "pubmed", "retmode": "json", "term": expression, "sort": "pub_date",
-            "retstart": window["offset"], "retmax": page_size, "tool": "istopmm_evidence",
+            "retstart": window["offset"], "retmax": page_size, "tool": "research_library",
         })
         provenance.append(raw)
         result = search.get("esearchresult")
@@ -380,7 +380,7 @@ def fetch_page(client, config, cursor):
         records = []
         if ids:
             summary, raw = client.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi", {
-                "db": "pubmed", "retmode": "json", "id": ",".join(ids), "tool": "istopmm_evidence",
+                "db": "pubmed", "retmode": "json", "id": ",".join(ids), "tool": "research_library",
             })
             provenance.append(raw)
             values = summary.get("result")

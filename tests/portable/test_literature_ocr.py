@@ -5,9 +5,9 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from istopmm_evidence import catalog
-from istopmm_evidence.build import literature_ocr as ocr
-from istopmm_evidence.collections import atomic_json
+from research_library import catalog
+from research_library.build import literature_ocr as ocr
+from research_library.collections import atomic_json
 import test_literature_ingest
 
 

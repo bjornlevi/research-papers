@@ -14,7 +14,7 @@ from fixtures import snapshots
 from test_collections import collection_cases, registry_fixture
 from test_http import running_server
 from test_releases import fixture_bundle
-from istopmm_evidence import __version__, collections, contracts, releases
+from research_library import __version__, collections, contracts, releases
 
 
 def run(command, root):
@@ -112,7 +112,7 @@ def acceptance(root, *, real_release=None, python=None):
     expected_file.write_text(json.dumps(expected))
     profile_args = [value for profile in profiles for value in ("--allow-profile", profile)]
     run([
-        python, scripts / "mcp_client.py", "--server", python.parent / "istopmm-mcp",
+        python, scripts / "mcp_client.py", "--server", python.parent / "research-mcp",
         "--registry", store.root, "--allow-collection", "istopmm",
         "--allow-collection", "test-literature", "--default-collection", "istopmm",
         *profile_args, "--expected", expected_file, "--cwd", root,
@@ -145,7 +145,7 @@ def main():
     args = parser.parse_args()
     if args.output and args.output.exists():
         parser.error("Output must be a new file")
-    with tempfile.TemporaryDirectory(prefix="istopmm-collections-check-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="research-collections-check-") as temporary:
         report = acceptance(Path(temporary), real_release=args.real_release)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

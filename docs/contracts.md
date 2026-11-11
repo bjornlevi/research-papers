@@ -44,7 +44,7 @@ The earlier plain-text-default search change is now explicitly versioned:
 advanced FTS5 callers must supply `mode: "fts5"`.
 
 The application exposes the schemas through
-`istopmm_evidence.contracts.schema(tool, "input" | "output")`.
+`research_library.contracts.schema(tool, "input" | "output")`.
 `request` validates inputs and returns a copy with documented defaults applied.
 All inputs reject unknown properties, including arbitrary SQL or file paths.
 

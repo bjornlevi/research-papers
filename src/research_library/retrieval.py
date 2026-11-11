@@ -29,9 +29,9 @@ def paper_id(doi: str) -> str:
 
 
 def data_root(value: Path | str | None = None) -> Path:
-    configured = value if value is not None else os.environ.get("ISTOPMM_DATA_ROOT")
+    configured = value if value is not None else os.environ.get("RESEARCH_LIBRARY_DATA_ROOT")
     if not configured:
-        raise RetrievalError("Specify --data-root or ISTOPMM_DATA_ROOT; no evidence corpus is bundled")
+        raise RetrievalError("Specify --data-root or RESEARCH_LIBRARY_DATA_ROOT; no evidence corpus is bundled")
     root = Path(configured).expanduser().resolve()
     if not root.is_dir():
         raise RetrievalError(f"Evidence data root is not a directory: {root}")

@@ -23,8 +23,8 @@ import xml.etree.ElementTree as ET
 import httpx
 import pymupdf
 
-from istopmm_evidence import catalog, literature, releases
-from istopmm_evidence.collections import atomic_json
+from research_library import catalog, literature, releases
+from research_library.collections import atomic_json
 from .supplements import validate_bytes
 
 FIELDS = ",".join((
@@ -385,7 +385,8 @@ def publish_metadata(root, *, project_scope=False):
                                "requests": requests[start:start + 20]})
             report = catalog.write_sqlite(
                 output, spool, [run], as_of=date.today().isoformat(),
-                rationale=("Project reference/citation metadata; not scientific approval or full-text evidence."
+                rationale=("Project reference/citation metadata; not scientific approval or full-text evidence. "
+                           + " ".join(text for text in graph["limitations"] if text.startswith("Incomplete coverage:"))
                            if project_scope else
                            "First-tier iStopMM background/impact metadata; not scientific approval or full-text evidence."),
                 authorization_basis="User-approved private local evaluation; remote redistribution requires review.",
@@ -649,7 +650,7 @@ def acquire(root, papers, retry_pmc=False):
                 raise ValueError("Previously acquired PDF checksum differs")
             hashes[entry["sha256"]] = entry["filename"]
     with httpx.Client(timeout=httpx.Timeout(60), follow_redirects=False,
-                      headers={"User-Agent": "istopmm-evidence-first-tier/1 (private-research-acquisition)"}) as client:
+                      headers={"User-Agent": "research-library-first-tier/1 (private-research-acquisition)"}) as client:
         pace = RequestPacer()
         with ThreadPoolExecutor(max_workers=4) as pool:
             pending = [

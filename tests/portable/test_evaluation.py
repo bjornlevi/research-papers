@@ -9,7 +9,7 @@ import unittest
 import anyio
 from jsonschema import ValidationError
 
-from istopmm_evidence import contracts, evaluation, releases
+from research_library import contracts, evaluation, releases
 from test_releases import fixture_bundle
 
 
@@ -151,7 +151,7 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(protocol, "2025-11-25")
         self.assertTrue(evaluation.score(benchmark, rows, split="held_out")["passed"])
         output = self.root / "run-1"
-        command = [sys.executable, "-m", "istopmm_evidence.evaluation", "run",
+        command = [sys.executable, "-m", "research_library.evaluation", "run",
                    "--benchmark", str(benchmark_file), "--release", str(self.path),
                    "--allow-profile", "synthetic", "--split", "development", "--output", str(output)]
         response = subprocess.run(command, capture_output=True, text=True, cwd=self.root, timeout=30)

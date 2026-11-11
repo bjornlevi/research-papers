@@ -143,11 +143,11 @@ class CollectionSnapshot:
                 "release_id": self.snapshots[cid].release_id, "result_index": index,
                 "publication_id": self._aliases[cid, record["citation"]["doi"]]}
 
-    def _search(self, selected, arguments):
+    def _search(self, selected, arguments, *, papers=None):
         selected = [cid for cid in selected if not is_catalog(self.snapshots[cid])]
         if not selected:
             return {"items": [], "next_offset": None, "scope": contracts.CORPUS_SCOPE}, []
-        if len(selected) == 1:
+        if len(selected) == 1 and papers is None:
             cid, = selected
             response = self.snapshots[cid].call("search_evidence", arguments)
             result = response["result"]
@@ -160,6 +160,8 @@ class CollectionSnapshot:
             snapshot = self.snapshots[cid]
             for unit in snapshot._bundle["units"]:
                 citation = unit["citation"]
+                if papers is not None and publication(citation["doi"]) not in papers:
+                    continue
                 identity = releases.sha256(releases.encode({
                     "publication": self._aliases[cid, citation["doi"]],
                     "sha256": citation["source_sha256"], "locator": citation["locator"],

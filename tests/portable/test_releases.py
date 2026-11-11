@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from jsonschema import ValidationError
 
-from istopmm_evidence import contracts, releases, retrieval
+from research_library import contracts, releases, retrieval
 from fixtures import CLAIM, CONTEXT, ISSUE, RELATIONSHIP, TABLE, snapshots
 
 
@@ -441,7 +441,7 @@ class ReleaseTests(unittest.TestCase):
         bundle.write_bytes(releases.encode(self.bundle))
         path = self.root / "cli-release"
         def run(module, *args, expected=0):
-            result = subprocess.run([sys.executable, "-m", "istopmm_evidence." + module, *map(str, args)],
+            result = subprocess.run([sys.executable, "-m", "research_library." + module, *map(str, args)],
                                     cwd=self.root.parent, capture_output=True, text=True)
             self.assertEqual(result.returncode, expected, result.stderr)
             return result

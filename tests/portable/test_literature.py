@@ -9,7 +9,7 @@ import unittest
 
 import httpx
 
-from istopmm_evidence import literature, releases
+from research_library import literature, releases
 
 
 def epmc_record(pid="123", types=None):
@@ -50,7 +50,7 @@ class LiteratureTests(unittest.TestCase):
         self.assertIsNone(source["full_text_acquisition"])
         self.assertTrue(source["metadata_acquisition"][0]["url"].startswith(
             "https://www.ebi.ac.uk/europepmc/"))
-        exported = subprocess.run([sys.executable, "-m", "istopmm_evidence.literature",
+        exported = subprocess.run([sys.executable, "-m", "research_library.literature",
                                    "bibliography", "--run", str(self.root / "run")],
                                   capture_output=True, text=True)
         self.assertEqual(exported.returncode, 0, exported.stderr)
@@ -322,7 +322,7 @@ class LiteratureTests(unittest.TestCase):
             literature.discover(self.root / "run", client=client, provider="europepmc",
                                 disease="mm", through="2026-10-19", page_size=1)
         response = subprocess.run([
-            sys.executable, "-m", "istopmm_evidence.literature", "report",
+            sys.executable, "-m", "research_library.literature", "report",
             "--run", str(self.root / "run"),
         ], capture_output=True, text=True, cwd=self.root)
         self.assertEqual(response.returncode, 2, response.stderr)

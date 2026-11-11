@@ -47,7 +47,7 @@ def memory_index(data):
         else:
             # Python 3.10 lacks deserialize; a private temporary file plus backup
             # provides the same detached snapshot without writing the release.
-            with tempfile.TemporaryDirectory(prefix="istopmm-index-") as temporary:
+            with tempfile.TemporaryDirectory(prefix="research-library-index-") as temporary:
                 path = Path(temporary) / "index.sqlite"
                 path.write_bytes(data)
                 with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as reader:

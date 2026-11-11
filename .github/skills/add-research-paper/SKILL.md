@@ -10,6 +10,19 @@ First determine which project and registry the operator intends to change.
 Do not assume the historical iStopMM collection. For a new independent
 project, follow [the project guide](../../../docs/independent-projects.md).
 
+Use the project's vocabulary consistently:
+- **Core papers**: papers explicitly selected as the project's discovery seeds.
+- **References**: papers cited by Core papers (outgoing citations).
+- **Citing papers**: papers that cite Core papers (incoming citations).
+- **All papers**: the combined library, not just Core papers.
+
+Use **Find references** and **Find citing papers** for discovery actions.
+A paper can belong to multiple groups. Discovery is metadata-only until a PDF
+is attached and extracted; extraction never promotes a paper to Core papers.
+Do not use background/impact or referenced-by-core/cites-core as display names.
+Existing `background` and `impact` identifiers still mean References and Citing
+papers respectively; do not rename persisted fields or API parameters.
+
 Register a DOI and title with `research-project add`, or import a CSV. A paper
 without a supplied PDF remains awaiting PDF. For an operator-provided copy,
 verify with the operator that the PDF matches the registered title and DOI and

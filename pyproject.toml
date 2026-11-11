@@ -3,7 +3,7 @@ requires = ["setuptools>=77,<83"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "istopmm-evidence"
+name = "research-library"
 version = "0.1.0"
 description = "Private, source-linked research evidence retrieval"
 readme = "README.md"
@@ -19,24 +19,23 @@ build = ["PyMuPDF==1.26.7"]
 dev = ["build>=1.2,<2", "pip>=23"]
 
 [project.scripts]
-research-mcp-check = "istopmm_evidence.connection_check:main"
-istopmm-evidence = "istopmm_evidence.cli:main"
-istopmm-build = "istopmm_evidence.build_cli:main"
-istopmm-release = "istopmm_evidence.release_cli:main"
-istopmm-mcp = "istopmm_evidence.server:main"
-istopmm-evaluate = "istopmm_evidence.evaluation:main"
-istopmm-check-cards = "istopmm_evidence.research_cards:main"
-istopmm-http = "istopmm_evidence.http_server:main"
-istopmm-http-token = "istopmm_evidence.http_auth:main"
-istopmm-collections = "istopmm_evidence.collections:main"
-istopmm-literature = "istopmm_evidence.literature:main"
-istopmm-web = "istopmm_evidence.web_server:main"
-istopmm-mcp-check = "istopmm_evidence.connection_check:main"
-research-project = "istopmm_evidence.build.project_library:main"
+research-mcp-check = "research_library.connection_check:main"
+research-library = "research_library.cli:main"
+research-build = "research_library.build_cli:main"
+research-release = "research_library.release_cli:main"
+research-mcp = "research_library.server:main"
+research-evaluate = "research_library.evaluation:main"
+research-check-cards = "research_library.research_cards:main"
+research-http = "research_library.http_server:main"
+research-http-token = "research_library.http_auth:main"
+research-collections = "research_library.collections:main"
+research-literature = "research_library.literature:main"
+research-web = "research_library.web_server:main"
+research-project = "research_library.build.project_library:main"
 
 [tool.setuptools]
-packages = ["istopmm_evidence", "istopmm_evidence.build"]
-package-dir = {istopmm_evidence = "src/istopmm_evidence", "istopmm_evidence.build" = "tools"}
+packages = ["research_library", "research_library.build"]
+package-dir = {research_library = "src/research_library", "research_library.build" = "tools"}
 
 [tool.setuptools.package-data]
-istopmm_evidence = ["schemas/*.json"]
+research_library = ["schemas/*.json"]

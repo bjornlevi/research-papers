@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pymupdf
 
-from istopmm_evidence import quality, releases
+from research_library import quality, releases
 
 
 def create(root):

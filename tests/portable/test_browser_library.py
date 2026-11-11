@@ -6,7 +6,7 @@ import unittest
 
 import httpx
 
-from istopmm_evidence import collections, quality, releases, web_server
+from research_library import collections, quality, releases, web_server
 from fixtures import snapshots
 from test_collections import registry_fixture
 from test_catalog import mixed_fixture
@@ -36,6 +36,37 @@ class Links(HTMLParser):
     def handle_data(self, data):
         if self.field:
             self.fields[self.field] += data
+
+
+class DefaultView(HTMLParser):
+    """Text and controls visible before any native disclosures are opened."""
+    def __init__(self, html):
+        super().__init__()
+        self.stack = []
+        self.text = ""
+        self.controls = {}
+        self.feed(html)
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        visible = self.stack[-1][2] if self.stack else True
+        if tag == "summary" and self.stack and self.stack[-1][0] == "details":
+            visible = self.stack[-1][1]
+        visible = visible and tag not in {"script", "style"} and "hidden" not in attrs
+        if tag in {"input", "select", "textarea", "button"} and attrs.get("name"):
+            self.controls[attrs["name"]] = visible and attrs.get("type") != "hidden"
+        if tag not in {"input", "meta", "link", "br", "hr", "img", "wbr", "source", "area", "base", "embed", "param", "track", "col"}:
+            self.stack.append((tag, visible, visible and (tag != "details" or "open" in attrs)))
+
+    def handle_endtag(self, tag):
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == tag:
+                del self.stack[index:]
+                break
+
+    def handle_data(self, data):
+        if not self.stack or self.stack[-1][2]:
+            self.text += data
 
 
 class BrowserLibraryTests(unittest.TestCase):
@@ -90,6 +121,42 @@ class BrowserLibraryTests(unittest.TestCase):
         self.assertNotIn("https://", script.text)
         self.assertIn("Read retained text", client.get("/sources").text)
         self.assertEqual(before, snapshots(self.release))
+
+    def test_default_pages_hide_identifiers_and_help_without_hiding_actions(self):
+        client = self.client(release=self.release)
+        release_id = releases.validate(self.release, allowed_profiles={"synthetic"}).release_id
+        source_hash = self.bundle["sources"][0]["sha256"]
+        for path in ("/", "/sources", "/search", "/connect", "/publications", "/coverage", "/quality"):
+            with self.subTest(path=path):
+                response = client.get(path)
+                self.assertEqual(response.status_code, 200)
+                view = DefaultView(response.text)
+                self.assertNotIn(release_id, view.text)
+                self.assertNotIn(source_hash, view.text)
+                self.assertNotIn("machine extraction is not scientific validation", view.text)
+                self.assertIn('src="/help.js"', response.text)
+                self.assertIn('class="help"><summary aria-label="Help:', response.text)
+                self.assertNotIn('<details class="help" open', response.text)
+        sources = DefaultView(client.get("/sources").text)
+        self.assertTrue(sources.controls["paper"])
+        search = DefaultView(client.get("/search").text)
+        self.assertTrue(search.controls["query"])
+        self.assertNotIn("Keyword search of retained extracted text", search.text)
+        reader = client.get("/read?unit_id=fictional-unit-1", follow_redirects=True)
+        view = DefaultView(reader.text)
+        self.assertNotIn(release_id, view.text)
+        self.assertNotIn(source_hash, view.text)
+        self.assertIn("Fictional screening", view.text)
+        self.assertIn("OCR transcription", view.text)
+        self.assertIn("Copy citation and excerpt", view.text)
+        self.assertNotIn("Citation and stable link", view.text)
+        self.assertIn(source_hash, Links(reader.text).fields["citation"])
+        script = client.get("/help.js")
+        self.assertEqual(script.status_code, 200)
+        self.assertEqual(script.headers["content-type"], "text/javascript; charset=utf-8")
+        for event in ("pointerenter", "pointerleave", "click", "Escape"):
+            self.assertIn(event, script.text)
+        self.assertNotIn("fetch(", script.text)
 
     def test_document_order_and_readable_office_locators(self):
         for number in (11, 3):
@@ -164,6 +231,31 @@ class BrowserLibraryTests(unittest.TestCase):
         self.assertNotIn('<option value="test-literature"', response.text)
         self.assertEqual(client.get("/search?query=screening&collection=test-literature").status_code, 403)
         self.assertEqual(client.get("/read?unit_id=fictional-unit-1&collection=test-literature").status_code, 400)
+
+    def test_catalog_provenance_is_collapsed_but_counts_and_bibliography_remain(self):
+        store, document, _, _ = mixed_fixture(self.root)
+        client = self.client(registry=store.root, allowed_collections={"istopmm", "test-literature"})
+        coverage = client.get("/coverage")
+        self.assertEqual(coverage.status_code, 200)
+        view = DefaultView(coverage.text)
+        catalog_id = store.current().snapshots["test-literature"].release_id
+        self.assertNotIn(catalog_id, view.text)
+        self.assertIn(catalog_id, coverage.text)
+        self.assertIn("Search history and provenance", view.text)
+        self.assertIn("Literature coverage", view.text)
+        self.assertIn("Publications", view.text)
+        self.assertIn("Metadata quality", view.text)
+        self.assertIn("Publication breakdown", view.text)
+        self.assertNotIn("Review eligibility", view.text)
+        self.assertIn("Review eligibility", coverage.text)
+        self.assertNotIn("Provider records", view.text)
+        self.assertIn("Provider records", coverage.text)
+        publications = client.get("/publications")
+        view = DefaultView(publications.text)
+        self.assertIn(document["publications"][0]["title"], view.text)
+        self.assertIn("Authors", view.text)
+        self.assertIn("More metadata and provenance", view.text)
+        self.assertNotIn("Provenance", view.text)
 
     def test_combined_duplicate_membership_links_use_each_members_source(self):
         store, _, _, _ = registry_fixture(self.root)

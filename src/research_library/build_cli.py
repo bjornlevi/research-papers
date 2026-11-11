@@ -21,21 +21,21 @@ def main():
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if importlib.util.find_spec("pymupdf") is None:
-        parser.error("Build tools require: pip install 'istopmm-evidence[build]'")
+        parser.error("Build tools require: pip install 'research-library[build]'")
     root = args.data_root.expanduser().resolve()
     if not root.is_dir() or (
         args.tool not in {"literature-ingest", "citation-neighborhood", "literature-update", "literature-ocr"}
         and not (root / "papers/manifest.csv").is_file()
     ):
         parser.error("data root must contain the authorized local papers/manifest.csv; no corpus is bundled")
-    os.environ["ISTOPMM_DATA_ROOT"] = str(root)
+    os.environ["RESEARCH_LIBRARY_DATA_ROOT"] = str(root)
     module_name = {"literature-ingest": "literature_ingest",
                    "citation-neighborhood": "citation_neighborhood",
                    "literature-update": "literature_update", "literature-ocr": "literature_ocr"}.get(args.tool, args.tool)
     module = importlib.import_module(
         ".build." + module_name,
-        package="istopmm_evidence")
-    sys.argv = [f"istopmm-build {args.tool}", *args.arguments]
+        package="research_library")
+    sys.argv = [f"research-build {args.tool}", *args.arguments]
     import pymupdf
     try:
         return module.main()

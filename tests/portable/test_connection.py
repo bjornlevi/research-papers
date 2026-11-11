@@ -15,8 +15,8 @@ import anyio
 import httpx
 from werkzeug.serving import WSGIRequestHandler, make_server
 
-from istopmm_evidence import connection_check, http_auth, releases, web_server
-from test_browser_library import Links
+from research_library import connection_check, http_auth, releases, web_server
+from test_browser_library import DefaultView, Links
 from test_collections import registry_fixture
 from test_http import running_server
 from test_releases import fixture_bundle
@@ -67,7 +67,7 @@ class ConnectionTests(unittest.TestCase):
     def test_connection_page_configured_url_no_secrets_and_copy_controls(self):
         app = web_server.create_app(release=self.release, profiles={"synthetic"},
                                     mcp_url="https://evidence.example.test/mcp")
-        with patch("istopmm_evidence.local_client.read_token", side_effect=AssertionError("Must not read credentials")):
+        with patch("research_library.local_client.read_token", side_effect=AssertionError("Must not read credentials")):
             with httpx.Client(transport=httpx.WSGITransport(app=app),
                               base_url="http://127.0.0.1:8080") as client:
                 page = client.get("/connect")
@@ -88,11 +88,18 @@ class ConnectionTests(unittest.TestCase):
                 self.assertIn("deletes the managed token file", page.text)
                 self.assertIn("Revoked-token records remain", page.text)
                 self.assertNotIn("<details open", page.text)
-                self.assertLess(page.text.index('id="remove"'), page.text.index("<details>"))
+                initial = DefaultView(page.text).text
+                self.assertIn("Claude setup command", initial)
+                self.assertIn("Reconnect or remove a connection", initial)
+                self.assertNotIn("Remove command", initial)
                 self.assertIn("--web-url http://127.0.0.1:8080", fields["sdk-check"])
                 self.assertIn("--url https://evidence.example.test/mcp", fields["sdk-check"])
                 prompt = Links(page.text).fields["prompt"]
                 self.assertIn("checksum", prompt)
+                self.assertIn("Core papers (operator-selected discovery seeds)", prompt)
+                self.assertIn("References", prompt)
+                self.assertIn("Citing papers", prompt)
+                self.assertIn("All papers", prompt)
                 self.assertIn("OCR", prompt)
                 self.assertIn("omit collections and snapshot_id", prompt)
                 self.assertIn("preserve the returned release_id", prompt)

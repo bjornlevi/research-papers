@@ -17,7 +17,7 @@ from contextlib import closing
 
 import pymupdf
 
-from istopmm_evidence import retrieval
+from research_library import retrieval
 
 if __package__:
     from .workspace import workspace_root

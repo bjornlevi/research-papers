@@ -8,8 +8,8 @@ import unittest
 
 import httpx
 
-from istopmm_evidence import collections, quality, releases, web_server
-from istopmm_evidence.quality_cli import repair
+from research_library import collections, quality, releases, web_server
+from research_library.quality_cli import repair
 from fixtures import snapshots
 from test_collections import collection_cases, registry_fixture
 from test_http import running_server
@@ -83,6 +83,16 @@ class QualityTests(unittest.TestCase):
         self.assertFalse(quality.report(candidate, self.quality)["ready"])
         with self.assertRaisesRegex(releases.ReleaseError, "stale"):
             quality.review(candidate, self.quality, missing["id"], "verified_blank", "A", "Old review")
+
+    def test_legacy_problem_records_remain_readable(self):
+        quality.problem(self.snapshot, self.quality, "fictional-unit-1", "A", "Original has a different number.")
+        event = quality._events(self.quality, "problems")[0]
+        self.assertEqual(event["schema_version"], 2)
+        event.update(schema_version=1, extraction_key=quality.unit_key(self.snapshot._bundle["units"][0]))
+        legacy_root = self.root / "legacy-quality"
+        quality._write(legacy_root, "problems", event)
+        self.assertIn("reported_defect",
+                      {item["code"] for item in quality.report(self.snapshot, legacy_root)["findings"]})
 
     def test_ocr_reported_defect_requires_repair_and_keeps_history(self):
         changed = deepcopy(self.bundle)
@@ -241,12 +251,13 @@ class QualityTests(unittest.TestCase):
             self.assertEqual(response.json()["result"]["record"], self.snapshot.source_context("fictional-unit-1")["record"])
             self.assertEqual(client.get("/sources").status_code, 200)
             self.assertEqual(client.get("/quality").status_code, 403)
+            self.assertEqual(client.post("/quality").status_code, 403)
         expected = self.root / "public-expected.json"
         expected.write_text(json.dumps(collection_cases(public)))
         scripts = Path(__file__).resolve().parents[1]
         result = subprocess.run([
             sys.executable, str(scripts / "mcp_client.py"),
-            "--server", str(Path(sys.executable).parent / "istopmm-mcp"),
+            "--server", str(Path(sys.executable).parent / "research-mcp"),
             "--registry", str(public.root), "--expected", str(expected), "--cwd", str(self.root),
             "--allow-collection", "istopmm", "--allow-collection", "test-literature",
             "--default-collection", "istopmm",
@@ -284,18 +295,19 @@ class QualityTests(unittest.TestCase):
             self.assertIn("not a detected extraction error", response.text)
             self.assertIn("Why this is flagged", response.text)
             self.assertIn("What to do", response.text)
-            self.assertIn("Record the result", response.text)
+            self.assertIn("Take action", response.text)
             self.assertIn("Technical identifiers (for troubleshooting)", response.text)
-            self.assertIn("--decision verified", response.text)
-            self.assertIn("problem --unit-id fictional-unit-1", response.text)
-            self.assertIn("repair releases/corrected-candidate-NEW --unit-id fictional-unit-1", response.text)
+            self.assertIn('name="decision"', response.text)
+            self.assertIn('value="verified"', response.text)
+            self.assertIn('value="problem"', response.text)
+            self.assertNotIn("quality_cli", response.text)
             self.assertIn(finding["id"], response.text)
             self.assertEqual(client.get("/quality?finding=missing").status_code, 404)
             self.assertEqual(client.get("/quality?offset=-1").status_code, 400)
-            self.assertEqual(client.post("/quality").status_code, 405)
+            self.assertEqual(client.post("/quality").status_code, 403)
             self.assertTrue(client.get("/api/text?unit_id=fictional-unit-1").json()["ok"])
         result = subprocess.run(
-            [sys.executable, "-m", "istopmm_evidence.quality_cli", "--release", str(self.release),
+            [sys.executable, "-m", "research_library.quality_cli", "--release", str(self.release),
              "--allow-profile", "synthetic", "--quality-root", str(self.quality), "check"],
             text=True, capture_output=True)
         self.assertEqual(result.returncode, 1)
@@ -329,10 +341,10 @@ class QualityTests(unittest.TestCase):
             self.assertIn("No text was extracted at this location.", response.text)
             self.assertIn("Neighbouring paragraph 3.", response.text)
             self.assertIn("not printed pages", client.get("/quality", params={"finding": coverage["id"]}).text)
-            self.assertIn("--unit-id fictional-unit-2", response.text)
-            self.assertIn("--decision verified_nontext", response.text)
-            self.assertIn("--text-file releases/corrected-text.txt", response.text)
-            self.assertIn(str(path), response.text)
+            self.assertIn('name="unit_id" value="fictional-unit-2"', response.text)
+            self.assertIn('value="verified_nontext"', response.text)
+            self.assertIn("Record comparison", response.text)
+            self.assertNotIn("quality_cli", response.text)
             response = client.get("/quality", params={"finding": coverage["id"]})
             self.assertLess(response.text.index("Word body element 2 (table)"),
                             response.text.index("Word body element 3 (table)"))
@@ -343,12 +355,13 @@ class QualityTests(unittest.TestCase):
             self.assertIn("Mean OCR word confidence: 61", response.text)
             self.assertIn("decimal points", response.text)
 
-    def test_operator_inventory_and_omitted_page_commands(self):
+    def test_operator_inventory_and_omitted_page_actions(self):
         app = web_server.create_app(release=self.release, profiles={"synthetic"}, quality_root=self.quality)
         with httpx.Client(transport=httpx.WSGITransport(app=app), base_url="http://127.0.0.1:8080") as client:
             finding = quality.report(self.snapshot, self.quality)["findings"][0]
             response = client.get("/quality", params={"finding": finding["id"]})
-            self.assertIn("inventory --papers papers", response.text)
+            self.assertIn("Build location inventory", response.text)
+            self.assertIn('name="original"', response.text)
             self.assertIn("omitted final page", response.text)
             self.inventory()
             source = self.bundle["sources"][0]
@@ -357,8 +370,9 @@ class QualityTests(unittest.TestCase):
             response = client.get("/quality", params={"finding": finding["id"]})
             self.assertIn("PDF page 2", response.text)
             self.assertIn("release has no text unit", response.text)
-            self.assertIn("--source-id fictional:main --locator", response.text)
-            self.assertIn("--decision verified_blank", response.text)
+            self.assertIn('value="verified_blank"', response.text)
+            self.assertIn("Record comparison", response.text)
+            self.assertNotIn("quality_cli", response.text)
             self.assertIn("Fictional screening context.", response.text)
 
     def test_publication_link_is_not_the_supplement_download(self):

@@ -10,8 +10,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from istopmm_evidence import retrieval
-from istopmm_evidence.build import evidence, knowledge
+from research_library import retrieval
+from research_library.build import evidence, knowledge
 from fixtures import corpus, DOI, snapshots
 
 
@@ -23,11 +23,11 @@ class RetrievalTests(unittest.TestCase):
 
     def cli(self, *args, legacy=False):
         if legacy:
-            command = [sys.executable, "-m", "istopmm_evidence.build.evidence", *args]
+            command = [sys.executable, "-m", "research_library.build.evidence", *args]
         else:
-            command = [sys.executable, "-m", "istopmm_evidence.cli", "--data-root", str(self.root), *args]
+            command = [sys.executable, "-m", "research_library.cli", "--data-root", str(self.root), *args]
         return subprocess.run(command, cwd=self.root.parent, capture_output=True, text=True,
-                              env={**os.environ, "ISTOPMM_DATA_ROOT": str(self.root)})
+                              env={**os.environ, "RESEARCH_LIBRARY_DATA_ROOT": str(self.root)})
 
     def test_cli_shared_and_legacy_parity(self):
         with closing(retrieval.open_index(self.root)) as db:
@@ -111,7 +111,7 @@ class RetrievalTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(retrieval.RetrievalError, "Specify"):
                 retrieval.open_index()
-        with patch.dict(os.environ, {"ISTOPMM_DATA_ROOT": str(self.root)}):
+        with patch.dict(os.environ, {"RESEARCH_LIBRARY_DATA_ROOT": str(self.root)}):
             with closing(retrieval.open_index()) as db:
                 self.assertEqual(len(retrieval.claims(db)), 2)
         with self.assertRaisesRegex(retrieval.RetrievalError, "directory"):
@@ -145,7 +145,7 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(snapshots(self.root), before)
 
     def test_installed_build_tools_respect_root(self):
-        with patch.dict(os.environ, {"ISTOPMM_DATA_ROOT": str(self.root)}):
+        with patch.dict(os.environ, {"RESEARCH_LIBRARY_DATA_ROOT": str(self.root)}):
             response = self.cli("claims", legacy=True)
             self.assertEqual(response.returncode, 0, response.stderr)
         with patch.object(evidence, "ROOT", self.root):

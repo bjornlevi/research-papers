@@ -264,7 +264,7 @@ def create_app(*, release=None, store=None, collection_registry=None, allowed_co
         return JSONResponse({
             "resource": base_url, "bearer_methods_supported": ["header"],
             "scopes_supported": ["evidence:read", *(f"profile:{p}" for p in sorted(profiles))],
-            "resource_name": "iStopMM private evidence (operator-issued bearer tokens)",
+            "resource_name": "Research Library private evidence (operator-issued bearer tokens)",
         })
     routes = [
         Route("/healthz", health, methods=["GET"]),
