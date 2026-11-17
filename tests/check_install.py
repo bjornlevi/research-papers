@@ -72,7 +72,7 @@ def main():
              "assert importlib.util.find_spec('pymupdf') is None; "
              "assert importlib.util.find_spec('istopmm_evidence') is None; "
              "assert importlib.metadata.version('research-library') == __version__; "
-             "assert len(contracts.TOOLS)==12"], cwd=temporary)
+             "assert len(contracts.TOOLS)==13"], cwd=temporary)
         run([environment / "bin/research-library", "--help"], cwd=temporary)
         run([environment / "bin/research-build", "--help"], cwd=temporary)
         run([environment / "bin/research-release", "--help"], cwd=temporary)

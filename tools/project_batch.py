@@ -40,16 +40,46 @@ def select(root, rows, selected):
     return job
 
 
-def prepare_locate(root):
+def prepare_locate(root, *, dois=None):
     job = load(root)
     tasks = [doi for doi, item in job["items"].items()
-             if item["selected"] and item["status"] not in {"downloaded", "extraction_failed", "extracted"}]
+             if item["selected"] and (dois is None or doi in dois)
+             and item["status"] not in {"downloaded", "local_found", "extraction_failed", "extracted"}]
     if not tasks:
         raise ValueError("Turn on Locate PDF for at least one paper without a downloaded PDF")
     job.update(status="running", operation="locate", tasks=tasks, processed=0)
     job.pop("message", None)
     save(root, job)
     return job
+
+
+def accept_pdf(root, pdf_root, doi, filename):
+    with literature_update.writer_lock(root):
+        job = load(root)
+        item = job["items"].get(doi)
+        if not item or item["status"] == "extracted":
+            raise ValueError("Only unextracted papers in the review queue can be accepted")
+        if Path(filename).suffix.casefold() != ".pdf":
+            raise ValueError("Select a PDF before accepting")
+        path = releases.safe_file(Path(pdf_root), filename)
+        item.update(filename=filename, accepted_sha256=releases.sha256(path.read_bytes()))
+        if item["status"] == "extraction_failed":
+            item["status"] = "local_found"
+            item.pop("error", None)
+        save(root, job)
+
+
+def prepare_accepted(root, pdf_root):
+    with literature_update.writer_lock(root):
+        job = load(root)
+        choices = []
+        for doi, item in job["items"].items():
+            if item.get("accepted_sha256") and item["status"] not in {"extracted", "extraction_failed"}:
+                path = releases.safe_file(Path(pdf_root), item["filename"])
+                if releases.sha256(path.read_bytes()) != item["accepted_sha256"]:
+                    raise ValueError("Accepted PDF changed; inspect and accept it again: " + item["filename"])
+                choices.append((doi, item["filename"]))
+        return prepare_extract(root, pdf_root, choices)
 
 
 def prepare_extract(root, pdf_root, choices):
@@ -104,8 +134,8 @@ def run(root, pdf_root, job, pause, *, on_error=None):
                     pace()
                     result = project_library.find_pdf(root, doi, pdf_root, title=item["title"])
                     item["result"] = result
-                    if result["status"] == "downloaded":
-                        item.update(status="downloaded", filename=result["filename"])
+                    if result["status"] in {"downloaded", "local_found"}:
+                        item.update(status=result["status"], filename=result["filename"])
                     else:
                         item.update(status="not_found", error=result["status"])
                 else:
@@ -119,6 +149,7 @@ def run(root, pdf_root, job, pause, *, on_error=None):
                     on_error(error)
                 item.update(status="failed" if job["operation"] == "locate" else "extraction_failed",
                             error=str(error))
+                item.pop("accepted_sha256", None)
                 # Stop the queue on provider errors rather than spending the next day's quota
                 # repeatedly retrying every remaining paper.
                 if isinstance(error, literature.DiscoveryError):

@@ -23,7 +23,7 @@ jobs:
       - run: python tests/check_collections.py
       - run: python tests/check_catalog.py
       - run: python -m unittest discover -s tests -p 'test_citation_neighborhood.py' -v
-      - run: python -m unittest discover -s tests -p 'test_project_library.py' -v
+      - run: python -m unittest discover -s tests -p 'test_project_*.py' -v
       - run: python tests/check_install.py
   container:
     runs-on: ubuntu-latest

@@ -14,7 +14,8 @@ from jsonschema import ValidationError
 import pymupdf
 
 from research_library import collections, quality, releases, web_server
-from research_library.build import project_edit, project_index, project_library, project_purge
+from research_library.build import project_edit, project_index, project_library, project_purge, project_text
+from project_text_helpers import publish_all
 
 
 class ProjectEditTests(unittest.TestCase):
@@ -35,7 +36,7 @@ class ProjectEditTests(unittest.TestCase):
                 pdf.new_page().insert_text((50, 50), f"Second {key} page must retain its original text without change.")
                 pdf.save(path)
             project_library.attach(self.root, "10.0000/" + key, path, identity_confirmed=True)
-        self.current = project_library.store(self.root).current()
+        self.current = project_text.editorial_store(self.root).current()
         self.original = self.current.snapshots["core"]
         self.source = next(source for source in self.original._bundle["sources"] if source["doi"] == "10.0000/example")
         self.unit = next(unit for unit in self.original._bundle["units"]
@@ -105,8 +106,8 @@ class ProjectEditTests(unittest.TestCase):
             "note": "Original says 20 but retained text says 2O."}, base_url=base).status_code, 303)
         report = quality.report(self.original, quality_root)
         self.assertIn("reported_defect", {item["code"] for item in report["findings"] if not item["resolved"]})
-        self.assertEqual(project_library.store(self.root).current().release_id, self.current.release_id)
-        self.assertEqual(self.original._bundle, project_library.store(self.root).current().snapshots["core"]._bundle)
+        self.assertEqual(project_text.editorial_store(self.root).current().release_id, self.current.release_id)
+        self.assertEqual(self.original._bundle, project_text.editorial_store(self.root).current().snapshots["core"]._bundle)
         other = next(item for item in report["findings"] if item["code"] == "inventory_missing")
         other_url = "/quality?" + urlencode({"collection": "core", "finding": other["id"]})
         uploaded = client.post(other_url, data={
@@ -120,11 +121,11 @@ class ProjectEditTests(unittest.TestCase):
                       if unit["citation"]["source_id"] == self.source["id"] and unit["id"] != self.unit["id"])
         project_edit.correct(self.root, **(self.args | {
             "unit_id": second["id"], "text": second["text"] + " Corrected second page.", "tables": []}))
-        updated = project_library.store(self.root).current()
+        updated = project_text.editorial_store(self.root).current()
         self.assertIn("reported_defect", {item["code"] for item in
                       quality.report(updated.snapshots["core"], quality_root)["findings"]})
         project_edit.correct(self.root, **(self.args | {"snapshot_id": updated.release_id, "tables": []}))
-        updated = project_library.store(self.root).current()
+        updated = project_text.editorial_store(self.root).current()
         self.assertNotIn("reported_defect", {item["code"] for item in
                          quality.report(updated.snapshots["core"], quality_root)["findings"]})
         self.assertEqual(len(list((quality_root / "problems").glob("*.json"))), 1)
@@ -135,7 +136,7 @@ class ProjectEditTests(unittest.TestCase):
         path = self.root.parent / "truncated"
         releases.export(bundle, path, profile="private_context",
                         authorization=self.original._manifest["authorization"])
-        registry = project_library.store(self.root)
+        registry = project_text.editorial_store(self.root)
         document = deepcopy(self.current.document)
         document["collections"][0]["release_id"] = registry.releases.install(path)
         registry.publish(document)
@@ -155,7 +156,7 @@ class ProjectEditTests(unittest.TestCase):
         path = self.root.parent / "missing-page"
         releases.export(bundle, path, profile="private_context",
                         authorization=self.original._manifest["authorization"])
-        registry = project_library.store(self.root)
+        registry = project_text.editorial_store(self.root)
         release_id = registry.releases.install(path)
         document = deepcopy(self.current.document)
         document["collections"][0]["release_id"] = release_id
@@ -196,16 +197,16 @@ class ProjectEditTests(unittest.TestCase):
     def test_corrected_version_search_context_metadata_tables_and_immutable_history(self):
         before = deepcopy(self.original._bundle)
         result = project_edit.correct(self.root, **self.args)
-        current = project_library.store(self.root).current()
+        current = project_text.editorial_store(self.root).current()
         self.assertNotEqual(current.release_id, self.current.release_id)
         evidence = current.snapshots["core"]
         self.assertEqual(self.original._bundle, before)
-        old = project_library.store(self.root).load(self.current.release_id).snapshots["core"]
+        old = project_text.editorial_store(self.root).load(self.current.release_id).snapshots["core"]
         self.assertEqual(old._bundle, before)
         new_source = next(source for source in evidence._bundle["sources"] if source["id"] == self.source["id"])
         self.assertEqual(new_source["sha256"], self.source["sha256"])
         self.assertEqual(new_source["bibliography"]["title"], "Corrected title")
-        self.assertIn("Operator-corrected", new_source["provenance"])
+        self.assertIn("Admin-edited draft", new_source["provenance"])
         untouched = [unit for unit in before["units"] if unit["id"] != self.unit["id"]]
         after = {unit["id"]: unit for unit in evidence._bundle["units"]}
         # Metadata provenance/URLs are propagated, but text and source identities stay unchanged elsewhere.
@@ -231,7 +232,7 @@ class ProjectEditTests(unittest.TestCase):
 
     def test_invalid_stale_unconfirmed_and_failed_publication_preserve_active_evidence(self):
         cases = [
-            {"checked": False}, {"reviewer": ""}, {"reason": ""},
+            {"reviewer": ""}, {"reason": ""},
             {"snapshot_id": "0" * 64}, {"unit_id": "missing"},
             {"bibliography": {**self.args["bibliography"], "year": "yesterday"}},
             {"bibliography": {**self.args["bibliography"], "acquired_from": "javascript:alert(1)"}},
@@ -244,17 +245,17 @@ class ProjectEditTests(unittest.TestCase):
             with self.subTest(changes=changes):
                 with self.assertRaises((ValueError, releases.ReleaseError, ValidationError)):
                     project_edit.correct(self.root, **(self.args | changes))
-                self.assertEqual(project_library.store(self.root).current().release_id, self.current.release_id)
+                self.assertEqual(project_text.editorial_store(self.root).current().release_id, self.current.release_id)
                 self.assertEqual(project_edit.history(self.root, self.source["id"]), [])
         with patch.object(collections.CollectionStore, "publish", side_effect=ValueError("Staging failure")):
             with self.assertRaisesRegex(ValueError, "Staging failure"):
                 project_edit.correct(self.root, **self.args)
-        self.assertEqual(project_library.store(self.root).current().release_id, self.current.release_id)
+        self.assertEqual(project_text.editorial_store(self.root).current().release_id, self.current.release_id)
         self.assertFalse(list((self.root / "runs").glob("correction-*")))
 
     def test_table_edit_and_removal_and_noop_corrections(self):
         project_edit.correct(self.root, **self.args)
-        current = project_library.store(self.root).current()
+        current = project_text.editorial_store(self.root).current()
         table = current.snapshots["core"]._bundle["tables"][0]
         editable = {"id": table["id"], **{key: table[key] for key in project_edit.TABLE_FIELDS}}
         args = self.args | {"snapshot_id": current.release_id, "tables": [editable]}
@@ -262,20 +263,20 @@ class ProjectEditTests(unittest.TestCase):
             project_edit.correct(self.root, **args)
         editable["rows"] = [["Example", 43]]
         project_edit.correct(self.root, **args)
-        current = project_library.store(self.root).current()
+        current = project_text.editorial_store(self.root).current()
         self.assertEqual(current.snapshots["core"]._bundle["tables"][0]["rows"], [["Example", 43]])
         project_edit.correct(self.root, **(args | {"snapshot_id": current.release_id, "tables": []}))
-        self.assertEqual(project_library.store(self.root).current().snapshots["core"]._bundle["tables"], [])
+        self.assertEqual(project_text.editorial_store(self.root).current().snapshots["core"]._bundle["tables"], [])
         self.assertEqual(len(project_edit.history(self.root, self.source["id"])), 3)
 
     def test_purge_removes_correction_history_and_tables_for_removed_source_only(self):
         project_edit.correct(self.root, **self.args)
         project_purge.purge(self.root, "10.0000/keep", self.pdfs)
-        current = project_library.store(self.root).current()
+        current = project_text.editorial_store(self.root).current()
         self.assertEqual(len(current.snapshots["core"]._bundle["tables"]), 1)
         self.assertEqual(len(project_edit.history(self.root, self.source["id"])), 1)
         project_purge.purge(self.root, "10.0000/example", self.pdfs)
-        self.assertIsNone(project_library.status(self.root)["snapshot"])
+        self.assertEqual(project_text.editorial_store(self.root).current().snapshots["core"]._bundle["sources"], [])
 
     def test_subsequent_attachment_preserves_corrections_tables_and_audit(self):
         project_edit.correct(self.root, **self.args)
@@ -285,11 +286,144 @@ class ProjectEditTests(unittest.TestCase):
             pdf.new_page().insert_text((50, 50), "Extra synthetic evidence with unique content for subsequent attachment.")
             pdf.save(path)
         project_library.attach(self.root, "10.0000/extra", path, identity_confirmed=True)
-        current = project_library.store(self.root).current()
+        current = project_text.editorial_store(self.root).current()
         unit = next(unit for unit in current.snapshots["core"]._bundle["units"] if unit["id"] == self.unit["id"])
         self.assertEqual(unit["text"], self.args["text"])
         self.assertEqual(len(current.snapshots["core"]._bundle["tables"]), 1)
         self.assertEqual(len(project_edit.history(self.root, self.source["id"])), 1)
+
+    def test_default_view_reads_whole_document_and_requires_explicit_edit_mode(self):
+        project_edit.correct(self.root, **self.args)
+        current = project_text.editorial_store(self.root).current()
+        evidence = current.snapshots["core"]
+        units = sorted((unit for unit in evidence._bundle["units"]
+                        if unit["citation"]["source_id"] == self.source["id"]), key=web_server.quality_order)
+        app = web_server.create_app(registry=self.root / "registry", project_root=self.root,
+            pdf_data_root=self.pdfs, profiles={"private_context"},
+            allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        base = "http://localhost:8080"
+        url = "/library/edit?doi=10.0000/example"
+        response = client.get(url, base_url=base)
+        html = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertNotIn("<textarea", html)
+        self.assertIn('name="action" value="publish"', html)
+        self.assertNotIn("Save corrected version", html)
+        text = re.search(r'<pre class="reading" id="document-text">(.*?)</pre>', html, re.S).group(1)
+        text = unescape(re.sub(r'</?span[^>]*>', '', text))
+        self.assertEqual(text, "\n\n".join(unit["text"] for unit in units))
+        self.assertIn("Paper metadata and provenance", html)
+        self.assertIn("Corrected title", html)
+        self.assertIn("Correction history (1)", html)
+        self.assertIn("<th>Measure</th>", html)
+        self.assertIn("participants", html)
+        self.assertIn("Operator transcription", html)
+        self.assertIn("Extraction warnings and provenance", html)
+        edit_link = unescape(re.search(r'<a class="button" href="([^"]+)">Turn on edit mode', html).group(1))
+        edit_html = client.get(edit_link, base_url=base).get_data(as_text=True)
+        self.assertIn('id="edit-text"', edit_html)
+        self.assertIn("Return to read-only view", edit_html)
+        for unit in units:
+            selected = client.get(url + "&" + urlencode({"unit_id": unit["id"]}), base_url=base)
+            self.assertIn(b'id="document-text"', selected.data)
+            self.assertNotIn(b'id="edit-text"', selected.data)
+        self.assertEqual(client.get(url + "&mode=invalid", base_url=base).status_code, 400)
+        self.assertEqual(project_text.editorial_store(self.root).current().release_id, current.release_id)
+
+    def test_whole_document_web_save_updates_all_pages_atomically_with_citations_and_tables(self):
+        units = project_edit.document_units(self.original._bundle, self.source["id"])
+        app = web_server.create_app(registry=self.root / "registry", project_root=self.root,
+            pdf_data_root=self.pdfs, profiles={"private_context"},
+            allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        base = "http://localhost:8080"
+        url = "/library/edit?doi=10.0000/example&mode=edit"
+        html = client.get(url, base_url=base).get_data(as_text=True)
+        draft = unescape(re.search(r'<textarea id="edit-text"[^>]*>(.*?)</textarea>', html, re.S).group(1))
+        self.assertEqual(draft, project_edit.document_draft(units))
+        self.assertEqual(html.count('id="edit-text"'), 1)
+        self.assertNotIn("Save changes before switching pages", html)
+        self.assertIn('name="scope" value="document"', html)
+        self.assertIn("Whole document text / OCR", html)
+        edited = draft.replace("transcripton", "fixedtranscription").replace("Second example", "Updatedsecond example")
+        tables = [{**self.args["tables"][0], "unit_id": units[-1]["id"]}]
+        form = {"token": re.search(r'name="token" value="([^"]+)"', html).group(1),
+                "doi": "10.0000/example", "scope": "document", "source_id": self.source["id"],
+                "unit_id": units[0]["id"], "snapshot_id": self.current.release_id,
+                "text": edited.replace("\n", "\r\n"), "tables": json.dumps(tables),
+                "reviewer": "Whole document reviewer", "reason": "Checked both pages", "checked": "yes",
+                "source_url": self.args["source_url"], **self.args["bibliography"]}
+        invalid = client.post("/library/edit", data=form | {
+            "text": edited.replace(project_edit.page_marker(units[-1]), "[[PAGE removed]]")}, base_url=base)
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn(b"page-boundary marker", invalid.data)
+        self.assertIn(b"[[PAGE removed]]", invalid.data)
+        self.assertEqual(project_text.editorial_store(self.root).current().release_id, self.current.release_id)
+        with patch.object(collections.CollectionStore, "publish", side_effect=ValueError("Staging failure")):
+            self.assertEqual(client.post("/library/edit", data=form, base_url=base).status_code, 400)
+        self.assertEqual(project_text.editorial_store(self.root).current().release_id, self.current.release_id)
+        self.assertEqual(project_edit.history(self.root, self.source["id"]), [])
+        response = client.post("/library/edit", data=form, base_url=base)
+        self.assertEqual(response.status_code, 303)
+        readable = client.get(response.location, base_url=base)
+        self.assertNotIn(b'id="edit-text"', readable.data)
+        self.assertIn(b"fixedtranscription", readable.data)
+        self.assertIn(b"Updatedsecond", readable.data)
+        current = project_text.editorial_store(self.root).current()
+        updated = project_edit.document_units(current.snapshots["core"]._bundle, self.source["id"])
+        for original, corrected in zip(units, updated):
+            self.assertEqual(corrected["id"], original["id"])
+            self.assertEqual(corrected["citation"]["locator"], original["citation"]["locator"])
+            self.assertEqual(corrected["citation"]["source_sha256"], original["citation"]["source_sha256"])
+            self.assertEqual(corrected["human_verification"], "not_reviewed")
+        self.assertEqual(project_edit.document_draft(updated), edited)
+        table = current.snapshots["core"]._bundle["tables"][0]
+        self.assertEqual(table["citation"]["locator"], units[-1]["citation"]["locator"])
+        history = project_edit.history(self.root, self.source["id"])
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["scope"], "document")
+        self.assertEqual(history[0]["unit_ids"], [unit["id"] for unit in units])
+        self.assertEqual(history[0]["before"]["text"], draft)
+        self.assertEqual(history[0]["after"]["text"], edited)
+        self.assertEqual(project_text.editorial_store(self.root).load(self.current.release_id).snapshots["core"]._bundle,
+                         self.original._bundle)
+        self.assertTrue(current.call("search_evidence", {"query": "Updatedsecond"})["result"]["items"])
+        document = current.call("get_source_document", {"source_id": self.source["id"], "collections": ["core"]})
+        self.assertIn("Updatedsecond", str(document))
+        self.assertEqual(client.post("/library/edit", data=form, base_url=base).status_code, 400)
+        edit_html = client.get(url, base_url=base).get_data(as_text=True)
+        table_json = unescape(re.search(r'<textarea id="edit-tables"[^>]*>(.*?)</textarea>', edit_html, re.S).group(1))
+        editable = json.loads(table_json)
+        self.assertEqual(editable[0]["unit_id"], units[-1]["id"])
+        args = self.args | {"whole_document": True, "snapshot_id": current.release_id,
+                           "text": edited, "tables": editable}
+        with self.assertRaisesRegex(ValueError, "No data changed"):
+            project_edit.correct(self.root, **args)
+        editable[0]["unit_id"] = units[0]["id"]
+        with self.assertRaisesRegex(ValueError, "original page"):
+            project_edit.correct(self.root, **args)
+
+    def test_document_markers_roundtrip_and_reject_ambiguous_page_mapping(self):
+        units = deepcopy(project_edit.document_units(self.original._bundle, self.source["id"]))
+        units[0]["text"] = ""
+        units[-1]["text"] = "Text with trailing newlines\n\n"
+        draft = project_edit.document_draft(units)
+        self.assertEqual(project_edit.document_pages(draft, units), {unit["id"]: unit["text"] for unit in units})
+        malformed = [
+            "Preface\n" + draft,
+            draft.replace(project_edit.page_marker(units[-1]), ""),
+            draft + "\n\n" + project_edit.page_marker(units[-1]) + "\nExtra",
+            project_edit.document_draft(list(reversed(units))),
+            draft.replace("\n\n[[PAGE", "\n[[PAGE"),
+        ]
+        for text in malformed:
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                project_edit.document_pages(text, units)
+        units[0]["text"] = "a" * 1000001
+        with self.assertRaisesRegex(ValueError, "Page text exceeds"):
+            project_edit.document_pages(project_edit.document_draft(units), units)
 
     def test_web_editor_full_text_validation_save_and_history_links(self):
         app = web_server.create_app(registry=self.root / "registry", project_root=self.root,
@@ -297,7 +431,7 @@ class ProjectEditTests(unittest.TestCase):
             allowed_collections={"core"}, default_collections=["core"])
         client = app.test_client()
         base = "http://localhost:8080"
-        url = "/library/edit?doi=10.0000/example"
+        url = "/library/edit?doi=10.0000/example&mode=edit&scope=page"
         response = client.get(url, base_url=base)
         self.assertEqual(response.status_code, 200)
         self.assertIn(self.unit["text"].encode(), response.data)
@@ -320,9 +454,14 @@ class ProjectEditTests(unittest.TestCase):
         response = client.post("/library/edit", data=form, base_url=base)
         self.assertEqual(response.status_code, 303)
         response = client.get(response.location, base_url=base)
+        self.assertNotIn(b'id="edit-text"', response.data)
+        self.assertIn(self.args["text"].encode(), response.data)
         self.assertIn(b"Correction history (1)", response.data)
         self.assertIn(b"Test reviewer", response.data)
         self.assertIn(b"<th>Measure</th>", response.data)
+        sources = client.get("/sources", base_url=base)
+        self.assertNotIn(b"Corrected title", sources.data)
+        publish_all(self.root)
         sources = client.get("/sources", base_url=base)
         self.assertIn(b"Corrected title", sources.data)
         self.assertIn(b"2021", sources.data)
@@ -340,17 +479,21 @@ class ProjectEditTests(unittest.TestCase):
             pdf_data_root=self.pdfs, profiles={"private_context"},
             allowed_collections={"core"}, default_collections=["core"])
         client = app.test_client()
-        response = client.get("/library/edit?doi=10.0000/example", base_url="http://localhost:8080")
+        response = client.get("/library/edit?doi=10.0000/example&mode=edit&scope=page", base_url="http://localhost:8080")
         self.assertIn(b"&lt;/textarea&gt;&lt;script&gt;not executable&lt;/script&gt;", response.data)
         self.assertGreater(response.data.count(b"Long transcription with retained details."), 120)
         self.assertNotIn(b"<script>not executable</script>", response.data)
+        view = client.get("/library/edit?doi=10.0000/example", base_url="http://localhost:8080")
+        self.assertIn(b"&lt;/textarea&gt;&lt;script&gt;not executable&lt;/script&gt;", view.data)
+        self.assertNotIn(b"<script>not executable</script>", view.data)
+        self.assertNotIn(b'id="edit-text"', view.data)
 
     def test_page_links_load_each_exact_retained_page(self):
         app = web_server.create_app(registry=self.root / "registry", project_root=self.root,
             pdf_data_root=self.pdfs, profiles={"private_context"},
             allowed_collections={"core"}, default_collections=["core"])
         client = app.test_client()
-        response = client.get("/library/edit?doi=10.0000/example", base_url="http://localhost:8080")
+        response = client.get("/library/edit?doi=10.0000/example&mode=edit&scope=page", base_url="http://localhost:8080")
         html = response.get_data(as_text=True)
         self.assertNotIn('id="edit-page"', html)
         nav = re.search(r'<nav class="pager" aria-label="Retained pages">(.*?)</nav>', html).group(1)
@@ -390,6 +533,7 @@ class ProjectEditTests(unittest.TestCase):
                         f"Scopeprobe {key} evidence on unique page {number} for relationship search validation.")
                 pdf.save(path)
             project_library.attach(self.root, "10.0000/" + key, path, identity_confirmed=True)
+        publish_all(self.root)
         app = web_server.create_app(registry=self.root / "registry", project_root=self.root,
             pdf_data_root=self.pdfs, profiles={"private_context"},
             allowed_collections={"core"}, default_collections=["core"])
@@ -446,7 +590,7 @@ class ProjectEditTests(unittest.TestCase):
             page.insert_text((40, 750), "Footer spanning both columns with enough text to cover the page width.")
             pdf.save(path)
         project_library.attach(self.root, "10.0000/columns", path, identity_confirmed=True)
-        current = project_library.store(self.root).current()
+        current = project_text.editorial_store(self.root).current()
         unit = next(unit for unit in current.snapshots["core"]._bundle["units"]
                     if unit["citation"]["doi"] == "10.0000/columns")
         args = {"snapshot_id": current.release_id, "source_id": unit["citation"]["source_id"], "unit_id": unit["id"]}
@@ -461,13 +605,13 @@ class ProjectEditTests(unittest.TestCase):
         self.assertIn("\n\n", draft)
         self.assertEqual(Counter(character for character in draft if not character.isspace()),
                          Counter(character for character in unit["text"] if not character.isspace()))
-        self.assertEqual(project_library.store(self.root).current().release_id, current.release_id)
+        self.assertEqual(project_text.editorial_store(self.root).current().release_id, current.release_id)
         app = web_server.create_app(registry=self.root / "registry", project_root=self.root,
             pdf_data_root=self.pdfs, profiles={"private_context"},
             allowed_collections={"core"}, default_collections=["core"])
         client = app.test_client()
         base = "http://localhost:8080"
-        html = client.get("/library/edit?doi=10.0000/columns", base_url=base).get_data(as_text=True)
+        html = client.get("/library/edit?doi=10.0000/columns&mode=edit&scope=page", base_url=base).get_data(as_text=True)
         token = re.search(r'name="token" value="([^"]+)"', html).group(1)
         form = self.args["bibliography"] | args | {
             "doi": "10.0000/columns", "action": "repair-layout", "token": token,
@@ -478,7 +622,7 @@ class ProjectEditTests(unittest.TestCase):
         self.assertIn("nothing has been saved", html)
         self.assertIn("Preserve reviewer", html)
         self.assertEqual(unescape(re.search(r'<textarea id="edit-text"[^>]*>(.*?)</textarea>', html, re.S).group(1)), draft)
-        self.assertEqual(project_library.store(self.root).current().release_id, current.release_id)
+        self.assertEqual(project_text.editorial_store(self.root).current().release_id, current.release_id)
         self.assertEqual(project_edit.history(self.root, args["source_id"]), [])
         self.assertEqual(client.post("/library/edit", data=form | {"token": ""}, base_url=base).status_code, 403)
         with self.assertRaisesRegex(ValueError, "Evidence changed"):

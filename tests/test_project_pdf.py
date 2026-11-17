@@ -44,6 +44,113 @@ class ProjectPdfTests(unittest.TestCase):
         self.assertEqual(project_library.status(self.root)["papers"][0]["status"], "awaiting_pdf")
         self.assertFalse((self.root / "registry/active.json").exists())
 
+    def test_local_title_filename_prevents_online_lookup_without_attaching(self):
+        self.pdf_root.mkdir()
+        path = self.pdf_root / "synthetic-example.pdf"
+        path.write_bytes(self.data)
+        with patch.object(literature.MetadataClient, "get", side_effect=AssertionError("Online lookup")), \
+                patch.object(citation_neighborhood, "download", side_effect=AssertionError("Download")):
+            result = project_library.find_pdf(self.root, "10.0000/example", self.pdf_root)
+        self.assertEqual(result["status"], "local_found")
+        self.assertEqual(result["filename"], path.name)
+        self.assertEqual(result["match_basis"], "title filename")
+        self.assertEqual(result["sha256"], releases.sha256(self.data))
+        self.assertEqual(path.read_bytes(), self.data)
+        self.assertEqual(project_library.status(self.root)["papers"][0]["status"], "awaiting_pdf")
+        self.assertFalse((self.root / "registry/active.json").exists())
+
+    def test_nested_hashed_pdf_is_found_by_doi_and_can_be_confirmed_in_browser(self):
+        folder = self.pdf_root / "preserved"
+        folder.mkdir(parents=True)
+        path = folder / "abcdef.pdf"
+        with pymupdf.open() as document:
+            document.new_page().insert_text((50, 50), "Synthetic example DOI: 10.0000/example")
+            document.save(path)
+        with patch.object(literature.MetadataClient, "get", side_effect=AssertionError("Online lookup")):
+            result = project_library.find_pdf(self.root, "10.0000/example", self.pdf_root)
+        self.assertEqual(result["filename"], "preserved/abcdef.pdf")
+        self.assertEqual(result["match_basis"], "DOI in first page or PDF metadata")
+        app = web_server.create_app(registry=self.root / "registry", project_root=self.root,
+            pdf_data_root=self.pdf_root, profiles={"private_context"},
+            allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        base = "http://localhost:8080"
+        settings = client.get("/settings", base_url=base).get_data(as_text=True)
+        token = re.search(r'name="token" value="([^"]+)"', settings).group(1)
+        with patch.object(literature.MetadataClient, "get", side_effect=AssertionError("Online lookup")):
+            started = client.post("/settings/find-pdf", data={
+                "doi": "10.0000/example", "token": token}, base_url=base)
+            app.extensions["find_pdf"]["thread"].join(5)
+        progress = client.get(started.location, base_url=base)
+        self.assertIn(b"Found local PDF", progress.data)
+        self.assertIn(b'preserved/abcdef.pdf" selected', progress.data)
+        self.assertIn(b"Not attached or extracted", progress.data)
+        denied = client.post("/settings/attach-pdf", data={
+            "doi": "10.0000/example", "pdf": "preserved/abcdef.pdf", "token": token}, base_url=base)
+        self.assertEqual(denied.status_code, 400)
+        with patch.object(project_library, "attach") as attach:
+            confirmed = client.post("/settings/attach-pdf", data={
+                "doi": "10.0000/example", "pdf": "preserved/abcdef.pdf",
+                "token": token, "confirm_identity": "yes"}, base_url=base)
+            self.assertEqual(confirmed.status_code, 303)
+            self.assertEqual(attach.call_args.args[2], path)
+
+    def test_recorded_doi_checksum_and_pdf_title_metadata_find_local_files(self):
+        self.pdf_root.mkdir()
+        path = self.pdf_root / "opaque.pdf"
+        path.write_bytes(self.data)
+        collections.atomic_json(self.pdf_root, "project-test-downloads.json", [{
+            "doi": "10.0000/example", "sha256": releases.sha256(self.data),
+            "status": "downloaded"}])
+        result, _ = project_library.find_local_pdf("10.0000/example", "Synthetic example", self.pdf_root)
+        self.assertEqual(result["match_basis"], "recorded acquisition DOI and checksum")
+        (self.pdf_root / "project-test-downloads.json").unlink()
+        with pymupdf.open(path) as document:
+            document.set_metadata({"title": "A long synthetic title to match from PDF metadata"})
+            document.save(self.pdf_root / "metadata.pdf")
+        result, _ = project_library.find_local_pdf(
+            "10.0000/other", "A long synthetic title to match from PDF metadata", self.pdf_root)
+        self.assertEqual(result["filename"], "metadata.pdf")
+        self.assertEqual(result["match_basis"], "title in first page or PDF metadata")
+
+    def test_correction_citing_original_doi_is_not_suggested_as_original_paper(self):
+        self.pdf_root.mkdir()
+        path = self.pdf_root / "s41591-023-02308-5.pdf"
+        with pymupdf.open() as document:
+            page = document.new_page()
+            page.insert_text((50, 50),
+                "Author Correction: Synthetic study\nCorrection DOI: 10.0000/correction\n"
+                "Correction to: Synthetic study DOI: 10.0000/original")
+            document.set_metadata({"title": "Author Correction: Synthetic study"})
+            document.save(path)
+        result, attempts = project_library.find_local_pdf(
+            "10.0000/original", "Synthetic study", self.pdf_root)
+        self.assertIsNone(result)
+        self.assertIn("not the original paper", attempts[0]["error"])
+        correction, _ = project_library.find_local_pdf(
+            "10.0000/correction", "Author Correction: Synthetic study", self.pdf_root)
+        self.assertEqual(correction["filename"], path.name)
+        self.assertEqual(correction["status"], "local_found")
+
+    def test_unrelated_corrupt_and_symlinked_local_files_do_not_claim_matches(self):
+        self.pdf_root.mkdir()
+        (self.pdf_root / "broken.pdf").write_bytes(b"not a PDF")
+        (self.pdf_root / "unrelated.pdf").write_bytes(self.data)
+        outside = self.root.parent / "outside"
+        outside.mkdir()
+        (outside / "synthetic-example.pdf").write_bytes(self.data)
+        (self.pdf_root / "linked").symlink_to(outside, target_is_directory=True)
+        (self.pdf_root / "synthetic-example.pdf").symlink_to(outside / "synthetic-example.pdf")
+        result, attempts = project_library.find_local_pdf("10.0000/example", "Synthetic example", self.pdf_root)
+        self.assertIsNone(result)
+        self.assertEqual(attempts, [{"filename": "broken.pdf", "error": "Local file is not a readable PDF"}])
+        self.work["locations"][0]["license"] = None
+        with patch.object(literature.MetadataClient, "get", return_value=(self.work, {})):
+            online = project_library.find_pdf(self.root, "10.0000/example", self.pdf_root)
+        self.assertEqual(online["status"], "no_explicitly_licensed_pdf")
+        self.assertEqual(online["local_attempts"], attempts)
+        self.assertEqual(set(project_library.local_pdf_files(self.pdf_root)), {"broken.pdf", "unrelated.pdf"})
+
     def test_readable_names_are_safe_repeatable_and_do_not_overwrite_collisions(self):
         self.pdf_root.mkdir()
         digest = releases.sha256(self.data)
@@ -188,11 +295,15 @@ class ProjectPdfTests(unittest.TestCase):
         status = project_library.status(self.root)
         self.assertEqual([paper["doi"] for paper in status["papers"]], ["10.0000/example"])
         self.assertEqual(status["papers"][0]["status"], "awaiting_pdf")
-        self.assertEqual(status["discovered"][0]["status"], "extracted")
+        self.assertEqual(status["discovered"][0]["status"], "draft")
         listing = client.get("/library?query=Discovered", base_url=base)
         self.assertIn(b"<dd>References</dd>", listing.data)
-        self.assertIn(b">Extracted<", listing.data)
+        self.assertIn(b">Clear-text draft<", listing.data)
         self.assertNotIn(b'action="/settings/find-pdf"', listing.data)
+        sources = client.get("/sources", base_url=base)
+        self.assertNotIn(b"Discovered synthetic paper", sources.data)
+        from project_text_helpers import publish_all
+        publish_all(self.root)
         sources = client.get("/sources", base_url=base)
         self.assertIn(b"Discovered synthetic paper", sources.data)
         search = client.get("/search?query=Synthetic", base_url=base)
@@ -211,6 +322,8 @@ class ProjectPdfTests(unittest.TestCase):
             core_pdf = self.pdf_root / "core.pdf"
             document.save(core_pdf)
         project_library.attach(self.root, "10.0000/example", core_pdf, identity_confirmed=True)
+        self.assertEqual(len(project_library.store(self.root).current().snapshots["core"]._bundle["sources"]), 1)
+        publish_all(self.root)
         self.assertEqual(len(project_library.store(self.root).current().snapshots["core"]._bundle["sources"]), 2)
 
     def test_discovered_find_pdf_uses_saved_membership_without_registering_core(self):

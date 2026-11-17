@@ -35,6 +35,8 @@ def protocol_cases(snapshot):
         ("get_claim", {"claim_id": "fictional-claim"}),
         ("get_source_context", {"unit_id": "fictional-unit-1", "max_characters": 15}),
         ("get_source_context", {"unit_id": "fictional-word-footnote"}),
+        ("get_source_document", {"source_id": "fictional:main", "max_characters": 2048}),
+        ("get_source_document", {"source_id": "fictional:main", "offset": 2048}),
         ("get_table", {"table_id": "fictional-table", "limit": 2}),
         ("get_table", {"table_id": "fictional-table", "limit": 2, "offset": 2}),
         ("get_source_issue", {"issue_id": "fictional-issue"}),
@@ -48,6 +50,8 @@ def protocol_cases(snapshot):
                 ["get_source_context", {"unit_id": "fictional-unit-1", "max_characters": 2049}, "invalid_input"],
                 ["get_table", {"table_id": "fictional-table", "limit": 101}, "invalid_input"],
                 ["get_source_issue", {"issue_id": "missing"}, "not_found"],
+                ["get_source_document", {"source_id": "missing"}, "not_found"],
+                ["get_source_document", {"source_id": "fictional:main", "offset": -1}, "invalid_input"],
                 ["get_related_evidence", {"evidence_id": "missing"}, "not_found"],
                 ["search_evidence", {"query": '"DO_NOT_ECHO', "mode": "fts5"}, "invalid_input"],
                 ["search_evidence", {"query": "DO_NOT_ECHO", "unexpected": 1}, "invalid_input"],
@@ -123,6 +127,9 @@ class MCPTests(unittest.TestCase):
                             denied = await client.call_tool("get_source_context", {"unit_id": "fictional-unit-1"})
                             self.assertTrue(denied.isError)
                             self.assertEqual(denied.structuredContent["error"]["code"], "permission_denied")
+                            denied_document = await client.call_tool(
+                                "get_source_document", {"source_id": "fictional:main"})
+                            self.assertEqual(denied_document.structuredContent["error"]["code"], "permission_denied")
                             usable = await client.call_tool("get_claim", {"claim_id": "fictional-claim"})
                             self.assertFalse(usable.isError)
                             self.assertEqual(usable.structuredContent["result"]["citation"]["availability"], "metadata_only")

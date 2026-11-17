@@ -705,6 +705,7 @@ td>a:first-child{font-weight:600}
 .library-record{padding:1rem 0;min-width:0;border-bottom:1px solid var(--line)}
 .library-record h3,.library-record h4{margin:0 0 .6rem;font-size:1.02rem;overflow-wrap:anywhere}
 .library-record dl{display:flex;flex-wrap:wrap;gap:.6rem 2rem;margin:0}
+.library-records[aria-label="Library papers"] .library-record dl{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr)}
 .library-record dl>div{min-width:0;max-width:100%}
 .library-record dt{font-size:.82rem;color:var(--muted);font-weight:600}
 .library-record dd{margin:.15rem 0 0}
@@ -849,6 +850,9 @@ mark{background:var(--mark);color:var(--mark-ink);padding:0 .08em;border-radius:
   .filters label{flex:1 1 100%}
   pre.reading{padding-left:1rem}
   th:first-child,td:first-child{padding-left:.5rem}
+}
+@media (max-width:600px){
+  .library-records[aria-label="Library papers"] .library-record dl{grid-template-columns:minmax(0,1fr)}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 @media print{
@@ -1335,12 +1339,20 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     f'<h3>Read-only tools</h3><dl class="tool-list">{tools}</dl></details>')
 
     def available_project_pdfs():
+        from .build import project_library
         if pdf_data_root.resolve() != pdf_data_root:
             raise ValueError("PDF data folder cannot contain a symlinked path")
         if not pdf_data_root.exists():
             return {}
-        return {path.name: path for path in sorted(pdf_data_root.iterdir())
-                if path.suffix.casefold() == ".pdf" and not path.is_symlink() and path.is_file()}
+        associated_hashes = set()
+        if project_root and (project_root / "registry/active.json").is_file():
+            from .build import project_text
+            current = project_text.editorial_store(project_root).current()
+            associated_hashes = {
+                source["sha256"] for source in current.snapshots["core"]._bundle["sources"]
+            }
+        return {name: path for name, path in project_library.local_pdf_files(pdf_data_root).items()
+                if releases.sha256(path.read_bytes()) not in associated_hashes}
 
     def pdf_controls(doi, title, *, prefix, pdfs, return_to="/settings", selected="", summary=None):
         hidden = (f'<input type="hidden" name="token" value="{provide_token}">'
@@ -1358,9 +1370,12 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                      + '</select>'
                      f'<label for="{prefix}-license">License or permission note (optional)</label>'
                      f'<input id="{prefix}-license" name="license">'
+                     '<label><input type="checkbox" name="skip_extraction" value="yes">'
+                     ' Attach only; I will provide clear text separately.</label>'
                      '<label><input type="checkbox" name="confirm_identity" value="yes" required>'
                      ' I checked that this PDF matches this paper&#39;s title and DOI and am authorized '
-                     'to extract it privately.</label><button>Attach and extract PDF</button></form></details>')
+                     'to extract it privately.</label><p>Extraction creates a draft, not active RAG evidence.</p>'
+                     '<button>Attach PDF and prepare draft</button></form></details>')
         else:
             body += (summary or '') + '<p>No local PDFs yet. Use Find PDF or place an authorized copy in the PDF data folder.</p>'
         body += ('<form method="post" action="/settings/find-pdf">' + hidden
@@ -1383,10 +1398,14 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             body += (f'<section class="panel"><h3>{escape(status["name"])}</h3>'
                      f"<p>{len(status['papers'])} core papers registered.</p>")
             awaiting = [item for item in status["papers"] if item["status"] == "awaiting_pdf"]
-            searchable = status["snapshot"] is not None
+            searchable = any(item["status"] in {"published", "draft_revision"}
+                             for item in [*status["papers"], *status["discovered"]])
             body += ('<ol class="progress-steps"><li class="done">Register core papers</li>'
                      f'<li class="{"done" if not awaiting else "active"}">Attach PDFs</li>'
-                     f'<li class="{"active" if searchable and not awaiting else ""}">Search and connect AI</li></ol>')
+                     f'<li class="{"done" if searchable else "active"}">Prepare and publish clear text</li>'
+                     f'<li class="{"active" if searchable else ""}">Search and connect AI</li></ol>'
+                     '<p>Extraction creates drafts. Open <a href="/library?status=draft">clear-text drafts in Library</a>, '
+                     'clean them with your own tools, and explicitly publish approved text for retrieval.</p>')
             pdfs = {}
             if awaiting:
                 body += ('<p class="callout"><strong>Next step:</strong> '
@@ -1397,6 +1416,12 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                          f'<p>PDF data folder: <code>{escape(str(pdf_data_root))}</code>. '
                          "Files in this shared folder are preserved when the project is reset. "
                          "Inspect the PDF locally before confirming its identity.</p>")
+                body += ('<form method="post" action="/library/batch">'
+                         f'<input type="hidden" name="token" value="{provide_token}">'
+                         '<button name="action" value="find-all">Find all</button></form>'
+                         '<p>Check local PDFs and subfolders first, then search online for missing copies '
+                         'for all Core papers awaiting PDF. Review and confirm each match before extraction.</p>'
+                         '<p><a href="/library/batch">Review PDF results and confirm extraction</a></p>')
                 if not pdfs:
                     body += '<p>No PDFs found. Place .pdf files in the PDF data folder, then reload this page.</p>'
                 queue_rows = []
@@ -1412,7 +1437,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             if status["papers"]:
                 rows = []
                 for item in status["papers"]:
-                    state = badge(escape(item["status"]))
+                    from .build import project_index
+                    state = badge(project_index.LABELS[item["status"]])
                     rows.append('<li class="library-record" data-core-paper-record>'
                                 f"<h4>{escape(item['title'])}</h4><dl>"
                                 f"<div><dt>DOI</dt><dd><code>{escape(item['doi'])}</code></dd></div>"
@@ -1431,7 +1457,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                          '<p id="core-paper-search-empty" hidden>No core papers match that search.</p>'
                          '<ul class="library-records">' + "".join(rows) + "</ul></details>")
             body += "</section>"
-            body += help_note("Find PDF", '<p><strong>Find PDF</strong> looks for an explicitly licensed open-access copy using OpenAlex. '
+            body += help_note("Find PDF", '<p><strong>Find PDF</strong> first checks the local PDF data folder and subfolders for a suggested match. '
+                     'If none is found, it looks for an explicitly licensed open-access copy using OpenAlex. '
                      'Downloads go to the PDF data folder; inspect the file and confirm identity and permission '
                      'before attaching. A missing result is not proof that no copy exists.</p>')
             if (project_root / "pdf-job.json").is_file():
@@ -1458,6 +1485,17 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                      + help_note("Discovery and metadata", '<p>Metadata-only discovery, with saved provider coverage and gaps; no PDFs are downloaded.</p>'
                      '<p>After searches finish, <a href="/publications">configure/update the publication metadata catalog</a> '
                      'to make saved bibliography available on Publication metadata and Literature coverage.</p>') + '</section>')
+            body += ('<section class="panel"><h3>Soft reset — preserve library material</h3>'
+                     '<p>Return to Core papers upload without deleting PDFs, extracted text, cleaned drafts, '
+                     'tables, history or saved discovery. The current project is preserved outside the active root. '
+                     'Reimported Core papers and papers encountered in new discovery reuse matching DOI/PDF material '
+                     'as drafts; nothing is automatically published for RAG. Discovery selections start fresh. '
+                     'Preserved copies also survive purge or factory reset of the new active project.</p>'
+                     '<form method="post" action="/settings/soft-reset">'
+                     f'<input type="hidden" name="token" value="{provide_token}">'
+                     '<label for="soft-reset-confirm">Type SOFT RESET to confirm</label>'
+                     '<input id="soft-reset-confirm" name="confirmation" required autocomplete="off">'
+                     '<button class="secondary">Soft reset (keep material)</button></form></section>')
             body += ('<section class="panel danger"><h3>Reset to factory settings</h3>'
                      "<p>This permanently deletes everything inside this project's root, including its PDFs, "
                      "extracted evidence, snapshots, discovery output and settings. It cannot be undone. "
@@ -1467,6 +1505,13 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                      '<input id="reset-confirm" name="confirmation" required autocomplete="off">'
                      '<button type="submit" class="danger">Reset to factory settings</button></form></section>')
         else:
+            from .build import project_preservation
+            retained = project_preservation.archives(project_root)
+            if retained:
+                body += (f'<p role="status">{len(retained)} preserved project(s) available. '
+                         'Upload your Core papers to reuse previously attached PDFs, clear-text drafts and tables '
+                         'by DOI and verified PDF checksum. Restored text needs explicit publication for RAG. '
+                         'Original Core papers manifests remain in the preserved projects.</p>')
             body += ('<section class="panel"><h3>Initialize project</h3>'
                      "<ol class=\"progress-steps\"><li class=\"active\">Register core papers</li>"
                      "<li>Attach PDFs</li><li>Search and connect AI</li></ol>"
@@ -1483,7 +1528,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                      '<input id="core-papers" name="papers" type="file" accept=".csv,.json" required>'
                      '<button type="submit">Initialize project</button></form>'
                      "<p>The authorization note records your stated basis; it does not verify rights. "
-                     "Registered papers start as awaiting PDF.</p></section>")
+                     "Registered papers start as awaiting PDF unless preserved material is restored.</p></section>")
         key_configured = project_library.openalex_key_path(project_root).is_file()
         body += (
             '<section class="panel"><h3>OpenAlex API key</h3>'
@@ -1707,6 +1752,25 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             store.clear_cache()
         return redirect("/settings", code=303)
 
+    def soft_reset_project():
+        if not project_root:
+            return project_settings("Project settings are not enabled for this website.", 404)
+        if not hmac.compare_digest(request.form.get("token", ""), provide_token):
+            return project_settings("Settings form expired; reload the page.", 403)
+        if request.form.get("confirmation") != "SOFT RESET":
+            return project_settings("Type SOFT RESET exactly to confirm; no material will be deleted.", 400)
+        from .build import project_preservation
+        with discovery_lock:
+            require_idle_project()
+            try:
+                project_preservation.soft_reset(project_root)
+            except (OSError, ValueError) as error:
+                diagnostic("web_soft_reset_rejected", exception_type=type(error).__name__)
+                return project_settings(str(error), 400)
+        if store:
+            store.clear_cache()
+        return redirect("/settings", code=303)
+
     def find_project_pdf():
         if not project_root:
             raise ValueError("Project settings are not enabled")
@@ -1720,7 +1784,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             paper = project_library.library_paper(project_root, doi, request.form.get("title"))
             return_to = "/library" if request.form.get("return_to") == "/library" else "/settings"
             job = {"status": "running", "title": paper["title"], "return_to": return_to,
-                   "message": "Looking for an explicitly licensed open-access PDF"}
+                   "message": "Checking local PDFs before looking for an explicitly licensed open-access copy"}
             collections.atomic_json(project_root, "pdf-job.json", job)
 
             def work():
@@ -1748,16 +1812,20 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         body = f'<h3>{escape(job["title"])}</h3>'
         running = job["status"] == "running" and pdf_running()
         if running:
-            body += ('<p role="status">Finding and downloading an explicitly licensed PDF. '
-                     'This uses OpenAlex and the hosting site; no access controls are bypassed.</p>'
+            body += ('<p role="status">Checking the local PDF data folder first, then looking for an explicitly licensed PDF online. '
+                     'Online lookup uses OpenAlex and the hosting site; no access controls are bypassed.</p>'
                      '<progress aria-label="Finding PDF"></progress>')
         elif job["status"] == "complete":
             result = job["result"]
-            if result["status"] == "downloaded":
-                body += (f'<p>Downloaded <code>{escape(result["filename"])}</code> to the PDF data folder.</p>'
+            if result["status"] in {"downloaded", "local_found"}:
+                if result["status"] == "local_found":
+                    body += (f'<p>Found local PDF <code>{escape(result["filename"])}</code>. No online lookup or download was needed.</p>'
+                             f'<p>Suggested match: {escape(result["match_basis"])}; not independent identity verification.</p>')
+                else:
+                    body += (f'<p>Downloaded <code>{escape(result["filename"])}</code> to the PDF data folder.</p>'
                          f'<p>Acquired from: {metadata_value(result["final_url"])}. '
-                         f'License: {escape(result["acquisition"]["license"])}.</p>'
-                         '<p>Not attached or extracted. Inspect the PDF locally, then select it in Project settings '
+                         f'License: {escape(result["acquisition"]["license"])}.</p>')
+                body += ('<p>Not attached or extracted. Inspect the PDF locally, then select it in Project settings '
                          'and confirm its identity and private-use permission.</p>')
                 body += pdf_controls(result["doi"], job["title"], prefix="found",
                                      pdfs=available_project_pdfs(), return_to=job.get("return_to", "/settings"),
@@ -1767,6 +1835,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                          f'<p>Result: {escape(result["status"])}. You can supply an authorized copy yourself.</p>')
                 for attempt in result["attempts"]:
                     body += f'<p>{metadata_value(attempt["url"])}: {escape(attempt["error"])}</p>'
+            for attempt in result.get("local_attempts", result.get("attempts", []) if result["status"] == "local_found" else []):
+                body += f'<p role="alert">Local PDF {escape(attempt["filename"])}: {escape(attempt["error"])}</p>'
         else:
             message = job["message"] if job["status"] == "failed" else "PDF search was interrupted; retry from Project settings."
             body += f'<p role="alert">{escape(message)}</p>'
@@ -1794,7 +1864,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 require_idle_project()
                 project_library.attach(project_root, request.form.get("doi", ""), selected,
                                        identity_confirmed=True, license=request.form.get("license"),
-                                       title=request.form.get("title"))
+                                       title=request.form.get("title"), extract=request.form.get("skip_extraction") != "yes")
         except ValueError as error:
             return project_settings(str(error), 400)
         store.clear_cache()
@@ -1912,6 +1982,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             if units and evidence.profile != "curated":
                 pin = {"snapshot_id": current.release_id} if store else {"release_id": current.release_id}
                 reader_link = f'<p><a href="{escape(reader_url(pin, member_cid, units[0]), quote=True)}">Read retained text</a></p>'
+                if source["format"] == "pdf":
+                    reader_link += (f'<p><a href="{escape(document_reader_url(pin, member_cid, source["source_id"]), quote=True)}">'
+                                    'Read whole document</a></p>')
                 entries[-1] = entries[-1].replace("</details></article>", reader_link + "</details></article>")
         def link(offset, label):
             params = {"offset": offset, "paper": paper}
@@ -1942,11 +2015,19 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
     def edit_paper(error=None, status_code=200, *, draft_text=None):
         if not project_root:
             raise ValueError("Editing is enabled only for private project libraries")
-        if request.method == "GET" and set(request.args) - {"doi", "unit_id"}:
+        if request.method == "GET" and set(request.args) - {"doi", "unit_id", "mode", "scope", "download"}:
             raise ValueError("Unknown editor parameter")
-        from .build import project_edit, project_library
+        mode = request.args.get("mode", "view")
+        if mode not in {"view", "edit"}:
+            raise ValueError("Unknown editor mode")
+        editing = request.method == "POST" or mode == "edit"
+        scope = request.values.get("scope", "page" if request.method == "POST" else "document")
+        if scope not in {"document", "page"}:
+            raise ValueError("Unknown correction scope")
+        whole_document = scope == "document"
+        from .build import project_edit, project_library, project_text
         doi = request.values.get("doi", "")
-        current = project_library.store(project_root).current()
+        current = project_text.editorial_store(project_root).current()
         evidence = current.snapshots["core"]
         source = next((source for source in evidence._bundle["sources"]
                        if collections.publication(source["doi"]) == collections.publication(doi)), None)
@@ -1960,40 +2041,171 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             raise ValueError("Select an extracted page belonging to this paper")
         tables = [table for table in evidence._bundle["tables"]
                   if table["citation"]["source_id"] == source["id"]
-                  and table["citation"]["locator"] == unit["citation"]["locator"]]
+                  and (whole_document or table["citation"]["locator"] == unit["citation"]["locator"])]
         bibliography = source.get("bibliography") or {key: None for key in project_edit.BIB_FIELDS}
+        if request.args.get("download") == "text":
+            response = Response(project_edit.document_draft(project_edit.document_units(evidence._bundle, source["id"])),
+                                mimetype="text/plain")
+            response.headers["Content-Disposition"] = 'attachment; filename="clear-text-draft.txt"'
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        if request.args.get("download"):
+            raise ValueError("Unknown draft download")
         submitted = request.form if request.method == "POST" else {}
         def value(name, default=""):
             if name == "text" and draft_text is not None:
                 return escape(draft_text, quote=True)
             return escape(submitted.get(name, default) or "", quote=True)
+
+        def rendered_tables(items):
+            rendered = ""
+            for table in items:
+                rendered += (f'<h5>{escape(table["title"])}</h5><div class="table-scroll">'
+                             '<table><thead><tr>'
+                             + "".join(f'<th>{escape(header)}</th>' for header in table["headers"])
+                             + '</tr></thead><tbody>')
+                if any(table["units"]):
+                    rendered += '<tr>' + "".join(
+                        f'<td>{escape(label or "")}</td>' for label in table["units"]) + '</tr>'
+                for row in table["rows"]:
+                    rendered += '<tr>' + "".join(
+                        f'<td>{escape(str(cell)) if cell is not None else ""}</td>' for cell in row) + '</tr>'
+                rendered += '</tbody></table></div>'
+                rendered += "".join(f'<p>{escape(note)}</p>' for note in table["footnotes"])
+            return rendered
+
+        def finish(body):
+            history = project_edit.history(project_root, source["id"])
+            body += f'<details><summary>Correction history ({len(history)})</summary>'
+            for event in history[:20]:
+                body += ('<details><summary>' + escape(event["at"] + " — " + event["reviewer"])
+                         + '</summary>' + metadata_value({
+                             "Reason": event["reason"], "Original PDF checksum": event["source_sha256"],
+                             "Parent snapshot": event["parent_snapshot"], "New version": event["release"],
+                             "Before": event["before"], "After": event["after"]}) + '</details>')
+            body += '</details><p><a href="/library">Library</a> | <a href="/sources">Sources available to AI</a></p>'
+            response = page("View and correct extracted data", body)
+            response.status_code = status_code
+            response.headers["Cache-Control"] = "no-store"
+            return response
+
+        labels = {"title": "Title", "year": "Publication year (YYYY)",
+                  "acquired_from": "Acquired from URL", "acquisition_method": "Acquisition method",
+                  "acquired_at": "Acquisition date/time (ISO format)"}
+        view_url = "/library/edit?" + urlencode({"doi": doi, "unit_id": unit_id})
+        if not editing:
+            published = project_library.store(project_root).current()
+            text_status = project_text.publication_state(evidence._bundle, published.snapshots["core"]._bundle, source["id"])
+            body = (f'<h3>{escape(bibliography["title"] or source["doi"])}</h3>'
+                    f'<p><strong>Clear-text status: {escape(text_status.replace("_", " "))}.</strong> '
+                    'Drafts are private editorial content, not RAG evidence. Publication approves transcription, not scientific findings.</p>'
+                    '<p>Read-only view of all retained pages. Text is unchanged, with two newlines between pages. '
+                    'Missing text and split words are not automatically repaired. Original PDFs are not served here.</p>'
+                    f'<p>DOI: <code>{escape(source["doi"])}</code></p>'
+                    f'<p><a class="button" href="{escape(view_url + "&mode=edit#page-editor", quote=True)}">'
+                    'Turn on edit mode</a> | '
+                    f'<a href="{escape(view_url + "&download=text", quote=True)}">Download clear-text draft</a></p>'
+                    '<nav class="pager" aria-label="Retained pages">')
+            warnings, text = [], []
+            for index, item in enumerate(units):
+                location = quality_location(item["citation"]["locator"])
+                page_url = "/library/edit?" + urlencode({"doi": doi, "unit_id": item["id"]})
+                body += (f'<a href="{escape(page_url, quote=True)}#document-page-{index}"'
+                         + (' aria-current="page"' if item["id"] == unit_id else '')
+                         + f'>{escape(location)}</a> ')
+                text.append(f'<span id="document-page-{index}">{escape(item["text"])}</span>')
+                warnings.append(
+                    f'<section><h4>{escape(location)}</h4>'
+                    f'<p><a href="{escape(page_url + "&mode=edit&scope=page#page-editor", quote=True)}">Edit {escape(location)}</a></p>'
+                    + source_warnings(item)
+                    + ('<p><strong>Stored extraction is marked incomplete.</strong></p>' if item["truncated"] else '')
+                    + ('<p>No text retained here; check the original PDF.</p>' if not item["text"] else '')
+                    + '</section>')
+            body += '</nav>'
+            if any("ocr" in " ".join(item["caveats"]).lower() for item in units):
+                body += '<p><strong>Includes OCR transcription; compare with the original PDF.</strong></p>'
+            if any(item["truncated"] or not item["text"] for item in units):
+                body += '<p><strong>Some pages have incomplete or missing retained text.</strong></p>'
+            body += ('<details><summary>Paper metadata and provenance</summary><dl>'
+                     + "".join(f'<dt>{escape(labels[key])}</dt><dd>{metadata_value(bibliography.get(key))}</dd>'
+                               for key in project_edit.BIB_FIELDS)
+                     + f'<dt>Citation/source URL</dt><dd>{metadata_value(source["url"])}</dd>'
+                     + f'<dt>Source ID</dt><dd>{metadata_value(source["id"])}</dd>'
+                     + f'<dt>Original PDF checksum</dt><dd>{metadata_value(source["sha256"])}</dd>'
+                     + '</dl></details><details><summary>Pages and extraction warnings</summary>'
+                     + "".join(warnings) + '</details>'
+                     + '<h4>Whole extracted text</h4><pre class="reading" id="document-text">'
+                     + "\n\n".join(text) + '</pre>')
+            all_tables = [table for table in evidence._bundle["tables"]
+                          if table["citation"]["source_id"] == source["id"]]
+            body += f'<details><summary>Structured tables ({len(all_tables)})</summary>'
+            for table in all_tables:
+                body += (f'<h4>{escape(quality_location(table["citation"]["locator"]))}</h4>'
+                         + rendered_tables([table]))
+            if not all_tables:
+                body += '<p>No structured tables retained. Tables may still appear in the extracted page text.</p>'
+            body += ('</details><h4>Publish clear text for retrieval</h4>'
+                     '<p>Publish only after checking the clear text, tables, page boundaries and omissions against the PDF. '
+                     'Use your own tools or LLM for cleanup; no external model is called by this app.</p>'
+                     '<form method="post" action="/library/edit">'
+                     f'<input type="hidden" name="token" value="{provide_token}">'
+                     f'<input type="hidden" name="doi" value="{escape(doi, quote=True)}">'
+                     f'<input type="hidden" name="unit_id" value="{escape(unit_id, quote=True)}">'
+                     f'<input type="hidden" name="source_id" value="{escape(source["id"], quote=True)}">'
+                     f'<input type="hidden" name="snapshot_id" value="{current.release_id}">'
+                     '<input type="hidden" name="action" value="publish">'
+                     '<label>Your name<input name="reviewer" required maxlength="200"></label>'
+                     '<label>Publication reason<input name="reason" required maxlength="2000"></label>'
+                     '<label><input type="checkbox" name="checked" value="yes" required>'
+                     ' I checked this clear text against the source and approve it for retrieval.</label>'
+                     '<button>Publish clear text for retrieval</button></form>')
+            return finish(body)
+
         body = (f'<h3>{escape(bibliography["title"] or source["doi"])}</h3>'
+                '<p><strong>Edit mode</strong> — saving creates a draft, not published RAG evidence.</p>'
+                f'<p><a href="{escape(view_url, quote=True)}">Return to read-only view (discard unsaved changes)</a></p>'
                 + help_note("Editing extracted data", '<p>Edit retained page text/OCR, paper metadata and structured tables. '
                 'Compare against the original PDF locally; original files are not served here. '
-                'Saving publishes a new evidence version used by search and AI. Original versions, '
+                'Saving retains a private editorial version. Publish separately to enable search and AI. Original versions, '
                 'source checksums, page locators and old snapshot links are preserved. '
                 'Corrections are operator assertions, not independent scientific validation.</p>')
                 + f'<p>DOI: <code>{escape(source["doi"])}</code>.</p>')
+        if whole_document:
+            body += ('<p>Edit the entire document below and save all pages together. '
+                     'Keep every <code>[[PAGE …]]</code> marker unchanged and in order, with two newlines before each '
+                     'marker after the first. Text between markers belongs to that PDF page for citations. '
+                     'You can move text across boundaries when correcting its page assignment.</p>')
         if error:
             body += f'<p role="alert">{escape(error)}</p>'
-        if draft_text is not None:
+        if draft_text is not None and request.form.get("action") == "repair-layout":
             body += ('<p role="status">Paragraph-layout draft prepared; nothing has been saved. '
                      'Text blocks are ordered by column and lines joined within each block. '
                      'Check reading order, paragraph boundaries, hyphenated words and tables against the original PDF '
                      'before saving. This replaces the text draft, not the retained evidence.</p>')
-        body += ('<nav class="pager" aria-label="Retained pages">'
+        if not whole_document:
+            body += ('<nav class="pager" aria-label="Retained pages">'
                  + "".join('<a href="/library/edit?'
-                           + escape(urlencode({"doi": doi, "unit_id": item["id"]}), quote=True) + '#page-editor"'
+                           + escape(urlencode({"doi": doi, "unit_id": item["id"], "mode": "edit", "scope": "page"}), quote=True) + '#page-editor"'
                            + (' aria-current="page"' if item["id"] == unit_id else '')
                            + f'>{escape(quality_location(item["citation"]["locator"]))}</a> ' for item in units)
                  + '</nav>')
-        body += ('<form method="post" action="/library/edit">'
+        body += ('<form method="post" enctype="multipart/form-data" action="/library/edit">'
                  f'<input type="hidden" name="token" value="{provide_token}">'
                  f'<input type="hidden" name="doi" value="{escape(doi, quote=True)}">'
                  f'<input type="hidden" name="unit_id" value="{escape(unit_id, quote=True)}">'
+                 f'<input type="hidden" name="scope" value="{scope}">'
                  f'<input type="hidden" name="snapshot_id" value="{value("snapshot_id", current.release_id)}">'
-                 f'<input type="hidden" name="source_id" value="{value("source_id", source["id"])}">'
-                 f'<h4 id="page-editor">{escape(quality_location(unit["citation"]["locator"]))} — Page text / OCR</h4>'
+                 f'<input type="hidden" name="source_id" value="{value("source_id", source["id"])}">')
+        if whole_document:
+            body += ('<h4 id="page-editor">Whole document text / OCR</h4>'
+                     '<label for="edit-text">Full retained document text with page-boundary markers</label>'
+                     f'<textarea id="edit-text" name="text" rows="40" maxlength="{project_edit.DOCUMENT_TEXT_LIMIT}">'
+                     f'{value("text", project_edit.document_draft(project_edit.document_units(evidence._bundle, source["id"])))}</textarea>')
+            body += ('<label for="clear-text-file">Or import a UTF-8 clear-text / Markdown draft</label>'
+                     '<input type="file" id="clear-text-file" name="clear_text_file" accept=".txt,.md,text/plain,text/markdown">'
+                     '<p>Keep the page-boundary markers. An uploaded file replaces the text field when saving.</p>')
+        else:
+            body += (f'<h4 id="page-editor">{escape(quality_location(unit["citation"]["locator"]))} — Page text / OCR</h4>'
                  '<p class="note">Save changes before switching pages.</p>'
                  f'<label for="edit-text">Full retained text: {escape(quality_location(unit["citation"]["locator"]))}</label>'
                  f'<textarea id="edit-text" name="text" rows="18" maxlength="1000000">{value("text", unit["text"])}</textarea>'
@@ -2002,13 +2214,10 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                  '<small>Replaces unsaved text edits.</small>'
                  + help_note("Repair paragraph layout", '<p>Rebuild an unsaved text draft from the original PDF text blocks, separating columns and paragraphs '
                  'instead of mixing lines across columns. Replaces any text edits in this form; review before saving. '
-                 'For scanned/OCR-only pages, edit manually. No original extraction is changed by this button.</p>')
-                 + '<details><summary>Paper metadata</summary>'
+                 'For scanned/OCR-only pages, edit manually. No original extraction is changed by this button.</p>'))
+        body += ('<details><summary>Paper metadata</summary>'
                  + help_note("Paper metadata", '<p>These fields apply to the entire paper, not only this page. '
                  'DOI/source identity cannot be changed here. Saved provider/download provenance remains unchanged.</p>'))
-        labels = {"title": "Title", "year": "Publication year (YYYY)",
-                  "acquired_from": "Acquired from URL", "acquisition_method": "Acquisition method",
-                  "acquired_at": "Acquisition date/time (ISO format)"}
         for key in project_edit.BIB_FIELDS:
             body += (f'<label for="edit-{key}">{labels[key]}</label>'
                      f'<input id="edit-{key}" name="{key}" value="{value(key, bibliography.get(key))}">'
@@ -2021,15 +2230,19 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                  'Keep existing IDs; use an empty id for a new table. Removing a table from the list removes it '
                  'from the new version only. Rows and column units must match the header width. '
                  'Maximum 100 tables, 100 columns and 100 rows per table.</p>'))
-        for table in tables:
-            body += f'<h5>{escape(table["title"])}</h5><div class="table-scroll"><table><thead><tr>'
-            body += "".join(f'<th>{escape(header)}</th>' for header in table["headers"]) + '</tr></thead><tbody>'
-            for row in table["rows"]:
-                body += '<tr>' + "".join(f'<td>{escape(str(cell)) if cell is not None else ""}</td>' for cell in row) + '</tr>'
-            body += '</tbody></table></div>'
+        body += rendered_tables(tables)
         editable = [{"id": table["id"], **{key: table[key] for key in project_edit.TABLE_FIELDS}} for table in tables]
+        if whole_document:
+            for table, entry in zip(tables, editable):
+                entry["unit_id"] = next(item["id"] for item in units
+                                        if item["citation"]["locator"] == table["citation"]["locator"])
+            body += ('<p>Tables cover the entire document. Include a <code>unit_id</code> to identify each table’s '
+                     'PDF page. Keep existing table IDs and page assignments unchanged.</p><ul>'
+                     + "".join(f'<li>{escape(quality_location(item["citation"]["locator"]))}: '
+                               f'<code>{escape(item["id"])}</code></li>' for item in units) + '</ul>')
         body += ('<details><summary>New table example</summary><pre>'
-                 + escape(json.dumps([{"id": "", "title": "Table 1", "headers": ["Measure", "Value"],
+                 + escape(json.dumps([{**({"unit_id": unit_id} if whole_document else {}),
+                                       "id": "", "title": "Table 1", "headers": ["Measure", "Value"],
                                        "units": [None, None], "rows": [["Example", 1]], "footnotes": []}], indent=2))
                  + '</pre></details><label for="edit-tables">Tables (JSON)</label>'
                  f'<textarea id="edit-tables" name="tables" rows="12">{value("tables", json.dumps(editable, ensure_ascii=False, indent=2))}</textarea>'
@@ -2037,33 +2250,31 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                  f'<input id="edit-reviewer" name="reviewer" maxlength="200" required value="{value("reviewer")}">'
                  '<label for="edit-reason">What changed and why</label>'
                  f'<textarea id="edit-reason" name="reason" maxlength="2000" rows="3" required>{value("reason")}</textarea>'
-                 '<label><input type="checkbox" name="checked" value="yes" required>'
-                 ' I checked these corrections against the original PDF. This is not scientific approval of the paper.</label>'
-                 '<button>Save corrected version</button></form>')
-        history = project_edit.history(project_root, source["id"])
-        body += f'<details><summary>Correction history ({len(history)})</summary>'
-        for event in history[:20]:
-            body += ('<details><summary>' + escape(event["at"] + " — " + event["reviewer"])
-                     + '</summary>' + metadata_value({
-                         "Reason": event["reason"], "Original PDF checksum": event["source_sha256"],
-                         "Parent snapshot": event["parent_snapshot"], "New evidence release": event["release"],
-                         "Before": event["before"], "After": event["after"]}) + '</details>')
-        body += '</details><p><a href="/library">Library</a> | <a href="/sources">Sources available to AI</a></p>'
-        response = page("View and correct extracted data", body)
-        response.status_code = status_code
-        response.headers["Cache-Control"] = "no-store"
-        return response
+                 '<p>Drafts may be incomplete. Source comparison is required at publication, not draft saving.</p>'
+                 '<button>Save clear-text draft</button></form>')
+        return finish(body)
 
     def save_paper_correction():
         if not project_root:
             raise ValueError("Project settings are not enabled")
         if not hmac.compare_digest(request.form.get("token", ""), provide_token):
             return Response("Editor form expired; reload the page.", status=403, mimetype="text/plain")
-        from .build import project_edit
+        from .build import project_edit, project_text
+        imported_text = None
         try:
             with discovery_lock:
                 require_idle_project()
+                if request.form.get("scope", "page") not in {"page", "document"}:
+                    raise ValueError("Unknown correction scope")
+                if request.form.get("action") == "publish":
+                    project_text.publish(project_root, snapshot_id=request.form.get("snapshot_id", ""),
+                        source_id=request.form.get("source_id", ""), reviewer=request.form.get("reviewer", ""),
+                        reason=request.form.get("reason", ""), checked=request.form.get("checked") == "yes")
+                    store.clear_cache()
+                    return redirect("/library/edit?" + urlencode({"doi": request.form.get("doi", "")}), code=303)
                 if request.form.get("action") == "repair-layout":
+                    if request.form.get("scope", "page") != "page":
+                        raise ValueError("Paragraph-layout repair is available in the individual page editor")
                     draft = project_edit.paragraph_draft(project_root,
                         snapshot_id=request.form.get("snapshot_id", ""), source_id=request.form.get("source_id", ""),
                         unit_id=request.form.get("unit_id", ""))
@@ -2072,22 +2283,31 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     tables = json.loads(request.form.get("tables", "[]"))
                 except ValueError as error:
                     raise ValueError("Tables must contain valid JSON; your edits have not been saved") from error
+                text = request.form.get("text", "")
+                uploaded = request.files.get("clear_text_file")
+                if uploaded and uploaded.filename:
+                    try:
+                        text = uploaded.read().decode("utf-8-sig")
+                        imported_text = text
+                    except UnicodeDecodeError as error:
+                        raise ValueError("Clear text must be UTF-8; draft was not saved") from error
                 project_edit.correct(project_root, snapshot_id=request.form.get("snapshot_id", ""),
                     source_id=request.form.get("source_id", ""), unit_id=request.form.get("unit_id", ""),
-                    text=request.form.get("text", ""),
+                    text=text,
                     bibliography={key: request.form.get(key, "") for key in project_edit.BIB_FIELDS},
                     source_url=request.form.get("source_url", ""), tables=tables,
                     reviewer=request.form.get("reviewer", ""), reason=request.form.get("reason", ""),
-                    checked=request.form.get("checked") == "yes")
+                    checked=request.form.get("checked") == "yes",
+                    whole_document=request.form.get("scope", "page") == "document")
         except (ValueError, ValidationError) as error:
             diagnostic("web_correction_rejected", exception_type=type(error).__name__)
-            return edit_paper(str(error), 400)
+            return edit_paper(str(error), 400, draft_text=imported_text)
         store.clear_cache()
         return redirect("/library/edit?" + urlencode({
             "doi": request.form.get("doi", ""), "unit_id": request.form.get("unit_id", "")}), code=303)
 
     def batch_action():
-        from .build import project_batch, project_index
+        from .build import project_batch, project_index, project_library
         if not project_root:
             raise ValueError("Project settings are not enabled")
         if not hmac.compare_digest(request.form.get("token", ""), provide_token):
@@ -2136,11 +2356,43 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     fragment = ("#locate-" + releases.sha256(request.form["doi"].encode())[:16]
                                 if action == "toggle" else "")
                     return redirect("/library?" + urlencode(params) + fragment, code=303)
-                if action == "locate":
+                if action == "find-all":
+                    awaiting = [paper for paper in project_library.status(project_root)["papers"]
+                                if paper["status"] == "awaiting_pdf"]
+                    if not awaiting:
+                        raise ValueError("No Core papers are awaiting PDF")
+                    rows = [{**paper, "status": "Awaiting PDF"} for paper in awaiting]
+                    job = project_batch.select(project_root, rows, True)
+                    dois = {paper["doi"] for paper in awaiting}
+                    if all(job["items"][doi]["status"] in {
+                            "downloaded", "local_found", "extraction_failed", "extracted"} for doi in dois):
+                        return redirect("/library/batch", code=303)
+                    job = project_batch.prepare_locate(project_root, dois=dois)
+                elif action == "locate":
                     job = project_batch.prepare_locate(project_root)
+                elif action == "accept":
+                    offset = int(request.form.get("offset", "0"))
+                    if not 0 <= offset <= retrieval.MAX_OFFSET:
+                        raise ValueError("Invalid confirmation page")
+                    position = int(request.form.get("position", str(offset)))
+                    if not offset <= position < offset + 25:
+                        raise ValueError("Invalid confirmation position")
+                    doi = request.form.get("doi", "")
+                    project_batch.accept_pdf(project_root, pdf_data_root, doi,
+                                             request.form.get("file:" + doi, ""))
+                    return redirect("/library/batch/confirm?" + urlencode({
+                        "offset": offset, "notice": "accepted"}) + f"#pair-{position}", code=303)
+                elif action == "extract-accepted":
+                    job = project_batch.prepare_accepted(project_root, pdf_data_root)
                 elif action == "extract":
                     choices = [(doi, request.form.get("file:" + doi, ""))
                                for doi in request.form.getlist("confirm")]
+                    if not choices:
+                        offset = int(request.form.get("offset", "0"))
+                        if not 0 <= offset <= retrieval.MAX_OFFSET:
+                            raise ValueError("Invalid confirmation page")
+                        return redirect("/library/batch/confirm?" + urlencode({
+                            "offset": offset, "notice": "confirm-needed"}), code=303)
                     job = project_batch.prepare_extract(project_root, pdf_data_root, choices)
                 else:
                     raise ValueError("Unknown batch action")
@@ -2163,17 +2415,93 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             response.status_code = 400
             return response
 
-    def batch_page():
+    def batch_page(confirmation=False):
         from .build import project_batch
         if not project_root:
             raise ValueError("Project settings are not enabled")
-        if set(request.args) - {"offset"}:
+        if set(request.args) - ({"offset", "notice"} if confirmation else {"offset"}):
             raise ValueError("Unknown batch parameter")
         offset = int(request.args.get("offset", "0"))
         if not 0 <= offset <= 1000000:
             raise ValueError("Invalid batch page")
         job = project_batch.load(project_root)
         running = batch_running()
+        if confirmation:
+            if running:
+                return redirect("/library/batch", code=303)
+            if request.args.get("notice", "") not in {"", "confirm-needed", "accepted"}:
+                raise ValueError("Unknown confirmation notice")
+            pdfs = available_project_pdfs()
+            suggested = [item for item in job["items"].values() if item["status"] != "extracted"
+                         and item.get("filename")]
+            accepted_items = [item for item in suggested if item.get("accepted_sha256")
+                              and item["status"] != "extraction_failed"]
+            items = [item for item in suggested if item not in accepted_items]
+            if offset and offset >= len(items):
+                offset = max(0, (len(items) - 1) // 25 * 25)
+            body = ('<p>Compare each suggested paper and PDF side by side. Inspect the file locally, '
+                    'choose the correct PDF, then click Accept. Acceptance is saved across pages. '
+                    'Use Extract accepted PDFs when ready; accepting does not start extraction.</p>')
+            if request.args.get("notice") == "accepted":
+                body += '<p role="status">PDF accepted and saved. It has moved out of the pending list; extraction has not started.</p>'
+            elif request.args.get("notice") == "confirm-needed":
+                body += '<p role="alert">No papers were confirmed. Confirm at least one matching PDF below to start extraction.</p>'
+            accepted = len(accepted_items)
+            body += (f'<p>{len(items)} pending paper/PDF pairs; {accepted} accepted across all pages.</p>'
+                     '<form method="post" action="/library/batch">'
+                     f'<input type="hidden" name="token" value="{provide_token}">'
+                     '<button name="action" value="extract-accepted"'
+                     + ('' if accepted else ' disabled') + '>Extract accepted PDFs</button></form>')
+            if accepted_items:
+                body += '<details><summary>Accepted PDFs (' + str(accepted) + ')</summary><ul>'
+                body += "".join(f'<li>{escape(item["title"])} - <code>{escape(item["filename"])}</code></li>'
+                                for item in accepted_items)
+                body += '</ul><p>To change an accepted PDF, select and confirm a different file in the review queue.</p></details>'
+            if not items:
+                body += ('<p>All suggested PDFs have been accepted. Use Extract accepted PDFs when ready.</p>'
+                         if accepted else '<p>No suggested PDFs are ready. Find PDFs or select local files in the review queue first.</p>')
+            else:
+                for index, item in enumerate(items[offset:offset + 25], offset):
+                    result = item.get("result", {})
+                    body += (
+                        f'<article class="library-record" id="pair-{index}">'
+                        '<form method="post" action="/library/batch">'
+                        f'<input type="hidden" name="token" value="{provide_token}">'
+                        f'<input type="hidden" name="doi" value="{escape(item["doi"], quote=True)}">'
+                        f'<input type="hidden" name="offset" value="{offset}">'
+                        f'<input type="hidden" name="position" value="{index}">'
+                        '<div class="two-col">'
+                        f'<section><h3>Paper</h3><h4>{escape(item["title"])}</h4>'
+                        f'<p>DOI: <code>{escape(item["doi"])}</code></p>'
+                        f'<p>Status: {escape(item["status"])}</p></section>'
+                        '<section><h3>Suggested PDF</h3>'
+                        f'<p><code>{escape(item["filename"])}</code></p>'
+                        f'<label for="confirm-file-{index}">PDF from data folder</label>'
+                        f'<select id="confirm-file-{index}" name="file:{escape(item["doi"], quote=True)}">'
+                        '<option value="">Select a PDF</option>'
+                        + "".join(f'<option value="{escape(name, quote=True)}"'
+                                  + (' selected' if name == item["filename"] else '')
+                                  + f'>{escape(name)}</option>' for name in pdfs)
+                        + '</select>')
+                    if item["filename"] not in pdfs:
+                        body += '<p role="alert">Suggested PDF is no longer available; select another local file.</p>'
+                    if result.get("match_basis"):
+                        body += f'<p>Suggested match: {escape(result["match_basis"])}.</p>'
+                    if result.get("final_url"):
+                        body += '<p>Acquired from: ' + metadata_value(result["final_url"]) + '</p>'
+                    if item.get("error"):
+                        body += f'<p role="alert">{escape(item["error"])}</p>'
+                    body += (
+                        '</section></div>'
+                        '<p>By clicking Accept, I confirm that I inspected this PDF, verified its title and DOI, '
+                        'and am authorized to extract it privately.</p>'
+                        + '<button name="action" value="accept">Accept</button></form></article>')
+                body += f'<span id="pair-{offset + len(items[offset:offset + 25])}"></span>'
+                for start, label in ((max(0, offset - 25), "Previous"), (offset + 25, "Next")):
+                    if label == "Previous" and offset or label == "Next" and start < len(items):
+                        body += f'<a href="/library/batch/confirm?offset={start}">{label}</a> '
+            body += '<p><a href="/library/batch">Back to review queue</a> | <a href="/settings">Project settings</a></p>'
+            return page("Confirm suggested papers and PDFs", body)
         counts = Counter(item["status"] for item in job["items"].values())
         state = "interrupted" if job["status"] == "running" and not running else job["status"]
         hidden = f'<input type="hidden" name="token" value="{provide_token}">'
@@ -2195,8 +2523,10 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                      'Extraction retries require fresh confirmation below.</p>')
                      + '<form method="post" action="/library/batch">' + hidden
                      + '<button name="action" value="locate">Locate selected / resume / retry missing PDFs</button></form>'
+                     '<p><a class="button secondary" href="/library/batch/confirm">Review suggested papers and PDFs side by side</a></p>'
                      '<form id="batch-extract" method="post" action="/library/batch">' + hidden
                      + '<input type="hidden" name="action" value="extract">'
+                     f'<input type="hidden" name="offset" value="{offset}">'
                      '<button>Attach and extract confirmed PDFs on this page</button></form>')
         items = list(job["items"].values())
         pdfs = available_project_pdfs()
@@ -2207,12 +2537,17 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             if item.get("error"):
                 body += f'<p role="alert">{escape(item["error"])}</p>'
             result = item.get("result", {})
+            if result.get("status") == "local_found":
+                body += (f'<p>Found local PDF: <code>{escape(result["filename"])}</code>. '
+                         f'Suggested match: {escape(result["match_basis"])}. Verify identity and permission before extraction.</p>')
             if result.get("final_url"):
                 body += '<p>Acquired from: ' + metadata_value(result["final_url"]) + '</p>'
                 body += metadata_value({key: result.get(key) for key in ("filename", "year", "license", "version")})
             for attempt in result.get("attempts", []):
                 if attempt.get("error"):
-                    body += '<p>' + metadata_value(attempt["url"]) + ': ' + escape(attempt["error"]) + '</p>'
+                    body += '<p>' + metadata_value(attempt.get("url") or attempt.get("filename")) + ': ' + escape(attempt["error"]) + '</p>'
+            for attempt in result.get("local_attempts", []):
+                body += f'<p role="alert">Local PDF {escape(attempt["filename"])}: {escape(attempt["error"])}</p>'
             if not running and item["status"] != "extracted":
                 body += (
                     f'<label for="review-file-{index}">PDF from data folder</label>'
@@ -2269,7 +2604,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             "<p>Discovered papers are metadata only until a PDF is supplied and extracted. "
             "Awaiting PDF means no PDF is attached, not that a download has been attempted. "
             "Discovery alone does not add papers to your Core papers or make them available to AI. "
-            "Find PDF and attach/extract below make text available to AI without changing core discovery seeds. "
+            "Attaching a PDF creates an extraction draft. An admin must publish clear text before AI retrieval. "
             "A resolved DOI and title are required; inspect each PDF before confirming.</p>")
             + '<p><a href="/discovery">Find related papers</a> · '
             '<a href="/settings">Manage core papers</a></p>'
@@ -2280,7 +2615,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 ("impact", "Citing papers")], relationship)
             + filter_select("status", "PDF / extraction status", [
                 ("", "All statuses"), ("awaiting", "Awaiting PDF"), ("extracted", "Extracted"),
-                ("review", "Needs visual review"), ("unresolved", "DOI unresolved")], status)
+                ("draft", "Clear-text drafts"), ("published", "Published for retrieval"),
+                ("review", "Needs review"), ("unresolved", "DOI unresolved")], status)
             + '<button>Search</button></form>'
             f'<section class="panel"><h3>Batch PDFs</h3><p><span id="batch-selected-count">{selected_count}</span> papers switched on for Locate PDF. '
             '</p>'
@@ -2339,7 +2675,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                                 return_to="/library")
                    if row["doi"] and row["title"] and row["status"] == "Awaiting PDF" else "")
                 + (f'<p><a href="/library/edit?{escape(urlencode({"doi": row["doi"]}), quote=True)}">'
-                   'View and correct extracted data</a></p>'
+                   'View and correct extracted data</a> | '
+                   f'<a href="/sources?{escape(urlencode({"paper": row["doi"], "collection": "core"}), quote=True)}">'
+                   'Published documents</a></p>'
                    if row["doi"] and row["status"] not in {"Awaiting PDF", "Metadata only — DOI unresolved"} else "")
                 + (f"<details><summary>Connections to your core papers</summary><ul>{connections}</ul>"
                    f"<p>Found in these discovery searches (including provider coverage and gaps):</p>"
@@ -2939,6 +3277,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             "warnings. For bibliography lookups, use get_publication in a kind='catalog' collection from "
             "list_collections, keeping the same snapshot_id, even if the publication_id came from evidence. "
             "No matching passage is not proof of no evidence. Do not invent references or file links."
+            " To read a whole retained PDF, use get_source_document with the source_id from its citation. "
+            "Follow next_offset until null with the same source, collection and snapshot. Preserve the "
+            "returned segment page/unit citations and extraction warnings; do not infer missing text."
         )
         body = (
             help_note("Connecting your AI", "<p>Run these commands from the research-papers project folder. "
@@ -3066,6 +3407,65 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         params = {**pin, **({"collection": cid} if store else {}),
                   "source_id": unit["citation"]["source_id"], "unit_id": unit["id"], **extra}
         return "/read?" + urlencode(params)
+
+    def document_reader_url(pin, cid, source_id):
+        return "/document?" + urlencode({
+            **pin, **({"collection": cid} if store else {}), "source_id": source_id})
+
+    def document_page():
+        current, pin = browser_snapshot({"source_id"})
+        cid = request.args.get("collection", "")
+        if store:
+            if cid not in current.snapshots:
+                raise releases.AccessDeniedError("Select one authorized evidence collection")
+            evidence = current.snapshots[cid]
+            if collections.is_catalog(evidence):
+                raise ValueError("Metadata catalogs do not contain source text")
+        else:
+            evidence = current
+        source_id = request.args.get("source_id", "")
+        contracts.request("get_source_document", {"source_id": source_id})
+        units = evidence.document_units(source_id)
+        canonical = document_reader_url(pin, cid, source_id)
+        if not request.args.get("snapshot_id" if store else "release_id"):
+            return redirect(canonical)
+        source = evidence._lookup("sources", source_id)
+        title = browser_title(current, cid, source)
+        citation = (f"{title}. Publication: {source['doi']}. Source: {source_id}; "
+                    f"SHA-256: {source['sha256']}. "
+                    + (f"Collection: {cid}; registry snapshot: {current.release_id}; " if store else "")
+                    + f"Evidence release: {evidence.release_id}. "
+                    + request.url_root.rstrip("/") + canonical)
+        navigation, text, warnings = [], [], []
+        for index, unit in enumerate(units):
+            location = quality_location(unit["citation"]["locator"])
+            navigation.append(f'<a href="#document-page-{index}">{escape(location)}</a>')
+            text.append(f'<span id="document-page-{index}">{escape(unit["text"])}</span>')
+            warnings.append(
+                f'<section><h4>{escape(location)}</h4>'
+                f'<p><a href="{escape(reader_url(pin, cid, unit), quote=True)}">Read and cite this page</a></p>'
+                + source_warnings(unit)
+                + ("<p><strong>The stored extraction itself is marked incomplete.</strong></p>" if unit["truncated"] else "")
+                + ("<p>No text retained at this location. Inspect the original; this does not prove it is blank.</p>"
+                   if not unit["text"] else "") + "</section>")
+        body = (f'<h3>{escape(title)}</h3>'
+                + help_note("Reading a whole document", "<p>All retained PDF pages in one continuous view. "
+                "Two newlines separate pages; text within each page is unchanged. Headers, footers, split words "
+                "and missing text are not automatically repaired. This is extracted text, not the original PDF "
+                "or proof of complete extraction. Use page links for exact citations and warnings.</p>")
+                + ("<p><strong>This document includes OCR transcription; compare with the original.</strong></p>"
+                   if any("ocr" in " ".join(unit["caveats"]).lower() for unit in units) else "")
+                + ("<p><strong>Some stored page extraction is marked incomplete.</strong></p>"
+                   if any(unit["truncated"] for unit in units) else "")
+                + '<nav aria-label="Document pages">' + " ".join(navigation) + "</nav>"
+                + "<details><summary>Page citations and extraction warnings</summary>"
+                + "<ul>" + "".join(f"<li>{escape(caveat)}</li>" for caveat in evidence._bundle["caveats"])
+                + "</ul>" + "".join(warnings) + "</details>"
+                + '<pre class="reading" id="document-text">' + "\n\n".join(text) + "</pre>"
+                + "<details><summary>Copy document citation</summary>"
+                + copy_field("citation", "Citation and stable link", citation)
+                + '<p id="copy-status" role="status" aria-live="polite"></p></details>')
+        return page("Read whole document", body, reader_script=True)
 
     def source_warnings(record):
         ocr = "ocr" in " ".join(record["caveats"]).lower()
@@ -3219,6 +3619,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             if 0 <= adjacent < len(units):
                 body += f'<a href="{escape(reader_url(pin, cid, units[adjacent]), quote=True)}">{label}</a> '
         body += '</nav>'
+        if source["format"] == "pdf":
+            body += (f'<p><a class="button secondary" href="{escape(document_reader_url(pin, cid, source_id), quote=True)}">'
+                     'Read whole document</a> - all retained pages in one continuous view.</p>')
         if project_root and cid == "core":
             body += (f'<p><a href="/library/edit?{escape(urlencode({"doi": source["doi"], "unit_id": unit_id}), quote=True)}">'
                      'View and correct this page in the active evidence version</a></p>')
@@ -3251,7 +3654,13 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             raise releases.AccessDeniedError("Operator quality pages are development-only")
         if set(request.args) - {"collection", "snapshot_id", "finding", "offset", "text_offset", "show", "kind", "unit_id", "unit_offset", "notice"}:
             raise ValueError("Unknown quality parameter")
-        current = snapshot(request)
+        if project_root:
+            from .build import project_text
+            workspace = project_text.editorial_store(project_root)
+            current = (workspace.load(request.args["snapshot_id"]) if request.args.get("snapshot_id")
+                       else workspace.current())
+        else:
+            current = snapshot(request)
         cid = request.args.get("collection", "")
         offset = int(request.args.get("offset", "0"))
         text_offset = int(request.args.get("text_offset", "0"))
@@ -3561,7 +3970,11 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         try:
             with discovery_lock:
                 require_idle_project()
-                current = store.current() if store else pinned
+                if project_root:
+                    from .build import project_text
+                    current = project_text.editorial_store(project_root).current()
+                else:
+                    current = store.current() if store else pinned
                 if request.form.get("snapshot_id") != current.release_id:
                     raise ValueError("Evidence changed; reload Data quality before recording a result")
                 cid = request.args.get("collection", "")
@@ -3623,6 +4036,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 elif action == "repair":
                     if not project_root or cid != "core" or finding["code"] != "missing_unit":
                         raise ValueError("Select a missing page in a private project library")
+                    if request.form.get("checked") != "yes":
+                        raise ValueError("Confirm that the missing-page transcription was checked against the PDF")
                     from .build import project_edit
                     source = next(item for item in evidence._bundle["sources"] if item["id"] == finding["source_id"])
                     bibliography = source.get("bibliography") or {}
@@ -3650,6 +4065,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
     app.json.ensure_ascii = False
     app.json.sort_keys = False
     for path, endpoint, view in (
+            ("/healthz", "health", lambda: jsonify({"status": "ok"})),
             ("/api/<endpoint>", "api", api), ("/", "overview", overview),
             ("/settings", "project_settings", project_settings),
             ("/discovery", "discovery", discovery_page),
@@ -3657,6 +4073,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             ("/publications", "publications", catalog_page), ("/coverage", "coverage", catalog_page),
             ("/quality", "quality", quality_page),
             ("/search", "search", search_page), ("/read", "read", read_page),
+            ("/document", "document", document_page),
             ("/reader.js", "reader_script", reader_script),
             ("/help.js", "help_script", lambda: Response(HELP_SCRIPT, mimetype="text/javascript")),
             ("/settings.js", "settings_script", lambda: Response(SETTINGS_SCRIPT, mimetype="text/javascript")),
@@ -3666,10 +4083,12 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         app.add_url_rule(path, endpoint, view, methods=["GET"])
     app.add_url_rule("/settings/initialize", "initialize_project", initialize_project, methods=["POST"])
     app.add_url_rule("/settings/reset", "reset_project", reset_project, methods=["POST"])
+    app.add_url_rule("/settings/soft-reset", "soft_reset_project", soft_reset_project, methods=["POST"])
     app.add_url_rule("/settings/attach-pdf", "attach_project_pdf", attach_project_pdf, methods=["POST"])
     app.add_url_rule("/settings/find-pdf", "find_project_pdf", find_project_pdf, methods=["POST"])
     app.add_url_rule("/settings/pdf-progress", "pdf_progress", pdf_progress, methods=["GET"])
     app.add_url_rule("/library/batch", "batch_page", batch_page, methods=["GET"])
+    app.add_url_rule("/library/batch/confirm", "batch_confirm", lambda: batch_page(confirmation=True), methods=["GET"])
     app.add_url_rule("/library/batch", "batch_action", batch_action, methods=["POST"])
     app.add_url_rule("/library/edit", "edit_paper", edit_paper, methods=["GET"])
     app.add_url_rule("/library/edit", "save_paper_correction", save_paper_correction, methods=["POST"])
@@ -3702,6 +4121,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         origin = request.headers.get("origin")
         if origin is not None and origin not in local_origins:
             return Response("Untrusted origin", status=403, mimetype="text/plain")
+        if request.endpoint == "health":
+            return None
         pause_batch = (batch_running() and request.path == "/library/batch"
                        and request.method == "POST" and request.form.get("action") == "pause")
         if pdf_running() and request.method != "GET" and not pause_batch:
@@ -3715,7 +4136,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
     def error_response(message, code, status):
         if request.path.startswith("/api/"):
             return jsonify({"ok": False, "error": {"code": code, "message": message}}), status
-        if request.path in {"/search", "/read"}:
+        if request.path in {"/search", "/read", "/document"}:
             response = page("Evidence request could not be completed",
                             f"<p>{escape(message)}</p><p>Check the query, collection and source link. "
                             "Unavailable snapshots are not silently replaced with current evidence. "

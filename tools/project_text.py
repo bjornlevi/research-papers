@@ -1,0 +1,212 @@
+"""Private editorial versions and explicit publication of clear text for retrieval."""
+
+from copy import deepcopy
+from datetime import datetime, timezone
+from pathlib import Path
+import shutil
+import tempfile
+
+from research_library import collections, releases
+from . import literature_update
+
+
+def editorial_store(root):
+    root = Path(root)
+    path = root / "editorial"
+    if not (path / "active.json").exists():
+        path = root / "registry"
+    return collections.CollectionStore(path, allowed_profiles=["private_context"],
+                                       allowed_collections=["core"], defaults=["core"])
+
+
+def empty_bundle():
+    return {"schema_version": 1, "caveats": ["Only explicitly published clear text is available for retrieval."],
+            **{section: [] for section in releases.SECTIONS}}
+
+
+def attached_bundle(source, result):
+    """Keep an attachable document and page anchors even without usable extraction."""
+    location = source["acquisition"]["acquisition"]
+    record = {
+        "id": source["source_id"], "doi": source["publication_id"].removeprefix("doi:"),
+        "sha256": source["sha256"], "format": "pdf", "url": location["final_url"],
+        "provenance": "Operator-provided private PDF. Draft text is not published or human verified.",
+        "rights": "restricted", "omission": "original_not_exported",
+        "bibliography": {"title": source["title"], "year": None, "acquired_from": location["url"],
+                         "acquisition_method": "user_provided_private_copy",
+                         "acquired_at": source["acquisition"]["acquired_at"]},
+    }
+    bundle = empty_bundle()
+    bundle["sources"] = [record]
+    for page in result["pages"]:
+        bundle["units"].append({
+            "id": record["id"] + f':p{page["pdf_page"]}', "text": page.get("text", ""), "truncated": False,
+            "citation": {"source_id": record["id"], "doi": record["doi"], "source_sha256": record["sha256"],
+                         "source_url": record["url"], "provenance": record["provenance"],
+                         "availability": "metadata_only", "locator": {"kind": "pdf", "pdf_page": page["pdf_page"]}},
+            "verification_status": "machine_extracted", "human_verification": "not_reviewed",
+            "caveats": ["No usable extraction at attachment; an admin must provide and check clear text."],
+            "source_issue_ids": [],
+        })
+    return {"bundle": bundle, "grants": {record["id"]: {"scopes": ["curated", "context"],
+            "basis": source["permissions"]["basis"]}}, "ocr": None}
+
+
+def activate(root, bundle, grants, *, editorial=False):
+    """Install a validated immutable release, then activate its registry last."""
+    from . import project_library
+    root = Path(root)
+    registry = collections.CollectionStore(root / ("editorial" if editorial else "registry"),
+        allowed_profiles=["private_context"], allowed_collections=["core"], defaults=["core"])
+    with tempfile.TemporaryDirectory() as temporary:
+        output = Path(temporary) / "evidence"
+        release_id = releases.export(bundle, output, profile="private_context", authorization=grants)
+        registry.releases.install(output)
+    previous = registry.current() if (registry.root / "active.json").exists() else None
+    document = deepcopy(previous.document) if previous else {"schema_version": 1, "collections": []}
+    document["collections"] = [entry for entry in document["collections"] if entry["id"] != "core"]
+    document["collections"].append({
+        "id": "core", "title": project_library.load(root)["name"], "version": release_id[:16],
+        "updated_at": datetime.now(timezone.utc).date().isoformat(),
+        "coverage": ("Private attached sources and editorial drafts; not authorized as published RAG text."
+                     if editorial else "Explicitly published clear text; transcription approval is not scientific validation."),
+        "release_id": release_id, "publications": {},
+    })
+    return {"snapshot": registry.publish(document), "release": release_id}
+
+
+def ensure_editorial(root):
+    from . import project_library
+    root = Path(root)
+    if (root / "editorial/active.json").exists():
+        return
+    if (root / "registry/active.json").exists():
+        original = project_library.store(root).current().snapshots["core"]
+        activate(root, original._bundle, original._manifest["authorization"], editorial=True)
+    else:
+        activate(root, empty_bundle(), {}, editorial=True)
+        activate(root, empty_bundle(), {})
+
+
+def migrate(root, *, withdraw=False):
+    """Preserve previous releases; optionally withdraw unapproved active evidence."""
+    from . import project_library
+    root = Path(root)
+    with literature_update.writer_lock(root):
+        ensure_editorial(root)
+        old = project_library.store(root).current()
+        if withdraw:
+            result = activate(root, empty_bundle(), {})
+        else:
+            result = {"snapshot": old.release_id,
+                      "release": old.snapshots["core"].release_id}
+        result.update(editorial_snapshot=editorial_store(root).current().release_id,
+                      previous_snapshot=old.release_id, withdrawn=withdraw)
+        return result
+
+
+def source_bundle(bundle, source_id):
+    selected = deepcopy(bundle)
+    selected["sources"] = [source for source in selected["sources"] if source["id"] == source_id]
+    if not selected["sources"]:
+        raise ValueError("Select an attached source")
+    for section in ("units", "tables"):
+        selected[section] = [item for item in selected[section] if item["citation"]["source_id"] == source_id]
+    for section in ("claims", "issues", "relationships"):
+        if selected[section]:
+            raise ValueError("Curated dependencies require a dependency-aware clear-text publication")
+    return selected
+
+
+def content_identity(bundle, source_id):
+    """Compare document content independently of verification/provenance labels."""
+    selected = source_bundle(bundle, source_id)
+    source = selected["sources"][0]
+    return releases.sha256(releases.encode({
+        "source": {key: source.get(key) for key in ("id", "sha256", "bibliography", "url")},
+        "units": sorted((item["id"], item["text"], item["citation"]["locator"]) for item in selected["units"]),
+        "tables": sorted((item["id"], {key: item[key] for key in
+                        ("title", "headers", "units", "rows", "footnotes")}) for item in selected["tables"]),
+    }))
+
+
+def publication_state(editorial, published, source_id):
+    if not any(source["id"] == source_id for source in published["sources"]):
+        return "draft"
+    return ("published" if content_identity(editorial, source_id) == content_identity(published, source_id)
+            else "draft_revision")
+
+
+def publish(root, *, snapshot_id, source_id, reviewer, reason, checked):
+    from . import project_library, project_edit
+    root = Path(root)
+    reviewer, reason = reviewer.strip(), reason.strip()
+    if not reviewer or len(reviewer) > 200 or not reason or len(reason) > 2000:
+        raise ValueError("Provide a reviewer name and publication reason")
+    if not checked:
+        raise ValueError("Confirm that the clear text was checked against the original source before publication")
+    with literature_update.writer_lock(root):
+        ensure_editorial(root)
+        current = editorial_store(root).current()
+        if current.release_id != snapshot_id:
+            raise ValueError("Editorial text changed; reload before publishing")
+        evidence = current.snapshots["core"]
+        selected = source_bundle(evidence._bundle, source_id)
+        if not selected["units"] or not any(unit["text"].strip() for unit in selected["units"]):
+            raise ValueError("Provide clear text before publishing")
+        if any(unit["truncated"] for unit in selected["units"]):
+            raise ValueError("Resolve incomplete page text before publishing")
+        source = selected["sources"][0]
+        source["provenance"] = (
+            source["provenance"]
+            .replace("Admin-edited draft; original extraction retained in prior snapshots; not published for retrieval.",
+                     "Admin-edited transcription; original extraction retained in prior snapshots.")
+            .replace("Draft text is not published or human verified.",
+                     "Clear text explicitly approved by the admin for retrieval; not scientific validation.")
+        )
+        publication_note = " Clear text explicitly published after admin source comparison; see local publication audit."
+        if publication_note not in source["provenance"]:
+            source["provenance"] += publication_note
+        for item in [*selected["units"], *selected["tables"]]:
+            item["citation"]["provenance"] = source["provenance"]
+            item.update(verification_status="source_checked_by_human", human_verification="reviewed")
+            if project_edit.CORRECTION_CAVEAT not in item["caveats"]:
+                item["caveats"].append(project_edit.CORRECTION_CAVEAT)
+        published = project_library.store(root).current()
+        original = published.snapshots["core"]
+        bundle = deepcopy(original._bundle)
+        if any(bundle[key] for key in ("claims", "issues", "relationships")):
+            raise ValueError("Curated dependencies require a dependency-aware clear-text publication")
+        for section in ("sources", "units", "tables"):
+            bundle[section] = [item for item in bundle[section]
+                if (item["id"] if section == "sources" else item["citation"]["source_id"]) != source_id]
+            bundle[section].extend(selected[section])
+        grants = deepcopy(original._manifest["authorization"])
+        grants[source_id] = evidence._manifest["authorization"][source_id]
+        (root / "runs").mkdir(exist_ok=True)
+        run = Path(tempfile.mkdtemp(prefix="correction-publication-", dir=root / "runs"))
+        activated = False
+        try:
+            # Audit and immutable release are staged before the retrieval registry changes.
+            release_id = releases.export(bundle, run / "evidence", profile="private_context", authorization=grants)
+            project_library.store(root).releases.install(run / "evidence")
+            project_library.write_text_views(run / "text", selected)
+            event = {"schema_version": 1, "at": datetime.now(timezone.utc).isoformat(),
+                     "reviewer": reviewer, "reason": reason, "scope": "publication", "source_id": source_id,
+                     "source_sha256": selected["sources"][0]["sha256"], "unit_id": None,
+                     "parent_snapshot": published.release_id, "parent_release": original.release_id,
+                     "editorial_snapshot": current.release_id, "release": release_id,
+                     "before": {"content_identity": (content_identity(original._bundle, source_id)
+                                if any(s["id"] == source_id for s in original._bundle["sources"]) else None)},
+                     "after": {"content_identity": content_identity(selected, source_id)}}
+            collections.atomic_json(run, "correction.json", event)
+            document = deepcopy(published.document)
+            entry = next(entry for entry in document["collections"] if entry["id"] == "core")
+            entry.update(release_id=release_id, version="published-" + release_id[:16],
+                         coverage="Admin-published clear text; transcription approval is not scientific validation.")
+            snapshot = project_library.store(root).publish(document)
+            activated = True
+            return {"snapshot": snapshot, "release": release_id, "audit": str(run / "correction.json")}
+        finally:
+            if not activated:
+                shutil.rmtree(run)

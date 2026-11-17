@@ -102,7 +102,7 @@ def main():
                 async with streamable_http_client(url, http_client=http) as (reader, writer, _):
                     async with ClientSession(reader, writer) as client:
                         await client.initialize()
-                        assert len((await client.list_tools()).tools) == 12
+                        assert len((await client.list_tools()).tools) == 13
                         for case in expected["cases"]:
                             response = await client.call_tool(case["tool"], case["arguments"])
                             assert response.structuredContent == case["response"]
@@ -149,7 +149,7 @@ def main():
             assert all(p.read_bytes() == data for p, data in before.items())
             report = {"passed": True, "image_id": metadata["Id"], "engine": engine,
                       "nonroot": True, "readonly": True, "restart": True,
-                      "unauthorized_denied": True, "twelve_tool_parity": True,
+                      "unauthorized_denied": True, "all_tool_parity": True,
                       "readiness_detected_corruption": True, "release_bytes_unchanged": True,
                       "memory_limit_mib": 512, "cpu_limit": 2}
             if args.output:

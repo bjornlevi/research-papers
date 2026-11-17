@@ -39,10 +39,44 @@ log under `releases/`; stop it with `make web-off`. The default project root is
 `releases/project/`. Use the same `PROJECT_ROOT=/path/to/project` with both
 commands to select another private location.
 
-Settings also offers **Reset to factory settings**. Typing `RESET PROJECT`
+### Restart setup while keeping material
+
+Use **Soft reset (keep material)** in Settings and type `SOFT RESET`. It moves
+the entire configured project into a dated folder under the sibling
+`<project-root>-preserved/` directory, then returns to Core papers upload.
+For the default root, this is `releases/project-preserved/`. Nothing inside
+the old project is deleted: PDFs, extracted text, cleaned text, structured
+tables, correction/publication history, settings and discovery results remain
+in the preserved copy.
+
+Upload the Core papers CSV or JSON again to initialize a fresh project.
+Exact DOI matches reuse the newest available retained attachment and editorial
+text, with PDF checksum verification and no re-extraction. Adding Core papers
+later or encountering papers in new discovery also restores matching material.
+Papers without retained matches remain awaiting PDF. Corrupted retained PDFs
+cause an explicit error instead of being silently skipped.
+
+Reused text is always an unpublished draft, even if it was previously published.
+Admins must explicitly publish it for current search/AI retrieval. Restoring
+discovered papers does not promote them to Core papers. Old discovery results
+remain in the archive; the new project's discovery selections and settings start
+fresh. Retained projects are not automatically merged back wholesale.
+
+The CLI equivalent, after stopping background operations, is:
+
+```sh
+.venv/bin/research-project --root releases/project soft-reset --confirm
+```
+
+Preserved folders and shared PDF folders are outside the active project.
+Purging or factory-resetting the new active project does **not** remove these
+retained copies. Inspect and manage them separately when permanent erasure
+is intended. Keep preserved material private and out of version control.
+
+Settings also offers the destructive **Reset to factory settings**. Typing `RESET PROJECT`
 confirms permanent deletion of everything inside the configured project root,
 including PDFs, extracted evidence, snapshots, discovery output and settings.
-Files outside that root are not affected.
+Files outside that root, including previously preserved projects, are not affected.
 
 Alternatively, initialize from the command line:
 
@@ -87,9 +121,20 @@ a local PDF from the shared `releases/pdf-data/` folder. Choose the file, confir
 you checked the identity and private-use authorization, and submit. Files in
 that folder are not served and survive project reset. To use another folder,
 restart with `make web PDF_DATA_ROOT=/path/to/pdfs`. The selection excludes
-symlinks and does not accept paths outside that folder.
+symlinks, does not accept paths outside that folder, and omits PDFs whose
+checksums are already attached to papers in the active project.
 
-For a paper awaiting PDF, **Find PDF** searches OpenAlex for a location with an
+For a paper awaiting PDF, **Find PDF** first searches the configured local PDF
+data folder, including subfolders and preserved project PDF copies. It suggests
+matches using recorded acquisition DOI/checksum, a title-based filename, or
+DOI/title on the first page or in PDF metadata. Symlinks are excluded.
+Local matches skip online lookup and downloads, but do not verify identity,
+licensing or extraction quality. Unreadable local PDFs are reported rather than
+treated as matches; scanned PDFs without usable metadata may need manual selection.
+Correction notices are not suggested as original papers merely because they cite
+the original DOI; they may be suggested for separately registered correction records.
+
+If no local match is found, **Find PDF** searches OpenAlex for a location with an
 explicit Creative Commons/public-domain license and tries downloading it in the
 background. The progress/result page shows failures or the saved filename and
 acquisition URL. This uses the installation's OpenAlex key when configured and
@@ -104,6 +149,49 @@ Downloaded filenames use the paper title, for example
 different PDFs with the same title; existing files are never overwritten.
 
 ### View and correct extracted data
+
+### Clear-text drafts and publication
+
+PDF attachment and extraction now create **private editorial drafts**, not active
+RAG evidence. The admin is responsible for a faithful clear-text version, prepared
+by hand or with their own LLM/tools. The application does not send documents to
+a model. In **View and correct extracted data**, download the page-marked draft,
+edit it externally or in whole-document edit mode, and **Save clear-text draft**.
+You can also import a UTF-8 `.txt`/`.md` file in the editor. An uploaded file replaces
+the text field for that save. Preserve page markers and source attribution.
+
+Saving does not assert human verification. From the read-only view, provide a
+reviewer and reason, confirm comparison with the source, then **Publish clear text
+for retrieval**. Only this action updates current search, reader, Sources available
+to AI, JSON API and MCP evidence. A subsequent draft revision leaves the previous
+published text active until published again. Tables are included in publication,
+with their page locators, headers, units and footnotes. Publication is transcription
+approval, not scientific validation.
+
+**Attach only; I will provide clear text separately** skips extraction and creates
+empty page anchors for manual input. Extraction, when used, is merely a draft
+generator. The command-line equivalents are:
+
+```sh
+research-project --root releases/project attach-pdf --doi 10.0000/example \
+  --pdf /path/to/authorized.pdf --confirm-identity --no-extract
+research-project --root releases/project export-text --doi 10.0000/example \
+  --file /path/to/draft.txt
+# Edit draft.txt locally, retaining page markers.
+research-project --root releases/project import-text --doi 10.0000/example \
+  --file /path/to/draft.txt --reviewer "Admin" --reason "Prepared clear text"
+research-project --root releases/project status
+research-project --root releases/project publish-text --doi 10.0000/example \
+  --snapshot-id EDITORIAL_SNAPSHOT_FROM_STATUS --reviewer "Admin" \
+  --reason "Checked transcription against source" --confirm-checked
+```
+
+For existing libraries, `migrate-text-workflow` preserves existing active text as
+legacy retrieval content and copies it into editorial storage. Add
+`--withdraw-existing` to exclude it from current RAG pending publication. Neither
+option deletes PDFs or historical snapshot-pinned content. No migration runs
+silently at startup. See [architecture](architecture.md) for storage, boundaries
+and current retrieval limitations.
 
 **Search evidence** provides **All papers**, **Core papers**, **References**
 (a core paper cites it), and **Citing papers** (it cites a core paper) scopes.
@@ -126,8 +214,26 @@ provider summaries, with reported/retrieved counts and errors. Technical provide
 details remain expandable rather than appearing as raw JSON.
 
 For an extracted paper in **Library** or **Sources available to AI**, click
-**View and correct extracted data**. The reader also links directly to the
-current version of its retained page. This private-project editor provides:
+**View and correct extracted data**. It opens in read-only mode with the whole
+retained document in page order, separated by two newlines without altering page
+text. Paper metadata, provenance, page warnings, structured tables from all pages
+and correction history are expandable. The reader also links to this view for
+the current version of its retained page.
+
+Choose **Turn on edit mode** to edit the entire document in one text field and
+save all pages in a single audited draft version. Visible `[[PAGE …]]` markers
+identify the original PDF pages. Keep every marker unchanged and in order, with
+two newlines before each marker after the first. Text between markers is assigned
+to that page for citations; move text across boundaries only when correcting its
+page assignment. Missing, duplicated, reordered or damaged markers reject the
+save and retain your draft rather than guessing provenance. Markers are editor
+scaffolding and do not appear in saved evidence or the read-only document.
+
+A page's **Edit** link under **Pages and extraction warnings** still opens the
+individual-page editor, including **Repair paragraph layout**. Metadata changes
+apply to the whole paper in either mode. **Return to read-only view** discards
+unsaved drafts, and saving returns to the readable document.
+This private-project editor provides:
 
 - Direct page/location links with the current page highlighted, and the full
   retained text, not the reader's 2,048-character slice. Save before switching
@@ -142,6 +248,11 @@ current version of its retained page. This private-project editor provides:
   a table from the list removes it only from the new version. Tables are limited
   to 100 columns/rows each by the evidence contract. Structured table IDs are
   retained in the editor data and can be retrieved through `get_table`.
+  In whole-document mode the JSON includes all tables and requires a `unit_id`
+  for each table to identify its PDF page. Existing table page assignments cannot
+  be changed. New tables use an empty table ID and one of the listed page unit IDs.
+  A correction accepts at most 100 tables. Whole-document text is limited to
+  10,000,000 characters including markers, with at most 1,000,000 per page.
 
 New native PDF extractions automatically order text blocks by column/section
 whitespace gutters and join wrapped lines within blocks, keeping blank lines
@@ -167,12 +278,12 @@ Review the draft against the PDF: complex layouts, tables, paragraph boundaries
 and line-end hyphenation still need manual checking. Pages with too little
 native text cannot use this repair; correct their OCR text manually.
 
-Inspect the original PDF locally, enter your name and correction reason, and
-confirm you checked the changes. **Save corrected version** validates and stages
-a new private evidence snapshot before activating it. Search, reader, source
-metadata, JSON API and MCP then use the corrected active version. Changed page
-text/tables are labelled operator-reviewed, not independently scientifically
-validated; existing extraction/OCR caveats are retained. The immutable source
+Inspect the original PDF locally, enter your name and correction reason, then
+**Save clear-text draft**. It validates and stages a private editorial version.
+Use **Publish clear text for retrieval** separately to activate it for search,
+reader, source metadata, JSON API and MCP. Published text/tables are labelled
+operator-reviewed, not independently scientifically validated; existing
+extraction/OCR caveats are retained. The immutable source
 checksum continues to identify the original PDF, not the corrected transcription.
 
 Existing evidence releases and snapshot-pinned links keep their original data.
@@ -203,7 +314,8 @@ Open **Data quality** and select a finding. No terminal commands are needed:
   a blocker, or **Edit extracted data** to open the existing versioned editor.
 - For an omitted project PDF page, use **Add missing page text** to enter its
   complete transcription. Saving requires an original-comparison confirmation
-  and activates a new version with the same correction audit as other edits.
+  and saves an editorial draft with the same correction audit as other edits.
+  Publish the completed clear text separately before it becomes RAG evidence.
 
 Reviews and problems are saved locally, bound to the source/extraction identity,
 without changing evidence text. Corrections preserve earlier versions and
@@ -215,6 +327,12 @@ also available for development evidence collections.
 
 ### Batch PDF location and extraction
 
+In **Project settings → Attach PDFs**, **Find all** starts the same local-first
+batch lookup for every Core paper awaiting PDF, without including discovered
+papers selected elsewhere. Existing local matches and downloads are reused.
+Review the batch results and explicitly confirm each PDF before extraction;
+finding PDFs does not attach them or start discovery.
+
 In **Library**, filter by relationship and PDF/extraction status, then switch
 **Locate PDF: off/on** for individual papers. These are toggle buttons, not
 identity/permission confirmations. Toggles update in place without navigating or
@@ -223,7 +341,9 @@ changing scroll position (ordinary form navigation is retained without JavaScrip
 papers** selects eligible records across pages; **Turn all off** clears the
 selection. Only records with a title and DOI awaiting PDF are eligible.
 
-**Locate selected PDFs** starts a sequential, rate-limited background job. The
+**Locate selected PDFs** starts a sequential, rate-limited background job,
+checking local PDFs first for each paper using the same matching rules as
+**Find PDF**. The
 **Review batch results and confirm extraction** page shows persistent per-paper
 results, acquisition links, license/year/version metadata and errors. A PDF can
 also be selected from the local data folder, including when online location
@@ -233,14 +353,28 @@ queues only those explicitly confirmed PDFs, with their checksums bound to the
 confirmation. Review pages contain 25 papers; unconfirmed papers are not extracted.
 Discovered papers remain outside the core seed list.
 
+Use **Review suggested papers and PDFs side by side** to open a confirmation
+page pairing each paper's title/DOI with its suggested local PDF and match
+information. Change the selected file if necessary and click **Accept** for each
+pair you have inspected. Accept confirms identity and private-use permission,
+but does not start extraction. Acceptance is saved across pages and app restarts
+and bound to the PDF checksum. Accepted pairs leave the pending list; a success
+message, accepted count and expandable accepted list show what has been saved.
+Choose **Extract accepted PDFs** to extract all
+accepted pairs across all pages; changed PDFs require fresh acceptance.
+Confirmation pages show 25 suggested pairs.
+Clicking the extraction button without checking any pairs opens this confirmation
+page with guidance instead of rejecting the request. Missing local files are
+flagged and must be replaced before confirmation.
+
 **Pause after current paper** finishes the current item before stopping.
 Selection and results are saved in private `batch-pdf.json` within the project.
 After a pause or app restart, **Locate selected / resume / retry missing PDFs**
-reuses completed downloads and retries selected missing/failed entries. Provider
+reuses local matches and completed downloads and retries selected missing/failed entries. Provider
 metadata errors pause the queue so remaining papers are not repeatedly attempted
 after a quota error. Resume only after the provider permits it; daily resets are
 not scheduled automatically. Interrupted or failed extraction requires fresh
-confirmation, and already activated evidence is not extracted again.
+confirmation, and already attached sources are not extracted again.
 Other project mutations are blocked while a batch is running.
 
 The same **Find PDF** and **Select PDF and attach/extract** controls are available
@@ -248,8 +382,9 @@ on **Library** for core and discovered papers with a resolved
 DOI and title. Discovered papers retain their relationship categories after extraction: they do not
 become core papers or seeds for further citation expansion. Library categories
 show **References** (a core paper cites it), **Citing papers** (it cites a
-core paper), or both. Their extracted text
-is available in Sources available to AI, search, reader, JSON API and MCP.
+core paper), or both. Their extraction remains a private draft until an admin
+publishes clear text. Only published text is available in Sources available to AI,
+search, reader, JSON API and MCP.
 For compatibility, all attached project evidence uses the existing internal
 `core` collection; core discovery membership is separately defined by the
 registered DOI/title list. No additional MCP collection authorization is needed.
@@ -272,8 +407,9 @@ be readable and within the existing size and page limits. Text is extracted per
 original page, with automatic column-aware paragraph formatting for native PDF
 text; pages without native text go through local Tesseract OCR, with
 the usual not-human-verified and confidence caveats. Missing OCR dependencies,
-unreadable PDFs and empty extraction are errors, not successful additions.
-Each successful import validates and activates a new immutable collection
+and unreadable PDFs surface as errors. A PDF with no usable extracted text retains
+empty page anchors for manual transcription; it is not published as usable text.
+Each successful attachment validates and activates a new immutable editorial
 snapshot; old snapshots remain available. The command prints the location of
 regenerated, formatting-only `text.md` views for all attached project papers; the release
 units remain authoritative. Originals are not served.
@@ -292,6 +428,31 @@ library page lists registered papers and their current extraction state.
 Search, reader, JSON API and MCP use the same project evidence snapshot. The
 website can also start before initialization so the project can be created in
 Project settings; evidence search and MCP retrieval require an attached PDF.
+
+### Read a whole retained document
+
+In **Sources available to AI**, expand a PDF entry and select **Read whole
+document**. The same link is available from a page's **Read source context**
+view; **Library → Read retained documents** opens the source inventory.
+All retained PDF page text is displayed in one scrollable view, without the
+2048-character slices used by the page reader. Page navigation, exact citations,
+OCR warnings, empty pages and stored truncation flags remain available.
+The URL pins the evidence version, so a later correction does not change it.
+
+AI clients can call `get_source_document` with the `source_id` from a passage
+citation or `list_sources`. On registry endpoints, select one authorized evidence
+collection and pin `snapshot_id`. Follow `next_offset` until null to read all
+retained text; each slice includes exact page/unit provenance in `segments`.
+The local JSON API exposes the same response at
+`/api/document?source_id=…&collection=core&snapshot_id=…`, with optional
+`offset` and `max_characters` (up to 8192).
+
+The combined text is a reading view, not a new extraction: two newlines separate
+pages, and the text inside each page is unchanged. Headers, footers, split words
+and missing text are not guessed or repaired. An abrupt ending may be the old
+page reader's slice boundary rather than missing extracted text. Check the next
+slice/page and compare with the original before correcting a real extraction
+gap. Existing attachments need no re-extraction. Original PDFs are not served.
 
 To collect **metadata only** for direct references and citing works of the
 registered core papers:

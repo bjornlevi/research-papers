@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 import httpx
 from flask import Flask
@@ -107,6 +108,30 @@ class WebTests(unittest.TestCase):
         client = httpx.Client(transport=httpx.WSGITransport(app=app), base_url="http://127.0.0.1:8080")
         self.addCleanup(client.close)
         return client
+
+    def test_health_is_independent_of_project_data_and_busy_jobs(self):
+        project = self.root / "project"
+        project.mkdir()
+        (project / "project.json").write_text("{}")
+        app = web_server.create_app(
+            registry=project / "registry", project_root=project, profiles={"synthetic"},
+            allowed_collections=["core"], default_collections=["core"])
+        app.extensions["core_purge"]["thread"] = Mock(is_alive=Mock(return_value=True))
+        app.extensions["find_pdf"]["thread"] = Mock(is_alive=Mock(return_value=True))
+        with app.test_client() as client, patch(
+                "research_library.build.project_library.status",
+                side_effect=AssertionError("Health must not read project data")):
+            response = client.get("/healthz", base_url="http://127.0.0.1:8080")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json, {"status": "ok"})
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            self.assertEqual(client.head("/healthz", base_url="http://127.0.0.1:8080").status_code, 200)
+            self.assertEqual(client.get("/healthz", base_url="http://evil.example:8080").status_code, 421)
+            self.assertEqual(client.get("/healthz", base_url="http://127.0.0.1:8080",
+                                        headers={"Origin": "https://evil.example"}).status_code, 403)
+            app.extensions["core_purge"]["thread"] = None
+            app.extensions["find_pdf"]["thread"] = None
+            self.assertEqual(client.post("/healthz", base_url="http://127.0.0.1:8080").status_code, 405)
 
     def test_overview_sources_safety_and_readonly(self):
         before = snapshots(self.release)

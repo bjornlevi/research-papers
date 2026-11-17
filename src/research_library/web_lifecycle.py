@@ -120,7 +120,7 @@ def start(args):
                 child_args, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                 start_new_session=True, close_fds=True)
         write_pid(pid_file, process.pid)
-        url = f"http://127.0.0.1:{args.port}/settings"
+        url = f"http://127.0.0.1:{args.port}/healthz"
         for _ in range(50):
             if process.poll() is not None:
                 pid_file.unlink(missing_ok=True)
