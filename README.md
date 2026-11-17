@@ -49,7 +49,8 @@ Project settings. Select the matching local file, confirm its identity and autho
 then click **Attach and extract PDF**. This shared folder is preserved by project
 reset; imported project copies and extracted evidence are not. Override the
 folder with `make web PDF_DATA_ROOT=/path/to/pdfs` (restart the web app first).
-PDFs are never served as files.
+PDFs already attached to papers in the active project are omitted from the
+selection list, based on their checksums. PDFs are never served as files.
 
 Alternatively, click **Find PDF** for a core paper awaiting PDF. It looks for an
 explicitly licensed open-access copy and downloads it, with acquisition provenance,

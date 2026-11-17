@@ -1339,8 +1339,16 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             raise ValueError("PDF data folder cannot contain a symlinked path")
         if not pdf_data_root.exists():
             return {}
+        associated_hashes = set()
+        if project_root and (project_root / "registry/active.json").is_file():
+            from .build import project_library
+            current = project_library.store(project_root).current()
+            associated_hashes = {
+                source["sha256"] for source in current.snapshots["core"]._bundle["sources"]
+            }
         return {path.name: path for path in sorted(pdf_data_root.iterdir())
-                if path.suffix.casefold() == ".pdf" and not path.is_symlink() and path.is_file()}
+                if path.suffix.casefold() == ".pdf" and not path.is_symlink() and path.is_file()
+                and releases.sha256(path.read_bytes()) not in associated_hashes}
 
     def pdf_controls(doi, title, *, prefix, pdfs, return_to="/settings", selected="", summary=None):
         hidden = (f'<input type="hidden" name="token" value="{provide_token}">'

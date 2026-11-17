@@ -87,7 +87,8 @@ a local PDF from the shared `releases/pdf-data/` folder. Choose the file, confir
 you checked the identity and private-use authorization, and submit. Files in
 that folder are not served and survive project reset. To use another folder,
 restart with `make web PDF_DATA_ROOT=/path/to/pdfs`. The selection excludes
-symlinks and does not accept paths outside that folder.
+symlinks, does not accept paths outside that folder, and omits PDFs whose
+checksums are already attached to papers in the active project.
 
 For a paper awaiting PDF, **Find PDF** searches OpenAlex for a location with an
 explicit Creative Commons/public-domain license and tries downloading it in the

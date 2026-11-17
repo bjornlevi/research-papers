@@ -178,6 +178,7 @@ class ProjectLibraryTests(unittest.TestCase):
         settings = client.get("/settings", base_url=base).get_data(as_text=True)
         self.assertNotIn('action="/settings/attach-pdf"', settings)
         self.assertIn('<details class="core-paper-inventory"><summary>All core papers (1)</summary>', settings)
+
         self.assertIn('id="core-paper-search"', settings)
         self.assertIn('data-core-paper-record', settings)
         self.assertIn("Attached papers remain registered here.", settings)
@@ -195,10 +196,32 @@ class ProjectLibraryTests(unittest.TestCase):
         queue = settings.split('<ul class="library-records awaiting-papers">', 1)[1].split("</ul>", 1)[0]
         self.assertIn("Pending paper", queue)
         self.assertNotIn("Folder paper", queue)
-        self.assertEqual(settings.count('action="/settings/attach-pdf"'), 1)
+        self.assertEqual(settings.count('action="/settings/attach-pdf"'), 0)
+        self.assertNotIn('value="folder.pdf"', settings)
         self.assertIn("Folder paper", settings)
         client.post("/settings/reset", data={"confirmation": "RESET PROJECT"}, base_url=base)
         self.assertTrue((folder / "folder.pdf").is_file())
+
+    def test_attached_pdf_is_not_listed_as_available_again(self):
+        project_library.register(self.root, [
+            {"doi": "10.0000/attached", "title": "Already attached"},
+            {"doi": "10.0000/pending", "title": "Still awaiting PDF"},
+        ])
+        attached = self.pdf("already-attached.pdf", "Fictional evidence already attached.")
+        project_library.attach(self.root, "10.0000/attached", attached, identity_confirmed=True)
+        folder = self.root.parent / "pdf-data"
+        folder.mkdir()
+        shutil.copyfile(attached, folder / "already-linked.pdf")
+        shutil.copyfile(self.pdf("unattached.pdf", "Different fictional evidence remains available."),
+                        folder / "unattached.pdf")
+        app = web_server.create_app(
+            registry=self.root / "registry", project_root=self.root, pdf_data_root=folder,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"])
+
+        settings = app.test_client().get("/settings", base_url="http://localhost:8080").get_data(as_text=True)
+
+        self.assertNotIn('value="already-linked.pdf"', settings)
+        self.assertIn('value="unattached.pdf"', settings)
 
     def test_web_attach_pdf_missing_data_folder(self):
         project_library.register(self.root, [{"doi": "10.0000/folder", "title": "Folder paper"}])
