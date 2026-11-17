@@ -20,6 +20,7 @@ import pymupdf
 
 from tools import project_library
 from research_library import collections, literature, releases, web_server
+from project_text_helpers import publish_all
 
 
 class ProjectLibraryTests(unittest.TestCase):
@@ -174,7 +175,7 @@ class ProjectLibraryTests(unittest.TestCase):
         response = client.post("/settings/attach-pdf", data=form, base_url=base,
                                headers={"Origin": base})
         self.assertEqual(response.status_code, 303)
-        self.assertEqual(project_library.status(self.root)["papers"][0]["status"], "extracted")
+        self.assertEqual(project_library.status(self.root)["papers"][0]["status"], "draft")
         settings = client.get("/settings", base_url=base).get_data(as_text=True)
         self.assertNotIn('action="/settings/attach-pdf"', settings)
         self.assertIn('<details class="core-paper-inventory"><summary>All core papers (1)</summary>', settings)
@@ -184,6 +185,8 @@ class ProjectLibraryTests(unittest.TestCase):
         self.assertIn("Attached papers remain registered here.", settings)
         self.assertIn("const corePaperSearch = document.querySelector('#core-paper-search');",
                       client.get("/settings.js", base_url=base).get_data(as_text=True))
+        self.assertEqual(project_library.store(self.root).call("search_evidence", {"query": "apricot"})["result"]["items"], [])
+        publish_all(self.root)
         result = project_library.store(self.root).call("search_evidence", {"query": "apricot"})
         self.assertTrue(result["result"]["items"])
         context = project_library.store(self.root).call("get_source_context", {
@@ -335,7 +338,7 @@ class ProjectLibraryTests(unittest.TestCase):
         self.assertIn(b'Find references', result.data)
         self.assertIn(b'2026-11-09T12:00:00Z</a>', result.data)
         self.assertNotIn(b'>Search 1</a>', result.data)
-        self.assertIn(b">Extracted<", result.data)
+        self.assertIn(b">Clear-text draft<", result.data)
         self.assertIn(b">Next</a>", result.data)
         last = client.get("/library?offset=50", base_url=base)
         self.assertIn(b"Metadata only", last.data)
@@ -534,6 +537,8 @@ class ProjectLibraryTests(unittest.TestCase):
             e["release_id"] for e in after.document["collections"] if e["id"] == "metadata"))
         self.assertIn(b"Fictional paper", client.get("/publications?query=Fictional", base_url=base).data)
         pdf_root = self.root.parent / "pdf-data"
+        publish_all(self.root)
+        after = project_library.store(self.root).current()
         source = after.snapshots["core"]._bundle["sources"][0]
         collections.atomic_json(pdf_root, "fixture-downloads.json", [{
             "status": "downloaded", "doi": source["doi"], "sha256": source["sha256"],
@@ -617,7 +622,17 @@ class ProjectLibraryTests(unittest.TestCase):
                              "Authorized fictional data", "--papers", str(papers))["papers"], 1)
         self.assertEqual(run("status")["papers"][0]["status"], "awaiting_pdf")
         run("attach-pdf", "--doi", "10.0000/cli", "--pdf", str(pdf), "--confirm-identity")
-        self.assertEqual(run("status")["papers"][0]["status"], "extracted")
+        self.assertEqual(run("status")["papers"][0]["status"], "draft")
+        draft = self.root.parent / "exported-clear-text.txt"
+        run("export-text", "--doi", "10.0000/cli", "--file", str(draft))
+        self.assertIn("[[PAGE 1:", draft.read_text())
+        draft.write_text(draft.read_text() + "\nAdditional fictional draft details.")
+        run("import-text", "--doi", "10.0000/cli", "--file", str(draft),
+            "--reviewer", "CLI admin", "--reason", "Prepared fictional text")
+        editorial_id = run("status")["editorial_snapshot"]
+        run("publish-text", "--doi", "10.0000/cli", "--snapshot-id", editorial_id,
+            "--reviewer", "CLI admin", "--reason", "Compared source", "--confirm-checked")
+        self.assertEqual(run("status")["papers"][0]["status"], "published")
 
     def test_metadata_manifest_roundtrip_excludes_private_data(self):
         project_library.register(self.root, [{"doi": "10.0000/one", "title": "First"}])
@@ -646,6 +661,9 @@ class ProjectLibraryTests(unittest.TestCase):
         self.assertTrue(index.is_file())
         self.assertIn("marmalade", next(index.parent.glob("*/text.md")).read_text())
         store = project_library.store(self.root)
+        self.assertEqual(store.call("search_evidence", {"query": "marmalade"})["result"]["items"], [])
+        publish_all(self.root)
+        first["snapshot"] = project_library.store(self.root).current().release_id
         response = store.call("search_evidence", {"query": "marmalade"})
         self.assertEqual(len(response["result"]["items"]), 1)
         self.assertEqual(response["result"]["items"][0]["citation"]["locator"]["pdf_page"], 1)
@@ -686,10 +704,11 @@ class ProjectLibraryTests(unittest.TestCase):
             project_library.attach(self.root, "10.0000/two", pdf, identity_confirmed=True)
         second_pdf = self.pdf("second.pdf", "Distinct fictional observation about oranges and screening.")
         second = project_library.attach(self.root, "10.0000/two", second_pdf, identity_confirmed=True)
+        publish_all(self.root)
         self.assertNotEqual(first["snapshot"], second["snapshot"])
         self.assertEqual(len(store.load(first["snapshot"]).snapshots["core"]._bundle["sources"]), 1)
         self.assertEqual(len(store.current().snapshots["core"]._bundle["sources"]), 2)
-        self.assertEqual({row["status"] for row in project_library.status(self.root)["papers"]}, {"extracted"})
+        self.assertEqual({row["status"] for row in project_library.status(self.root)["papers"]}, {"published"})
 
     def test_invalid_pdf_does_not_activate(self):
         project_library.register(self.root, [{"doi": "10.0000/one", "title": "First"}])
@@ -714,11 +733,13 @@ class ProjectLibraryTests(unittest.TestCase):
             document.save(scan)
         result = project_library.attach(self.root, "10.0000/scan", scan, identity_confirmed=True)
         self.assertIsNotNone(result["ocr"])
+        self.assertEqual(project_library.status(self.root)["papers"][0]["status"], "draft")
+        publish_all(self.root)
         hit = project_library.store(self.root).call("search_evidence", {"query": "tangerines"})
         self.assertEqual(len(hit["result"]["items"]), 1)
         self.assertTrue(any("not human verified" in caveat for caveat in hit["result"]["items"][0]["caveats"]))
         self.assertIn(project_library.status(self.root)["papers"][0]["status"],
-                      {"extracted_with_ocr", "needs_visual_review"})
+                      {"published"})
 
     def test_citation_export_retains_occurrences_and_escapes_spreadsheet_formulas(self):
         output = self.root / "discovery"

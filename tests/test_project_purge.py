@@ -12,6 +12,7 @@ import pymupdf
 
 from research_library.build import project_library, project_purge
 from research_library import collections, releases, web_server
+from project_text_helpers import publish_all
 
 
 class ProjectPurgeTests(unittest.TestCase):
@@ -35,6 +36,7 @@ class ProjectPurgeTests(unittest.TestCase):
                 pdf.save(path)
             self.pdfs[doi] = path
             project_library.attach(self.root, "10.0000/" + doi, path, identity_confirmed=True)
+        publish_all(self.root)
         self.current_id = project_library.store(self.root).current().release_id
 
     def graph(self):
@@ -134,6 +136,7 @@ class ProjectPurgeTests(unittest.TestCase):
                 pdf.save(path)
             project_library.attach(self.root, "10.0000/" + key, path,
                                    identity_confirmed=True, title=key)
+        publish_all(self.root)
         self.assertEqual(len(project_library.status(self.root)["papers"]), 2)
         self.assertEqual(len(project_library.status(self.root)["discovered"]), 2)
         project_purge.purge(self.root, "10.0000/remove", self.pdf_root)
@@ -203,7 +206,7 @@ class ProjectPurgeTests(unittest.TestCase):
         project_purge.purge(self.root, "10.0000/remove", self.pdf_root)
         project_purge.purge(self.root, "10.0000/keep", self.pdf_root)
         self.assertEqual(project_library.status(self.root)["papers"], [])
-        self.assertIsNone(project_library.status(self.root)["snapshot"])
+        self.assertEqual(project_library.store(self.root).current().snapshots["core"]._bundle["sources"], [])
         self.assertFalse(self.pdfs["keep"].exists())
         project_library.register(self.root, [{"doi": "10.0000/new", "title": "New core"}])
         self.assertEqual(project_library.status(self.root)["papers"][0]["status"], "awaiting_pdf")

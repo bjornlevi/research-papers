@@ -89,7 +89,7 @@ def plan(root, doi, pdf_data_root, *, prepare=True):
         raise ValueError("An earlier purge has undeleted recovery data beside the project; review it before another purge")
     if any(path.name not in {"project.json", "runs", "registry", "papers", "discovery", "metadata-job.json",
                              "purge-job.json", "pdf-job.json", "batch-pdf.json", "retained-text",
-                             "library-index.sqlite", "corrections"} for path in root.iterdir()):
+                             "library-index.sqlite", "corrections", "editorial"} for path in root.iterdir()):
         raise ValueError("Unexpected project files; review them before rebuilding project data")
     project = project_library.load(root)
     doi = citation_neighborhood.doi(doi)
@@ -134,6 +134,21 @@ def plan(root, doi, pdf_data_root, *, prepare=True):
                      Path(pdf_data_root).absolute()).items()}
     protected_hashes = {digest for (identifier, digest) in downloads if identifier not in removed_dois}
     digests = {digest for (identifier, digest) in downloads if identifier in removed_dois}
+    editorial_snapshot = None
+    if (root / "editorial/active.json").exists():
+        state = releases.read_json(releases.safe_file(root / "editorial", "active.json").read_bytes())
+        editorial_snapshot = collections.digest(state["active"])
+        for path in (root / "editorial/releases").iterdir():
+            if prepare:
+                sources = releases.validate(path, allowed_profiles=["private_context"])._bundle["sources"]
+            else:
+                manifest = releases.read_json(releases.safe_file(path, "manifest.json").read_bytes())
+                records = releases.safe_file(path, "records.json").read_bytes()
+                if releases.sha256(records) != manifest["files"]["records.json"]["sha256"]:
+                    raise ValueError("Editorial source inventory checksum mismatch")
+                sources = releases.read_json(records)["sources"]
+            for source in sources:
+                (digests if _doi(source["doi"]) in removed_dois else protected_hashes).add(source["sha256"])
     registry = project_library.store(root)
     current, snapshot = None, None
     if (root / "registry/active.json").exists():
@@ -176,6 +191,7 @@ def plan(root, doi, pdf_data_root, *, prepare=True):
         "root": root, "doi": doi, "project": project, "remaining": remaining, "graphs": graphs,
         "removed_dois": removed_dois, "digests": digests, "shared": shared, "current": current,
         "snapshot": snapshot, "graph_versions": graph_versions,
+        "editorial_snapshot": editorial_snapshot,
         "related_removed": len(all_keys - keep_keys),
     }
 
@@ -190,7 +206,7 @@ def fingerprint(plan):
         "project": plan["project"], "snapshot": plan["snapshot"],
         "removed_dois": sorted(plan["removed_dois"]), "digests": sorted(plan["digests"]),
         "shared": [str(path) for path in plan["shared"]],
-        "graphs": plan["graph_versions"],
+        "graphs": plan["graph_versions"], "editorial": plan["editorial_snapshot"],
     }))
 
 
@@ -213,6 +229,31 @@ def purge(root, doi, pdf_data_root, *, progress=None, expected_plan=None):
             project = deepcopy(data["project"])
             del project["papers"][data["doi"]]
             collections.atomic_json(stage, "project.json", project)
+            if (root / "editorial/active.json").exists():
+                from . import project_text, project_edit
+                draft = project_text.editorial_store(root).current().snapshots["core"]
+                edited = deepcopy(draft._bundle)
+                if any(edited[key] for key in ("claims", "issues", "relationships")):
+                    raise ValueError("Editorial curated dependencies require a dependency-aware purge")
+                edited["sources"] = [s for s in edited["sources"] if _doi(s["doi"]) not in data["removed_dois"]]
+                retained = {s["id"] for s in edited["sources"]}
+                for section in ("units", "tables"):
+                    edited[section] = [item for item in edited[section] if item["citation"]["source_id"] in retained]
+                project_text.activate(stage, edited,
+                    {key: value for key, value in draft._manifest["authorization"].items() if key in retained},
+                    editorial=True)
+                for source in edited["sources"]:
+                    for event in project_edit.history(root, source["id"]):
+                        collections.atomic_json(stage / "corrections", releases.sha256(releases.encode(event)) + ".json", event)
+                for path in (root / "editorial/releases").iterdir():
+                    historical = releases.validate(path, allowed_profiles=["private_context"])
+                    if all(_doi(s["doi"]) not in data["removed_dois"] for s in historical._bundle["sources"]):
+                        project_text.editorial_store(stage).releases.install(path)
+                for path in (root / "editorial/registries").glob("*.json"):
+                    doc = releases.read_json(path.read_bytes())
+                    safe = {p.name for p in (stage / "editorial/releases").iterdir()}
+                    if all(entry["release_id"] in safe for entry in doc["collections"]):
+                        collections.atomic_json(stage / "editorial/registries", path.name, doc)
             registry = project_library.store(stage)
             old = data["current"]
             if old:
@@ -226,6 +267,9 @@ def purge(root, doi, pdf_data_root, *, progress=None, expected_plan=None):
                 ids = {source["id"] for source in bundle["sources"]}
                 bundle["units"] = [unit for unit in bundle["units"] if unit["citation"]["source_id"] in ids]
                 bundle["tables"] = [table for table in bundle["tables"] if table["citation"]["source_id"] in ids]
+                if not bundle["sources"]:
+                    from . import project_text
+                    project_text.activate(stage, bundle, {})
                 if bundle["sources"]:
                     destination = stage / "retained-evidence"
                     grants = {key: value for key, value in original._manifest["authorization"].items() if key in ids}

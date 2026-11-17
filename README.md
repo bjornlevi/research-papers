@@ -1,7 +1,7 @@
 # Research Library
 
 Build a private, source-linked research library from your own core papers.
-Search extracted PDF pages in a browser, through a read-only JSON API, or
+Publish admin-cleaned clear text for search in a browser, through a read-only JSON API, or
 through an MCP client. Papers, extracts and project data are not included in
 the repository and are not served as original files.
 
@@ -37,7 +37,20 @@ Stop it with `make web-off`. The project is stored under `releases/project/`
 by default. Use `PROJECT_ROOT=/path/to/project` consistently with both make
 commands to select another project.
 
-Project settings also includes **Reset to factory settings**. After typing
+Startup checks the lightweight `/healthz` endpoint, not the Settings page.
+It confirms the website is serving requests, not that project evidence is valid.
+Settings can take longer to load while checking local PDFs.
+
+To restart setup without losing material, use **Soft reset (keep material)**
+in Project settings and confirm with `SOFT RESET`. The entire project moves
+to a dated folder under `releases/project-preserved/` (or `<project-root>-preserved/`).
+Upload your Core papers again: matching DOIs reuse checksum-verified PDFs,
+clear text, tables and correction history as drafts, without re-extraction.
+New discovery also reuses matching material. Discovery selections start fresh,
+and restored text is not published for RAG until an admin explicitly publishes it.
+Preserved folders are outside the active project and survive its purge or factory reset.
+
+Project settings also includes the destructive **Reset to factory settings**. After typing
 `RESET PROJECT` to confirm, it permanently removes everything inside the
 configured project root, including PDFs, extracted evidence, snapshots,
 discovery output, and settings. It cannot be undone.
@@ -46,32 +59,46 @@ Registered papers start as **awaiting PDF**. After checking that a PDF matches
 the title and DOI and that you can use it privately, put it in
 `releases/pdf-data/` and click **awaiting_pdf** in that paper's status in
 Project settings. Select the matching local file, confirm its identity and authorization,
-then click **Attach and extract PDF**. This shared folder is preserved by project
-reset; imported project copies and extracted evidence are not. Override the
+then click **Attach PDF and prepare draft**. This shared folder survives either
+reset; imported project copies and extracted evidence survive only soft reset. Override the
 folder with `make web PDF_DATA_ROOT=/path/to/pdfs` (restart the web app first).
 PDFs already attached to papers in the active project are omitted from the
 selection list, based on their checksums. PDFs are never served as files.
 
-Alternatively, click **Find PDF** for a core paper awaiting PDF. It looks for an
-explicitly licensed open-access copy and downloads it, with acquisition provenance,
+Alternatively, click **Find PDF** for a core paper awaiting PDF. It first checks
+the local PDF data folder, including subfolders, using recorded DOI/checksum,
+title filenames, or DOI/title on the first page or in PDF metadata. Local matches
+are suggestions, not identity or permission verification. If no local match is
+found, it looks for an explicitly licensed open-access copy and downloads it, with acquisition provenance,
 to the PDF data folder. Review the progress/result page, inspect the PDF locally,
 then select and confirm it before extraction; finding a PDF does not attach it.
 These controls are also available on **Library** for discovered
-papers with a DOI and title. Extracting a discovered paper makes its text
-available to AI without adding it to core or expanding discovery seeds.
+papers with a DOI and title. Extracting a discovered paper creates a private draft.
+Publishing its clear text makes it available to AI without adding it to Core papers or expanding discovery seeds.
 For batches, use the per-paper **Locate PDF: off/on** buttons or select the page/all
 matching papers, then **Locate selected PDFs**. Review the saved results and
 individually confirm PDFs before **Attach and extract confirmed PDFs on this page**.
+**Project settings → Attach PDFs → Find all** runs local-first lookup for all
+Core papers awaiting PDF and opens that same review workflow.
 Relationship/status filters, background progress, pause/resume and failed-item
 retries are available in the [batch workflow](docs/independent-projects.md#batch-pdf-location-and-extraction).
 
-For extracted papers, **View and correct extracted data** opens a page-by-page
-editor for text/OCR, paper metadata and structured tables. Saving requires your
-name, a reason and confirmation against the original PDF; it creates a new
-version for search/AI while preserving the original and a before/after audit.
+For attached papers, **View and correct extracted data** opens a readable whole
+document with explicit edit mode for text/OCR, paper metadata and structured tables.
+Download/import a UTF-8 draft for manual cleanup or use your own LLM.
+Saving creates an editorial version, not RAG evidence. **Publish clear text for
+retrieval** separately requires your name, a reason and confirmation against the
+original PDF. It activates a new search/AI version while retaining old versions.
 See [correcting extracted data](docs/independent-projects.md#view-and-correct-extracted-data).
 New PDF extractions automatically format native text into column-aware
 paragraphs while retaining raw text in private extraction checkpoints.
+
+For continuous reading, select **Read whole document** from a PDF source or
+page-context view. All retained pages are shown together with page citations and
+extraction warnings. AI clients can use `get_source_document` and follow
+`next_offset` until null. This also works for existing attachments; it does not
+guess missing text or repair split words. See
+[whole-document reading](docs/independent-projects.md#read-a-whole-retained-document).
 
 Choose **Find related papers** in the sidebar for **Find references** or
 **Find citing papers**. Searches work before attaching
@@ -153,3 +180,10 @@ not need migration. Container deployment variables now use the
 Run `make test` for portable tests and `make test-project` for the
 independent-project ingestion and citation tests. Further implementation and
 deployment references are in [docs](docs/).
+## Clear-text publication workflow
+
+Independent libraries separate article registration, PDF sources, editable
+clear-text drafts and published RAG evidence. Extraction prepares a draft; an
+admin supplies/cleans text with their own tools and explicitly publishes it.
+See [architecture](docs/architecture.md) and
+[admin workflow](docs/independent-projects.md#clear-text-drafts-and-publication).

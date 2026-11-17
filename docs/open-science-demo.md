@@ -118,11 +118,17 @@ Check the result:
 .venv/bin/research-project --root releases/open-science-demo status
 ```
 
-The attached paper should be `extracted` (or indicate an OCR/visual-review
-caveat); the other five should remain `awaiting_pdf`. The project creates a
-source-linked snapshot and formatting-only text views. The original PDF stays
-local and is not served as a file; extracted passages are available through
-the configured source-linked retrieval services.
+The attached paper should be `draft`; the other five should remain `awaiting_pdf`.
+The project creates a source-linked editorial snapshot and text views. The
+original PDF stays local and is not served as a file. Extraction is not
+publication: search and AI return no passages until the admin approves clear text.
+
+Start the browser as below, open **Library → View and correct extracted data**,
+and compare the draft with the PDF. Clean it manually, or download the page-marked
+draft and use your own tools/LLM, then import it in edit mode. **Save clear-text
+draft** preserves edits without making them retrievable. From the read-only view,
+use **Publish clear text for retrieval**, entering your name, reason and
+source-comparison confirmation. Only then proceed with retrieval checks.
 
 ## 5. Try search in the browser
 

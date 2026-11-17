@@ -49,9 +49,13 @@ def metadata_client_options(root):
     return {"openalex_api_key": key}
 
 
-def save_named_pdf(pdf_data_root, data, digest, title):
+def pdf_title_stem(title):
     normalized = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode()
-    stem = re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-")[:140].rstrip("-") or "paper"
+    return re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-")[:140].rstrip("-") or "paper"
+
+
+def save_named_pdf(pdf_data_root, data, digest, title):
+    stem = pdf_title_stem(title)
     filename = stem + ".pdf"
     counter = 0
     while True:
@@ -63,6 +67,86 @@ def save_named_pdf(pdf_data_root, data, digest, title):
         counter += 1
         suffix = digest[:12] + (f"-{counter}" if counter > 1 else "")
         filename = f"{stem}-{suffix}.pdf"
+
+
+def local_pdf_files(pdf_data_root):
+    """Enumerate local PDFs recursively without following symlinks."""
+    root = Path(pdf_data_root).absolute()
+    if root.resolve() != root:
+        raise ValueError("PDF data folder cannot contain a symlinked path")
+    if not root.exists():
+        return {}
+    if not root.is_dir():
+        raise ValueError("PDF data folder must be a directory")
+    files = {}
+    def scan_error(error):
+        raise error
+    for folder, directories, names in os.walk(root, followlinks=False, onerror=scan_error):
+        directories[:] = sorted(name for name in directories if not (Path(folder) / name).is_symlink())
+        for name in sorted(names):
+            path = Path(folder) / name
+            if path.suffix.casefold() == ".pdf" and not path.is_symlink() and path.is_file():
+                files[path.relative_to(root).as_posix()] = path
+    return files
+
+
+def find_local_pdf(doi, title, pdf_data_root):
+    """Suggest a local copy using recorded acquisition, filename or first-page metadata."""
+    import pymupdf
+    files = local_pdf_files(pdf_data_root)
+    known = downloaded_pdf_metadata(Path(pdf_data_root))
+    normalized_title = re.sub(r"[^a-z0-9]", "", unicodedata.normalize(
+        "NFKD", title).encode("ascii", "ignore").decode().lower())
+    title_stem = pdf_title_stem(title)
+    doi_pattern = re.compile(re.escape(doi) + r"(?=$|[\s,;:)\]}]|\.(?:\s|$))", re.IGNORECASE)
+    correction_pattern = re.compile(
+        r"^\s*(?:(?:author|publisher)\s+correction|correction|corrigendum|erratum)\b", re.IGNORECASE | re.MULTILINE)
+    correction_requested = bool(correction_pattern.search(title))
+    attempts = []
+    for filename, path in sorted(files.items(), key=lambda item: (len(Path(item[0]).parts), item[0])):
+        if path.stat().st_size > provided_sources.MAX_BYTES:
+            attempts.append({"filename": filename, "error": "Local PDF exceeds the 64 MiB limit"})
+            continue
+        digest = releases.sha256(path.read_bytes())
+        acquisition = known.get(("doi:" + doi, digest))
+        basis = "recorded acquisition DOI and checksum" if acquisition else None
+        stem = path.stem.casefold()
+        if basis is None and title_stem and (stem == title_stem or stem.startswith(title_stem + "-")
+                and re.fullmatch(r"[a-f0-9]{12}(?:-\d+)?", stem[len(title_stem) + 1:])):
+            basis = "title filename"
+        try:
+            with pymupdf.open(path) as document:
+                if document.is_encrypted or not len(document):
+                    attempts.append({"filename": filename, "error": "Local PDF is encrypted or empty"})
+                    continue
+                first_page = document[0].get_text()[:100_000]
+                metadata = document.metadata or {}
+                correction_pdf = bool(correction_pattern.search(
+                    first_page + "\n" + (metadata.get("title") or "")))
+                if correction_pdf and not correction_requested:
+                    if basis is not None or doi_pattern.search(first_page):
+                        attempts.append({"filename": filename,
+                                         "error": "Correction notice is not the original paper; its cited DOI is not PDF identity"})
+                    continue
+                if basis is None and doi_pattern.search(first_page + "\n" + " ".join(
+                        value for value in metadata.values() if isinstance(value, str))):
+                    basis = "DOI in first page or PDF metadata"
+                if basis is None and len(normalized_title) >= 25:
+                    text = re.sub(r"[^a-z0-9]", "", unicodedata.normalize(
+                        "NFKD", first_page + "\n" + (metadata.get("title") or "")
+                        ).encode("ascii", "ignore").decode().lower())
+                    if normalized_title in text:
+                        basis = "title in first page or PDF metadata"
+        except pymupdf.FileDataError:
+            attempts.append({"filename": filename, "error": "Local file is not a readable PDF"})
+            continue
+        if basis:
+            return {
+                "status": "local_found", "doi": doi, "filename": filename, "sha256": digest,
+                "match_basis": basis, "attempts": attempts,
+                "identity_note": "Suggested local match; operator must verify title, DOI and private-use permission.",
+            }, attempts
+    return None, attempts
 
 
 def library_paper(root, doi, title=None):
@@ -98,6 +182,9 @@ def find_pdf(root, doi, pdf_data_root, *, title=None):
     paper = library_paper(root, doi, title)
     if pdf_data_root.resolve() != pdf_data_root:
         raise ValueError("PDF data folder cannot contain a symlinked path")
+    local, local_attempts = find_local_pdf(doi, paper["title"], pdf_data_root)
+    if local is not None:
+        return local
     with closing(literature.MetadataClient(**metadata_client_options(root))) as client:
         work, source = client.get("https://api.openalex.org/works/https://doi.org/" + doi,
                                   {"select": citation_neighborhood.FIELDS})
@@ -113,6 +200,7 @@ def find_pdf(root, doi, pdf_data_root, *, title=None):
             client, record, candidates, citation_neighborhood.RequestPacer())
     entry.update(doi=doi, year=(work.get("publication_date") or "")[:4],
                  metadata_source=citation_neighborhood.source_ref(source))
+    entry["local_attempts"] = local_attempts
     with literature_update.writer_lock(root):
         library_paper(root, doi, paper["title"])
         pdf_data_root.mkdir(parents=True, exist_ok=True)
@@ -342,17 +430,29 @@ def export_manifest(root, path):
 
 
 def initialize(root, name, authorization, rows=None):
+    from . import project_preservation
     root = Path(root)
     if root.exists() or root.is_symlink():
         raise ValueError("Project directory already exists; choose a new directory")
     if not name.strip() or len(name) > 256 or not authorization.strip():
         raise ValueError("Project name and private-use authorization are required")
     papers = validated_papers(rows)[0] if rows is not None else {}
-    collections.atomic_json(root, "project.json", {
-        "schema_version": 1, "name": name.strip(), "authorization": authorization.strip(), "papers": papers})
+    with literature_update.writer_lock(root):
+        if root.exists() or root.is_symlink():
+            raise ValueError("Project directory already exists; choose a new directory")
+        root.parent.mkdir(parents=True, exist_ok=True)
+        stage = Path(tempfile.mkdtemp(prefix="." + root.name + "-init-", dir=root.parent))
+        try:
+            collections.atomic_json(stage, "project.json", {
+                "schema_version": 1, "name": name.strip(), "authorization": authorization.strip(), "papers": papers})
+            project_preservation.restore(stage, papers, preserved_for=root)
+            stage.rename(root)
+        finally:
+            if stage.exists():
+                shutil.rmtree(stage)
 
 
-def reset(root):
+def check_reset_root(root):
     root = Path(root)
     if root.is_symlink() or not root.is_dir():
         raise ValueError("Project root is missing or is a symlink")
@@ -362,30 +462,38 @@ def reset(root):
     cwd = Path.cwd().resolve()
     if resolved == Path(resolved.anchor) or resolved == cwd or cwd.is_relative_to(resolved):
         raise ValueError("Refusing to reset a filesystem root or an ancestor of the working directory")
+
+
+def reset(root):
+    root = Path(root)
+    check_reset_root(root)
     load(root)
     shutil.rmtree(root)
 
 
 def register(root, rows):
+    from . import project_preservation
     with literature_update.writer_lock(root):
         project = load(root)
         project["papers"], added = validated_papers(rows, project["papers"])
+        project_preservation.restore(root, added)
         collections.atomic_json(Path(root), "project.json", project)
         return added
 
 
-def attach(root, doi, pdf, *, identity_confirmed, license=None, title=None, expected_sha256=None):
+def attach(root, doi, pdf, *, identity_confirmed, license=None, title=None, expected_sha256=None, extract=True):
     if not identity_confirmed:
         raise ValueError("Confirm that the PDF matches the registered title and DOI")
     root = Path(root)
     doi = citation_neighborhood.doi(doi)
     with literature_update.writer_lock(root):
+        from . import project_text
         project = load(root)
         paper = library_paper(root, doi, title)
-        registry = store(root)
-        current = registry.current() if (root / "registry/active.json").exists() else None
+        registry = project_text.editorial_store(root)
+        current = registry.current() if (registry.root / "active.json").exists() else None
         if current and any(s["doi"].lower() == doi for s in current.snapshots["core"]._bundle["sources"]):
-            raise ValueError("This DOI already has extracted evidence; replacement requires a separate workflow")
+            raise ValueError("This DOI already has an attached source; replacement requires a separate workflow")
         if Path(pdf).stat().st_size > provided_sources.MAX_BYTES:
             raise ValueError("The PDF exceeds the 64 MiB limit")
         data = Path(pdf).read_bytes()
@@ -419,16 +527,33 @@ def attach(root, doi, pdf, *, identity_confirmed, license=None, title=None, expe
             "license": license, "license_source": "operator" if license else None,
         }
         source = provided_sources.source_for(item, project["authorization"])
-        result = literature_ingest.extract_pdf(target, source)
+        if extract:
+            result = literature_ingest.extract_pdf(target, source)
+        else:
+            import pymupdf
+            with pymupdf.open(target) as document:
+                if document.is_encrypted or not 1 <= len(document) <= literature_ingest.POLICY["max_pages"]:
+                    raise ValueError("PDF is encrypted, empty or exceeds the page limit")
+                result = {"status": "not_extracted",
+                          "pages": [{"pdf_page": number, "text": ""} for number in range(1, len(document) + 1)]}
         result.update(publication_id=item["publication_id"], source_sha256=digest,
                       policy=literature_ingest.POLICY, extracted_at=now)
         runs = root / "runs"
         runs.mkdir(exist_ok=True)
         run = Path(tempfile.mkdtemp(prefix="import-", dir=runs))
-        built = literature_update.source_bundle(run / "source", papers,
-                                                     item["publication_id"], source, result)
+        built = (literature_update.source_bundle(run / "source", papers, item["publication_id"], source, result)
+                 if extract else project_text.attached_bundle(source, result))
         if built["bundle"] is None:
-            raise ValueError("No text extracted, including OCR; inspect the PDF")
+            built = project_text.attached_bundle(source, result)
+        present = {unit["citation"]["locator"]["pdf_page"] for unit in built["bundle"]["units"]}
+        missing = project_text.attached_bundle(source, result)
+        for unit in missing["bundle"]["units"]:
+            unit["citation"]["provenance"] = built["bundle"]["sources"][0]["provenance"]
+        built["bundle"]["units"].extend(unit for unit in missing["bundle"]["units"]
+                                        if unit["citation"]["locator"]["pdf_page"] not in present)
+        project_text.ensure_editorial(root)
+        registry = project_text.editorial_store(root)
+        current = registry.current()
         identity_note = " Operator confirmed the registered title and DOI; identity not independently verified."
         for entry in built["bundle"]["sources"]:
             entry["provenance"] += identity_note
@@ -462,27 +587,27 @@ def attach(root, doi, pdf, *, identity_confirmed, license=None, title=None, expe
         snapshot = registry.publish(document)
         return {"doi": doi, "snapshot": snapshot, "release": evidence_id, "pages": len(result["pages"]),
                 "extraction": result["status"], "ocr": built["ocr"],
+                "text_status": "draft", "retrievable": False,
                 "text_views": str(run / "text" / "index.md"),
                 "identity": "operator-confirmed; not independently verified"}
 
 
 def status(root):
+    from . import project_text
     project = load(root)
     registry = store(root)
-    current = registry.current() if (Path(root) / "registry/active.json").exists() else None
+    published = registry.current() if (Path(root) / "registry/active.json").exists() else None
+    workspace = project_text.editorial_store(root)
+    current = workspace.current() if (workspace.root / "active.json").exists() else None
     bundle = current.snapshots["core"]._bundle if current else {"sources": [], "units": []}
+    published_bundle = published.snapshots["core"]._bundle if published else project_text.empty_bundle()
     sources = {s["doi"].lower(): s for s in bundle["sources"]}
     def state(doi):
         if doi not in sources:
             return "awaiting_pdf"
-        caveats = [caveat for unit in bundle["units"] if unit["citation"]["source_id"] == sources[doi]["id"]
-                   for caveat in unit["caveats"]]
-        if any("needs_visual_review" in caveat for caveat in caveats):
-            return "needs_visual_review"
-        if any(caveat.startswith("Separate local OCR") for caveat in caveats):
-            return "extracted_with_ocr"
-        return "extracted"
-    return {"name": project["name"], "snapshot": current.release_id if current else None,
+        return project_text.publication_state(bundle, published_bundle, sources[doi]["id"])
+    return {"name": project["name"], "snapshot": published.release_id if published else None,
+            "editorial_snapshot": current.release_id if current else None,
             "papers": [{"doi": doi, "title": (sources[doi].get("bibliography", {}).get("title") or row["title"])
                         if doi in sources else row["title"],
                         "status": state(doi)}
@@ -554,6 +679,11 @@ def discover(root, output, *, directions=None):
             output, manifest, citation_neighborhood.CachedAPI(output / "responses", client), project_scope=True,
             **({"directions": directions} if directions is not None else {}))
     from . import project_purge
+    from . import project_preservation
+    with literature_update.writer_lock(root):
+        project_preservation.restore(root, {
+            node["record"]["identifiers"]["doi"] for node in graph["nodes"].values()
+            if node["record"]["identifiers"].get("doi")})
     project_purge.discovery_index(output, graph)
     csv_path = export_citations(output)
     failures = sum(any(provider["status"] not in {"complete_indexed_neighborhood", "complete_deposited_references"}
@@ -583,7 +713,27 @@ def main():
     pdf.add_argument("--pdf", type=Path, required=True)
     pdf.add_argument("--confirm-identity", action="store_true", help="Confirm PDF matches the registered DOI and title")
     pdf.add_argument("--license")
+    pdf.add_argument("--no-extract", action="store_true", help="Attach the PDF with empty page drafts for manual text import")
+    migration = commands.add_parser("migrate-text-workflow", help="Separate editorial drafts from retrieval")
+    migration.add_argument("--withdraw-existing", action="store_true",
+                           help="Withdraw active text pending admin publication; historical snapshots remain")
+    text = commands.add_parser("import-text", help="Save a UTF-8 page-marked clear-text draft")
+    text.add_argument("--doi", required=True)
+    text.add_argument("--file", type=Path, required=True)
+    text.add_argument("--reviewer", required=True)
+    text.add_argument("--reason", required=True)
+    export_text = commands.add_parser("export-text", help="Export a page-marked UTF-8 draft for external editing")
+    export_text.add_argument("--doi", required=True)
+    export_text.add_argument("--file", type=Path, required=True)
+    publish = commands.add_parser("publish-text", help="Explicitly publish admin-checked clear text for RAG")
+    publish.add_argument("--doi", required=True)
+    publish.add_argument("--snapshot-id", required=True, help="Editorial snapshot from status")
+    publish.add_argument("--reviewer", required=True)
+    publish.add_argument("--reason", required=True)
+    publish.add_argument("--confirm-checked", action="store_true")
     commands.add_parser("status")
+    soft = commands.add_parser("soft-reset", help="Preserve all material and return to Core papers setup")
+    soft.add_argument("--confirm", action="store_true", help="Confirm restarting the active project without deletion")
     manifest = commands.add_parser("export-manifest", help="Export DOI/title metadata only")
     manifest.add_argument("file", type=Path)
     discovery = commands.add_parser("discover")
@@ -602,9 +752,51 @@ def main():
             result = {"added": register(args.root, read_csv(args.file))}
         elif args.command == "attach-pdf":
             result = attach(args.root, args.doi, args.pdf, identity_confirmed=args.confirm_identity,
-                            license=args.license)
+                            license=args.license, extract=not args.no_extract)
         elif args.command == "status":
             result = status(args.root)
+        elif args.command == "soft-reset":
+            from . import project_preservation
+            if not args.confirm:
+                raise ValueError("Use --confirm to restart the project while preserving its material")
+            result = project_preservation.soft_reset(args.root)
+        elif args.command == "migrate-text-workflow":
+            from . import project_text
+            result = project_text.migrate(args.root, withdraw=args.withdraw_existing)
+        elif args.command in {"publish-text", "import-text", "export-text"}:
+            from . import project_text, project_edit
+            current = project_text.editorial_store(args.root).current()
+            bundle = current.snapshots["core"]._bundle
+            source = next((s for s in bundle["sources"] if s["doi"] == citation_neighborhood.doi(args.doi)), None)
+            if source is None:
+                raise ValueError("Attach the source PDF before providing clear text")
+            if args.command == "export-text":
+                units = project_edit.document_units(bundle, source["id"])
+                with args.file.open("x", encoding="utf-8") as stream:
+                    stream.write(project_edit.document_draft(units))
+                result = {"file": str(args.file), "editorial_snapshot": current.release_id, "status": "draft"}
+            elif args.command == "publish-text":
+                result = project_text.publish(args.root, snapshot_id=args.snapshot_id, source_id=source["id"],
+                    reviewer=args.reviewer, reason=args.reason, checked=args.confirm_checked)
+            else:
+                units = project_edit.document_units(bundle, source["id"])
+                if not units:
+                    raise ValueError("No retained pages; add missing pages before importing text")
+                tables = []
+                for table in bundle["tables"]:
+                    if table["citation"]["source_id"] == source["id"]:
+                        page = next(u for u in units if u["citation"]["locator"] == table["citation"]["locator"])
+                        tables.append({"id": table["id"], "unit_id": page["id"],
+                                       **{key: table[key] for key in project_edit.TABLE_FIELDS}})
+                try:
+                    text = args.file.read_text(encoding="utf-8-sig")
+                except UnicodeDecodeError as error:
+                    raise ValueError("Clear text must be UTF-8 encoded") from error
+                result = project_edit.correct(args.root, snapshot_id=current.release_id, source_id=source["id"],
+                    unit_id=units[0]["id"], text=text, whole_document=True,
+                    bibliography={k: v or "" for k, v in source["bibliography"].items()},
+                    source_url=source["url"] or "", tables=tables, reviewer=args.reviewer,
+                    reason=args.reason, checked=False)
         elif args.command == "export-manifest":
             result = {"manifest": str(args.file), "papers": export_manifest(args.root, args.file)}
         elif args.command == "discover":

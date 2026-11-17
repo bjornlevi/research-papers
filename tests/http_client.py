@@ -16,7 +16,7 @@ async def exercise(url, token, expected):
             async with ClientSession(reader, writer) as client:
                 await client.initialize()
                 tools = await client.list_tools()
-                assert len(tools.tools) == 12
+                assert len(tools.tools) == 13
                 for tool in tools.tools:
                     assert tool.outputSchema["type"] == "object"
                     if tool.name == "search_evidence":
@@ -33,7 +33,7 @@ async def exercise(url, token, expected):
                     if tool == "search_evidence" and arguments.get("mode") == "fts5":
                         assert "mode='plain'" in result.structuredContent["error"]["message"]
                 assert session_id()
-    print("PASS: SDK-only HTTP client, twelve tools, exact transport parity and errors")
+    print("PASS: SDK-only HTTP client, thirteen tools, exact transport parity and errors")
 
 
 if __name__ == "__main__":

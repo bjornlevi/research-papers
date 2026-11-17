@@ -58,6 +58,9 @@ def acceptance(registry, *, profiles, evidence_collection, catalog_collection, t
         ("get_table", {"table_id": original._bundle["tables"][0]["id"], "limit": 1, **common}),
         ("get_source_issue", {"issue_id": original._bundle["issues"][0]["record"]["id"], **common}),
         ("get_related_evidence", {"evidence_id": original._bundle["claims"][0]["id"], **common}),
+        ("get_source_document", {"source_id": next(source["id"] for source in original._bundle["sources"]
+                                                   if source["format"] == "pdf"),
+                                 "max_characters": 200, **common}),
     ]
     expected = {"cases": [{"tool": tool, "arguments": args, "response": store.call(tool, args)}
                           for tool, args in calls], "errors": [
@@ -110,7 +113,7 @@ def acceptance(registry, *, profiles, evidence_collection, catalog_collection, t
         "passed": True, "application_version": __version__, "tool_schema_version": contracts.SCHEMA_VERSION,
         "scope": "authorized real metadata and unchanged iStopMM" if real else "synthetic fixtures",
         "registry_snapshot_id": sid, "catalog_id": metadata.release_id, "coverage": counts,
-        "twelve_tool_stdio_http_parity": True, "pagination_complete": exhaustive,
+        "all_tool_stdio_http_parity": True, "pagination_complete": exhaustive,
         "pagination_boundary_samples_passed": True,
         "evidence_exact_fidelity": True, "backing_bytes_unchanged": True,
         "scientific_approval": False, "seconds": round(time.monotonic() - start, 3),

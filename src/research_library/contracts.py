@@ -10,12 +10,14 @@ from jsonschema import Draft202012Validator
 
 from .retrieval import MAX_QUERY_LENGTH
 
-SCHEMA_VERSION = "2.3.0"
+SCHEMA_VERSION = "2.4.0"
 MAX_RESPONSE_BYTES = 65_536
+MAX_DOCUMENT_CHARACTERS = 8192
+MAX_DOCUMENT_OFFSET = 100_000_000
 CORPUS_SCOPE = "Matches are limited to this evidence release; no match is not global scientific absence."
 DOCUMENT = json.loads(files("research_library").joinpath("schemas/contract-v2.json").read_text())
 
-ToolName = Literal["corpus_status", "list_collections", "list_sources", "search_evidence", "get_claim", "get_source_context",
+ToolName = Literal["corpus_status", "list_collections", "list_sources", "search_evidence", "get_claim", "get_source_context", "get_source_document",
                    "get_table", "get_source_issue", "get_related_evidence",
                    "list_publications", "get_publication", "catalog_status"]
 
@@ -101,6 +103,12 @@ TOOLS: dict[ToolName, ToolSpec] = {
         "unit_id": ref("id"),
         "max_characters": {"type": "integer", "minimum": 1, "maximum": 2048, "default": 1024},
     }, ("unit_id",), "context"),
+    "get_source_document": ToolSpec({
+        "source_id": ref("id"),
+        "offset": {"type": "integer", "minimum": 0, "maximum": MAX_DOCUMENT_OFFSET, "default": 0},
+        "max_characters": {"type": "integer", "minimum": 1, "maximum": MAX_DOCUMENT_CHARACTERS,
+                           "default": 4096},
+    }, ("source_id",), "source_document"),
     "get_table": ToolSpec({"table_id": ref("id"), **PAGING}, ("table_id",), "table"),
     "get_source_issue": ToolSpec({"issue_id": ref("id")}, ("issue_id",), "issue"),
     "get_related_evidence": ToolSpec({"evidence_id": ref("id"), **PAGING},
@@ -265,6 +273,28 @@ DOCUMENT["$defs"].update({
     }),
 })
 DOCUMENT["$defs"]["collection_info"]["properties"]["kind"] = {"enum": ["evidence", "catalog"]}
+DOCUMENT["$defs"].update({
+    "document_offset": {"type": "integer", "minimum": 0, "maximum": MAX_DOCUMENT_OFFSET},
+    "document_segment": {
+        "allOf": [ref("evidence")], "type": "object",
+        "properties": {
+            **{key: ref("document_offset") for key in ("start", "end", "unit_offset")},
+            "extraction_truncated": {"type": "boolean"},
+            "source_issue_ids": array_schema(ref("id"), 100),
+        },
+        "required": ["start", "end", "unit_offset", "extraction_truncated", "source_issue_ids"],
+        "unevaluatedProperties": False,
+    },
+    "source_document": object_schema({
+        "source_id": ref("id"), "source_sha256": ref("hash"), "doi": ref("id"),
+        "text": {"type": "string", "maxLength": MAX_DOCUMENT_CHARACTERS},
+        "offset": ref("document_offset"), "total_characters": ref("document_offset"),
+        "next_offset": {"anyOf": [ref("document_offset"), {"type": "null"}]},
+        "unit_count": {"type": "integer", "minimum": 1},
+        "extraction_incomplete": {"type": "boolean"},
+        "segments": array_schema(ref("document_segment"), 100),
+    }),
+})
 
 
 def schema(tool: ToolName, direction: Literal["input", "output"]) -> dict[str, Any]:
@@ -380,6 +410,22 @@ def validate_response(tool: ToolName, arguments: dict[str, Any], response: Succe
             raise ValueError("next_offset must advance by the number of returned records")
     if tool == "get_source_context" and len(result["text"]) > selected["max_characters"]:
         raise ValueError("Context exceeds requested character limit")
+    if tool == "get_source_document":
+        if result["source_id"] != selected["source_id"] or result["offset"] != selected["offset"]:
+            raise ValueError("Document does not match the requested source or offset")
+        end = result["offset"] + len(result["text"])
+        if len(result["text"]) > selected["max_characters"] or end > result["total_characters"]:
+            raise ValueError("Document exceeds requested character limit or retained length")
+        expected = end if end < result["total_characters"] else None
+        if result["next_offset"] != expected or (expected is not None and not result["text"]):
+            raise ValueError("Document continuation must advance by returned characters")
+        for segment in result["segments"]:
+            if not result["offset"] <= segment["start"] <= segment["end"] <= end:
+                raise ValueError("Document segment lies outside returned text")
+            citation = segment["citation"]
+            if (citation["source_id"], citation["source_sha256"], citation["doi"]) != (
+                    result["source_id"], result["source_sha256"], result["doi"]):
+                raise ValueError("Document segment cites a different source")
 
 
 def success(tool: ToolName, release_id: str, result: dict[str, Any],

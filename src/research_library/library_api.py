@@ -20,6 +20,7 @@ def respond(current, request):
         "sources": {"paper", "limit", "offset"},
         "units": {"source_id", "limit", "offset"},
         "text": {"unit_id", "offset", "limit"},
+        "document": {"source_id", "offset", "max_characters"},
         "search": {"query", "paper", "limit", "offset"},
     }
     if endpoint not in allowed:
@@ -47,6 +48,11 @@ def respond(current, request):
     limit = int(params.get("limit", "2048" if endpoint == "text" else "20"))
     if offset and isinstance(current, collections.CollectionSnapshot) and not params.get("snapshot_id"):
         raise retrieval.RetrievalError("Pin snapshot_id for pagination")
+    if endpoint == "document":
+        return json_response(current.call("get_source_document", {
+            **scope, "source_id": params.get("source_id", ""), "offset": offset,
+            "max_characters": int(params.get("max_characters", "4096")),
+        }))
     if endpoint == "text":
         unit_id = params.get("unit_id", "")
         contracts.request("get_source_context", {"unit_id": unit_id, "max_characters": limit})

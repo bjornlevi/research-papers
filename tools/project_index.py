@@ -11,6 +11,8 @@ from . import literature_update, project_library, project_purge
 
 
 LABELS = {"awaiting_pdf": "Awaiting PDF", "extracted": "Extracted",
+          "draft": "Clear-text draft", "draft_revision": "Draft revision (published text remains active)",
+          "published": "Published for retrieval",
           "needs_visual_review": "Needs visual review",
           "extracted_with_ocr": "Extracted with OCR (not human verified)"}
 
@@ -31,7 +33,7 @@ def discovery_titles(graph):
 
 
 def _state(root):
-    paths = [root / "project.json", root / "registry/active.json"]
+    paths = [root / "project.json", root / "registry/active.json", root / "editorial/active.json"]
     searches = []
     discovery = root / "discovery"
     for folder in sorted(discovery.iterdir()) if discovery.exists() else []:
@@ -44,7 +46,7 @@ def _state(root):
         if (folder / "neighborhood.json").is_file():
             paths.append(releases.safe_file(folder, "neighborhood.json"))
     signature = releases.encode({
-        "version": 2,
+        "version": 3,
         "files": [[str(path.relative_to(root)), project_purge._file_version(path)]
                   for path in paths if path.exists()],
     }).decode()
@@ -109,7 +111,7 @@ def library_page(root, query="", offset=0, limit=50, *, relationship="", status=
     if offset < 0 or not 1 <= limit <= 100:
         raise ValueError("Invalid Library pagination")
     if relationship not in {"", "core", "background", "impact"} or status not in {
-            "", "awaiting", "extracted", "review", "unresolved"}:
+            "", "awaiting", "extracted", "review", "unresolved", "published", "draft"}:
         raise ValueError("Invalid Library filter")
     path = root / "library-index.sqlite"
     with literature_update.writer_lock(root):
@@ -142,8 +144,10 @@ def library_page(root, query="", offset=0, limit=50, *, relationship="", status=
                 words.append(relationship)
             conditions = {
                 "awaiting": "status='Awaiting PDF'",
-                "extracted": "status IN ('Extracted','Extracted with OCR (not human verified)')",
-                "review": "status='Needs visual review'",
+                "extracted": "status!='Awaiting PDF' AND doi!=''",
+                "review": "status IN ('Needs visual review','Clear-text draft','Draft revision (published text remains active)')",
+                "draft": "status IN ('Clear-text draft','Draft revision (published text remains active)')",
+                "published": "status IN ('Published for retrieval','Draft revision (published text remains active)')",
                 "unresolved": "doi=''",
             }
             if status:

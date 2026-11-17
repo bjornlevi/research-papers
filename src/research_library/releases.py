@@ -130,8 +130,6 @@ def validate_bundle(bundle):
         if source["id"] in registry:
             raise ReleaseError("Duplicate source ID")
         registry[source["id"]] = source
-    if not registry:
-        raise ReleaseError("An evidence release must identify at least one source")
     ids = {}
     validators = {key: Draft202012Validator(_record_schema(kind)) for key, kind in (
         ("claims", "claim"), ("units", "context"), ("tables", "table"),
@@ -361,7 +359,7 @@ def validate(root, *, allowed_profiles):
     if not isinstance(manifest, dict) or set(manifest) != expected_keys:
         raise ReleaseError("Invalid release manifest")
     if (type(manifest["schema_version"]) is not int or manifest["schema_version"] != MANIFEST_SCHEMA
-            or manifest["tool_schema_version"] not in {"2.0.0", "2.1.0", "2.2.0", contracts.SCHEMA_VERSION}):
+            or manifest["tool_schema_version"] not in {"2.0.0", "2.1.0", "2.2.0", "2.3.0", contracts.SCHEMA_VERSION}):
         raise ReleaseError("Unsupported release/tool schema")
     if not isinstance(manifest["profile"], str) or manifest["profile"] not in PROFILES or manifest["profile"] not in allowed_profiles:
         raise AccessDeniedError("Release rights profile is not allowed by this operator")
@@ -554,6 +552,9 @@ class Snapshot:
             result = self._lookup("issues", selected["issue_id"])
         elif tool == "get_source_context":
             result = self.source_context(selected["unit_id"], limit=selected["max_characters"])["record"]
+        elif tool == "get_source_document":
+            result = self.source_document(selected["source_id"], offset=selected["offset"],
+                                          max_characters=selected["max_characters"])
         elif tool == "get_table":
             result = self._lookup("tables", selected["table_id"])
             rows, continuation = self._page(result["rows"], selected)
@@ -614,6 +615,46 @@ class Snapshot:
         return [{key: deepcopy(unit[key]) for key in (
             "id", "citation", "verification_status", "human_verification", "caveats", "source_issue_ids")}
                 for unit in self._bundle["units"] if unit["citation"]["source_id"] == source_id]
+
+    def document_units(self, source_id):
+        """Return canonical PDF page units in reading order, without rewriting extraction."""
+        if self.profile == "curated":
+            raise AccessDeniedError("Extracted context is not authorized by this release profile")
+        source = self._lookup("sources", source_id)
+        if source["format"] != "pdf":
+            raise retrieval.RetrievalError("Continuous document reading requires a PDF source")
+        units = [unit for unit in self._bundle["units"] if unit["citation"]["source_id"] == source_id]
+        if not units:
+            raise retrieval.NotFoundError("No retained pages for this source document")
+        return deepcopy(sorted(units, key=lambda unit: (unit["citation"]["locator"]["pdf_page"], unit["id"])))
+
+    def source_document(self, source_id, *, offset=0, max_characters=4096):
+        """Slice a page-ordered text stream and retain exact page/unit provenance."""
+        contracts.request("get_source_document", {
+            "source_id": source_id, "offset": offset, "max_characters": max_characters})
+        units = self.document_units(source_id)
+        source = self._lookup("sources", source_id)
+        text = "\n\n".join(unit["text"] for unit in units)
+        if len(text) > contracts.MAX_DOCUMENT_OFFSET or offset > len(text):
+            raise retrieval.RetrievalError("Document offset exceeds retained text or supported length")
+        end = min(offset + max_characters, len(text))
+        segments, position = [], 0
+        for unit in units:
+            unit_end = position + len(unit["text"])
+            if (position < end and unit_end > offset) or (
+                    not unit["text"] and offset <= position <= end):
+                segment = {key: deepcopy(unit[key]) for key in (
+                    "id", "citation", "verification_status", "human_verification", "caveats", "source_issue_ids")}
+                segment.update(start=max(offset, position), end=min(end, unit_end),
+                               unit_offset=max(0, offset - position), extraction_truncated=unit["truncated"])
+                segments.append(segment)
+            position = unit_end + 2
+        return {
+            "source_id": source_id, "source_sha256": source["sha256"], "doi": source["doi"],
+            "text": text[offset:end], "offset": offset, "total_characters": len(text),
+            "next_offset": end if end < len(text) else None, "unit_count": len(units),
+            "extraction_incomplete": any(unit["truncated"] for unit in units), "segments": segments,
+        }
 
     def source_inventory(self, paper=None):
         """Inventory the exact source versions behind this release, without original bytes."""

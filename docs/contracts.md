@@ -1,4 +1,4 @@
-# Evidence and catalog tool contract v2.3
+# Evidence and catalog tool contract v2.4
 
 These schemas are shared by the stdio MCP server and the installed
 application's release-mode `tool` command. Legacy workspace retrieval preserves
@@ -12,6 +12,14 @@ turning an unreported value into text. This is an intentional major version
 change; version-1 consumers must not silently accept version-2 responses.
 
 ## Tools and inputs
+
+Contract **2.4.0** adds `get_source_document` for continuous reading of one
+retained PDF, with character-based pagination and page/unit provenance.
+It joins canonical page text with two newlines in original PDF page order;
+it does not repair split words, remove headers/footers or infer missing text.
+Existing release bytes and page-context tool behavior are unchanged.
+Releases exported with tool schemas 2.0.0 through 2.3.0 remain loadable;
+responses use the current contract without rewriting those releases.
 
 Contract **2.3.0** adds `list_publications`, `get_publication` and `catalog_status`
 for explicitly separate metadata-only catalog collections. These records contain
@@ -59,6 +67,7 @@ All inputs reject unknown properties, including arbitrary SQL or file paths.
 | `search_evidence` | `query` | `paper`, `mode`, `limit`, `offset` | Page of cited search hits |
 | `get_claim` | `claim_id` | none | Whole contextual claim and numerical records |
 | `get_source_context` | `unit_id` | `max_characters` | Bounded cited context |
+| `get_source_document` | `source_id` | `offset`, `max_characters` | Continuous PDF text slice, page segments and continuation |
 | `get_table` | `table_id` | `limit`, `offset` | Headers, units, rows, footnotes and continuation |
 | `get_source_issue` | `issue_id` | none | Status, explanation, exact quotes and citations |
 | `get_related_evidence` | `evidence_id` | `limit`, `offset` | Cited, qualified relationship edges |
@@ -81,6 +90,17 @@ preserves existing record IDs and maps source units explicitly.
 - `limit`: integer 1-100, default 10; `offset`: integer 0-1,000,000, default 0.
 - Context: `max_characters` 1-2048, default 1024. Evidence quotes/snippets are
   at most 2048 characters; other text fields at most 4096.
+- Document: `max_characters` 1-8192, default 4096; character `offset`
+  0-100,000,000, default 0. `next_offset` advances by the returned character
+  count (including page-separator newlines); null means the end of retained
+  text, not proof of complete PDF extraction. Follow all slices with the same
+  source, collection and snapshot. Office sources are explicitly unsupported.
+  Each segment has absolute document `start`/`end` offsets (end exclusive),
+  `unit_offset`, the original unit ID/citation, verification, caveats and source
+  issues. Empty retained pages have zero-length segments.
+  `extraction_incomplete` reports stored truncation anywhere in the document;
+  each segment retains its own `extraction_truncated` flag. Empty/missing
+  extraction may still require inspection even when neither flag is set.
 - Arrays have at most 100 entries. **Every serialized response is at most
   65,536 UTF-8 bytes**, including provenance and caveats. MCP framing and the
   text/structured duplication are additional transport overhead.
@@ -106,7 +126,7 @@ tests. Release handlers implement retrieval and truncation, not the schemas alon
 
 ## Success, provenance and uncertainty
 
-Success envelopes have `ok: true`, `schema_version: "2.3.0"`, a nonempty immutable
+Success envelopes have `ok: true`, `schema_version: "2.4.0"`, a nonempty immutable
 `release_id`, the tool name, `result` and collection-level `caveats`.
 Every evidence result inherits that release identity and adds:
 
@@ -154,3 +174,12 @@ rejected. An evidence release ID identifies content, not an application version.
 The application package version, tool contract version, and release
 manifest schema version are separate. Original source bytes may be restricted
 even when citation metadata is available.
+## Publication boundary
+
+Independent project endpoints read the published retrieval registry, not the
+private editorial registry. PDF attachment and draft edits do not authorize
+text for retrieval; explicit admin publication does. An empty evidence release
+is valid when no clear text has been published. Its source, unit and table lists
+and search results are empty, without a fallback to editorial drafts.
+Historical snapshot-pinned access remains available according to authorization.
+See [architecture](architecture.md) for the editorial/publication lifecycle.

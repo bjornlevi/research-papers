@@ -289,7 +289,8 @@ class CollectionSnapshot:
                 raise retrieval.NotFoundError("Metadata catalog has no extracted evidence records")
             response = self.snapshots[cid].call(tool, plain)
             result = response["result"]
-            records = result["items"] if tool == "get_related_evidence" else [result]
+            records = (result["segments"] if tool == "get_source_document" else
+                       result["items"] if tool == "get_related_evidence" else [result])
             refs = [self.reference(cid, record, index) for index, record in enumerate(records)]
         caveats = list(dict.fromkeys(caveat for cid in selected
                                     for caveat in snapshot_caveats(self.snapshots[cid])))

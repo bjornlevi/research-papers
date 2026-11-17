@@ -199,6 +199,25 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(releases.ReleaseError, "already exist"):
             self.export()
 
+    def test_supported_older_tool_versions_load_without_rewriting_release(self):
+        for version in ("2.0.0", "2.1.0", "2.2.0", "2.3.0"):
+            with self.subTest(version=version):
+                _, path = self.export("release-" + version)
+                self.rewrite_manifest(path, lambda manifest: manifest.update(tool_schema_version=version))
+                before = snapshots(path)
+                snapshot = self.snapshot(path)
+                response = snapshot.call("get_source_document", {
+                    "source_id": "fictional:main", "max_characters": 8192})
+                self.assertEqual(response["schema_version"], contracts.SCHEMA_VERSION)
+                self.assertEqual(response["result"]["text"], self.bundle["units"][0]["text"])
+                self.assertEqual(snapshots(path), before)
+        for version in ("1.0.0", "2.5.0", "3.0.0"):
+            with self.subTest(unsupported=version):
+                _, path = self.export("unsupported-" + version)
+                self.rewrite_manifest(path, lambda manifest: manifest.update(tool_schema_version=version))
+                with self.assertRaisesRegex(releases.ReleaseError, "Unsupported release/tool schema"):
+                    self.snapshot(path)
+
     def test_python310_index_loading_without_deserialize(self):
         identifier, path = self.export()
         before = snapshots(path)
