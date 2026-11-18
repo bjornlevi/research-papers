@@ -210,3 +210,68 @@ def publish(root, *, snapshot_id, source_id, reviewer, reason, checked):
         finally:
             if not activated:
                 shutil.rmtree(run)
+
+
+def publication(root, source_id, *, current=None):
+    """Describe the active retrieval version, not a newer editorial draft."""
+    from . import project_edit, project_library
+    registry = project_library.store(root)
+    if not (registry.root / "active.json").is_file():
+        return None
+    current = current if current is not None else registry.current()
+    bundle = current.snapshots["core"]._bundle
+    if not any(source["id"] == source_id for source in bundle["sources"]):
+        return None
+    identity = content_identity(bundle, source_id)
+    event = next((event for event in project_edit.history(root, source_id)
+                  if event.get("scope") == "publication"
+                  and event.get("after", {}).get("content_identity") == identity), None)
+    return {"snapshot": current.release_id, "content_identity": identity, "event": event}
+
+
+def unpublish(root, *, snapshot_id, source_id, reviewer, reason, checked):
+    """Withdraw one source from active retrieval without removing editorial/history data."""
+    from . import project_library
+    root = Path(root)
+    reviewer, reason = reviewer.strip(), reason.strip()
+    if not reviewer or len(reviewer) > 200 or not reason or len(reason) > 2000:
+        raise ValueError("Provide your name and an unpublication reason")
+    if not checked:
+        raise ValueError("Confirm removal from active AI retrieval")
+    with literature_update.writer_lock(root):
+        registry = project_library.store(root)
+        current = registry.current()
+        if current.release_id != snapshot_id:
+            raise ValueError("Published content changed; reload before unpublishing")
+        original = current.snapshots["core"]
+        selected = source_bundle(original._bundle, source_id)
+        ensure_editorial(root)
+        bundle = deepcopy(original._bundle)
+        for section in ("sources", "units", "tables"):
+            bundle[section] = [item for item in bundle[section]
+                              if (item["id"] if section == "sources" else item["citation"]["source_id"]) != source_id]
+        grants = deepcopy(original._manifest["authorization"])
+        grants.pop(source_id, None)
+        (root / "runs").mkdir(exist_ok=True)
+        run = Path(tempfile.mkdtemp(prefix="correction-unpublication-", dir=root / "runs"))
+        activated = False
+        try:
+            release_id = releases.export(bundle, run / "evidence", profile="private_context", authorization=grants)
+            registry.releases.install(run / "evidence")
+            event = {"schema_version": 1, "at": datetime.now(timezone.utc).isoformat(),
+                     "reviewer": reviewer, "reason": reason, "scope": "unpublication", "source_id": source_id,
+                     "source_sha256": selected["sources"][0]["sha256"], "unit_id": None,
+                     "parent_snapshot": current.release_id, "parent_release": original.release_id,
+                     "release": release_id,
+                     "before": {"content_identity": content_identity(selected, source_id)},
+                     "after": {"content_identity": None}}
+            collections.atomic_json(run, "correction.json", event)
+            document = deepcopy(current.document)
+            entry = next(entry for entry in document["collections"] if entry["id"] == "core")
+            entry.update(release_id=release_id, version="published-" + release_id[:16])
+            snapshot = registry.publish(document)
+            activated = True
+            return {"snapshot": snapshot, "release": release_id, "audit": str(run / "correction.json")}
+        finally:
+            if not activated:
+                shutil.rmtree(run)

@@ -27,3 +27,4 @@ __pycache__/
 
 # Machine-local make settings (e.g. LAN_HOST).
 /local.mk
+/node_modules/

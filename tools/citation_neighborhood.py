@@ -90,7 +90,7 @@ class CachedAPI:
 
 
 def source_ref(source):
-    return {key: source[key] for key in ("url", "retrieved_at", "sha256") if key in source}
+    return {key: source[key] for key in ("url", "retrieved_at", "sha256", "status") if key in source}
 
 
 def openalex_record(value):
@@ -286,6 +286,7 @@ def discover(root, manifest, api, *, project_scope=False, directions=("backgroun
         print(json.dumps({"event": "citation_seed", "number": row["number"], "nodes": len(nodes),
                           "edges": len(edges)}), file=sys.stderr, flush=True)
     identifiers = sorted(pending)
+    resolved_count = 0
     for start in range(0, len(identifiers), 50):
         batch = identifiers[start:start + 50]
         payload, source = api.get("https://api.openalex.org/works", {
@@ -302,11 +303,38 @@ def discover(root, manifest, api, *, project_scope=False, directions=("backgroun
             key = add_work(work, source)
             for seed, direction, origin in pending[identifier]:
                 add_edge(seed, direction, key, origin)
-        for identifier in set(batch) - resolved:
+        for identifier in sorted(set(batch) - resolved):
+            url = "https://api.openalex.org/works/" + identifier
+            resolution = {"resolution_status": "lookup_failed", "lookup_url": url}
+            try:
+                work, lookup_source = api.get(url, {"select": FIELDS})
+            except literature.DiscoveryError as error:
+                resolution["error"] = str(error)
+            else:
+                resolution["lookup_source"] = source_ref(lookup_source)
+                if work is None:
+                    if lookup_source.get("status") != 404:
+                        raise ValueError("Missing reference lookup requires an explicit HTTP 404")
+                    resolution["resolution_status"] = "not_found"
+                elif work_id(work["id"]) != identifier:
+                    resolution.update(
+                        resolution_status="identity_mismatch", returned_work=work["id"],
+                        error="Direct reference lookup returned a different OpenAlex work ID; not imported.")
+                else:
+                    key = add_work(work, lookup_source)
+                    for seed, direction, origin in pending[identifier]:
+                        add_edge(seed, direction, key, origin)
+                    resolved.add(identifier)
+                    continue
+            print(json.dumps({"event": "citation_reference_unresolved", "openalex_id": identifier,
+                              "status": resolution["resolution_status"]}), file=sys.stderr, flush=True)
             for seed, direction, origin in pending[identifier]:
                 unresolved.append({"seed_doi": seed, "direction": direction, "openalex_id": identifier,
-                                   "source": source_ref(origin), "resolution_source": source_ref(source)})
-        print(json.dumps({"event": "citation_reference_batch", "resolved": start + len(batch),
+                                   "source": source_ref(origin), "resolution_source": source_ref(source),
+                                   **resolution})
+        resolved_count += len(resolved)
+        print(json.dumps({"event": "citation_reference_batch", "processed": start + len(batch),
+                          "resolved": resolved_count,
                           "total": len(identifiers)}), file=sys.stderr, flush=True)
     # Resolve deposited DOI references absent from the OpenAlex identifier graph.
     known_dois = {value.removeprefix("doi:") for node in nodes.values()
@@ -358,6 +386,12 @@ def discover(root, manifest, api, *, project_scope=False, directions=("backgroun
     return result
 
 
+def unresolved_references(graph):
+    """Return actionable reference diagnostics, excluding logged HTTP 404s."""
+    return [item for item in graph.get("unresolved", [])
+            if item.get("resolution_status") != "not_found"]
+
+
 def publish_metadata(root, *, project_scope=False):
     graph = releases.read_json((root / "neighborhood.json").read_bytes())
     identifier = releases.sha256(releases.encode(graph))
@@ -366,7 +400,7 @@ def publish_metadata(root, *, project_scope=False):
            "policy_sha256": releases.sha256(releases.encode(graph["limitations"])),
            "from_date": "1000-01-01", "through_date": date.today().isoformat(),
            "started_at": graph["acquired_at"], "updated_at": graph["acquired_at"],
-           "status": "incomplete" if graph["unresolved"] or any(
+           "status": "incomplete" if unresolved_references(graph) or any(
                any(p["status"] not in {"complete_indexed_neighborhood", "complete_deposited_references"}
                    for p in seed["providers"].values()) for seed in graph["seeds"]) else "complete",
            "disease": "citation_neighborhood"}
@@ -455,6 +489,15 @@ def distribution_response(client, url, pace):
                          "sha256": hashlib.sha256(body).hexdigest(), "raw": body.decode("utf-8")}
 
 
+def pmc_distribution_license(metadata):
+    if not isinstance(metadata, dict):
+        raise ValueError("Invalid PMC distribution metadata: expected a JSON object")
+    code = metadata.get("license_code")
+    if not isinstance(code, str) or not code.strip():
+        raise ValueError("PMC distribution has no explicit license code")
+    return code.lower().replace(" ", "-")
+
+
 def official_pmc_location(client, candidate, record, pace):
     identifier = pmcid(candidate["url"]) or pmcid(candidate.get("landing_page_url"))
     if not identifier:
@@ -474,7 +517,7 @@ def official_pmc_location(client, candidate, record, pace):
     version, key = versions[-1]
     body, metadata_source = distribution_response(client, base + key, pace)
     metadata = releases.read_json(body)
-    license_code = metadata.get("license_code", "").lower().replace(" ", "-")
+    license_code = pmc_distribution_license(metadata)
     if (metadata.get("pmcid") != identifier or metadata.get("version") != version
             or metadata.get("is_pmc_openaccess") is not True or license_code not in LICENSES):
         raise ValueError("PMC distribution identity/open-access/license validation failed")
@@ -745,8 +788,9 @@ def verify_and_export(root, papers):
                     if releases.sha256(source["raw"].encode()) != source["sha256"]:
                         raise ValueError("Official PMC license metadata checksum differs")
                 metadata = releases.read_json(official["metadata"]["raw"].encode())
-                if (metadata["pmcid"] != official["pmcid"] or metadata["is_pmc_openaccess"] is not True
-                        or metadata["license_code"].lower().replace(" ", "-") != official["license"]
+                license_code = pmc_distribution_license(metadata)
+                if (metadata.get("pmcid") != official["pmcid"] or metadata.get("is_pmc_openaccess") is not True
+                        or license_code != official["license"]
                         or official["license"] not in LICENSES):
                     raise ValueError("Official PMC license/identity basis differs")
             downloaded[entry["filename"]] = entry["bytes"]
@@ -803,7 +847,9 @@ def verify_and_export(root, papers):
         "unresolved_reference_occurrences": sum(
             bibliographic_resolution(records[key]) == "unresolved_reference_occurrence" for key in memberships),
         "provider_edges": len(graph["edges"]), "canonical_edges": len(canonical_edges),
-        "unresolved_openalex_reference_links": len(graph["unresolved"]),
+        "unresolved_openalex_reference_links": len(unresolved_references(graph)),
+        "ignored_404_reference_links": sum(item.get("resolution_status") == "not_found"
+                                           for item in graph["unresolved"]),
         "doi_resolution_mismatches": len(graph["resolution_issues"]),
         "acquisition_status": dict(Counter(entry["status"] for entry in acquisition["items"].values())),
         "unique_pdf_files": len(downloaded), "pdf_bytes": sum(downloaded.values()),
@@ -869,7 +915,7 @@ def main():
             with closing(literature.MetadataClient()) as client:
                 result = discover(args.root, args.manifest, CachedAPI(args.root / "responses", client))
             print(json.dumps({"seeds": len(result["seeds"]), "nodes": len(result["nodes"]),
-                              "edges": len(result["edges"]), "unresolved": len(result["unresolved"])}))
+                              "edges": len(result["edges"]), "unresolved": len(unresolved_references(result))}))
         elif args.command == "catalog":
             result = publish_metadata(args.root)
             print(json.dumps({"catalog_id": result["catalog_id"], "memberships": result["membership_count"]}))

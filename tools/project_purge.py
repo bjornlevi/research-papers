@@ -322,7 +322,8 @@ def purge(root, doi, pdf_data_root, *, progress=None, expected_plan=None):
                 job = deepcopy(job)
                 job["status"] = "complete"
                 job["report"] = {
-                    "edges": len(graph["edges"]), "unresolved": len(graph["unresolved"]),
+                    "edges": len(graph["edges"]),
+                    "unresolved": len(citation_neighborhood.unresolved_references(graph)),
                     "seeds_with_provider_gaps": sum(any(
                         result["status"] not in {"complete_indexed_neighborhood", "complete_deposited_references"}
                         for result in seed["providers"].values()) for seed in graph["seeds"])}
