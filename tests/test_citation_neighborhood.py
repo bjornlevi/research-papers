@@ -117,6 +117,102 @@ class CitationTests(unittest.TestCase):
                 self.assertEqual(bool(citing_queries), direction == "impact")
                 self.assertEqual(bool(crossref_queries), direction == "background")
 
+    def test_missing_batch_reference_is_recovered_by_direct_lookup_once_without_expansion(self):
+        lookups = []
+
+        def handler(request):
+            if request.url.path == "/works/W100":
+                lookups.append(request)
+                recovered = work(100)
+                recovered["referenced_works"] = ["https://openalex.org/W999"]
+                return httpx.Response(200, json=recovered)
+            response = self.handler(request)
+            if response.status_code != 200:
+                return response
+            payload = response.json()
+            if request.url.params.get("filter", "").startswith("openalex_id:"):
+                payload["results"] = [row for row in payload["results"]
+                                      if row["id"] != "https://openalex.org/W100"]
+            elif request.url.path.endswith("/https://doi.org/10.0000/paper-2"):
+                payload["referenced_works"] = ["https://openalex.org/W100"]
+            return httpx.Response(200, json=payload)
+
+        graph = self.discover(handler)
+        self.assertEqual(len(lookups), 1)
+        self.assertEqual(lookups[0].url.params["select"], citation.FIELDS)
+        self.assertEqual(graph["unresolved"], [])
+        target = "openalex:WORK:W100"
+        self.assertIn(target, graph["nodes"])
+        self.assertTrue(any("/works/W100?" in source["url"] for source in graph["nodes"][target]["sources"]))
+        self.assertEqual({edge["seed_doi"] for edge in graph["edges"]
+                          if edge["target_provider_record"] == target},
+                         {"10.0000/paper-1", "10.0000/paper-2"})
+        self.assertNotIn("openalex:WORK:W999", graph["nodes"])
+        self.assertFalse(any("W999" in str(request.url) for request in self.requests))
+
+    def test_missing_reference_checks_distinguish_broken_failed_and_wrong_identity(self):
+        for status, response in (
+            ("not_found", httpx.Response(404)),
+            ("lookup_failed", httpx.Response(403)),
+            ("identity_mismatch", httpx.Response(200, json=work(999))),
+        ):
+            with self.subTest(status=status), redirect_stderr(io.StringIO()) as diagnostics:
+                direct_requests = []
+
+                def handler(request):
+                    if request.url.path == "/works/W100":
+                        direct_requests.append(request)
+                        return response
+                    result = self.handler(request)
+                    if request.url.params.get("filter", "").startswith("openalex_id:"):
+                        payload = result.json()
+                        payload["results"] = [row for row in payload["results"]
+                                              if row["id"] != "https://openalex.org/W100"]
+                        return httpx.Response(200, json=payload)
+                    return result
+
+                output = self.root / status
+                api = self.api(handler)
+                api.root = output / "responses"
+                graph = citation.discover(output, self.manifest, api)
+                progress = [json.loads(line) for line in diagnostics.getvalue().splitlines()
+                            if json.loads(line)["event"] == "citation_reference_batch"]
+                self.assertEqual(progress, [{"event": "citation_reference_batch", "processed": 2,
+                                             "resolved": 1, "total": 2}])
+                self.assertEqual(len(direct_requests), 1)
+                self.assertEqual(len(graph["unresolved"]), 1)
+                unresolved = graph["unresolved"][0]
+                self.assertEqual(unresolved["resolution_status"], status)
+                self.assertEqual(unresolved["openalex_id"], "W100")
+                self.assertEqual(unresolved["seed_doi"], "10.0000/paper-1")
+                self.assertIn("resolution_source", unresolved)
+                self.assertIn("source", unresolved)
+                if status == "not_found":
+                    self.assertEqual(unresolved["lookup_source"]["status"], 404)
+                    self.assertEqual(api.get(unresolved["lookup_url"], {"select": citation.FIELDS})[1]["status"], 404)
+                    self.assertEqual(len(direct_requests), 1)
+                else:
+                    self.assertIn("error", unresolved)
+                self.assertNotIn("openalex:WORK:W100", graph["nodes"])
+                self.assertNotIn("openalex:WORK:W999", graph["nodes"])
+                self.assertFalse(any(edge["target_provider_record"] == "openalex:WORK:W100"
+                                     for edge in graph["edges"]))
+                graph["seeds"][-1]["providers"]["openalex"]["status"] = "complete_indexed_neighborhood"
+                citation.atomic_json(output, "neighborhood.json", graph)
+                inventory = citation.publish_metadata(output)
+                self.assertEqual(inventory["unresolved"], graph["unresolved"])
+                snapshot = catalog.open_snapshot(output / "catalog-001.sqlite", validate_records=True)
+                reference = snapshot.get("doi:10.0000/paper-100")
+                self.assertTrue(all(origin["provider_record"].startswith("crossref:REFERENCE:")
+                                    for origin in reference["provenance"]))
+                self.assertEqual(snapshot.document["runs"][0]["status"],
+                                 "complete" if status == "not_found" else "incomplete")
+                self.assertIn('"event": "citation_reference_unresolved"', diagnostics.getvalue())
+                self.assertEqual(len(citation.unresolved_references(graph)), 0 if status == "not_found" else 1)
+                with patch.object(citation, "download") as download:
+                    citation.acquire(output, self.root / ("pdfs-" + status))
+                download.assert_not_called()
+
     def test_project_scope_accepts_configurable_seed_count(self):
         with self.manifest.open("w", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=["number", "doi", "title", "filename"])
@@ -289,7 +385,9 @@ class CitationTests(unittest.TestCase):
                 <IsTruncated>false</IsTruncated><Contents><Key>PMC123.1/PMC123.1.json</Key></Contents>
                 </ListBucketResult>""")
         candidate = {"url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC123/", "license": "cc-by"}
-        record = {"aliases": ["doi:10.0000/paper-100"]}
+        record = {"aliases": ["doi:10.0000/paper-100"], "id": "doi:10.0000/paper-100",
+                  "title": "Synthetic paper", "citation_url": "https://doi.org/10.0000/paper-100",
+                  "istopmm_overlap": "not_matched", "identity_status": "resolved"}
         with httpx.Client(transport=httpx.MockTransport(handler)) as client:
             result = citation.official_pmc_location(client, candidate, record, lambda: None)
             self.assertEqual(result["download_url"],
@@ -298,6 +396,22 @@ class CitationTests(unittest.TestCase):
             metadata["license_code"] = "UNKNOWN"
             with self.assertRaisesRegex(ValueError, "license"):
                 citation.official_pmc_location(client, candidate, record, lambda: None)
+            for value in (None, "", 42):
+                with self.subTest(license_code=value), patch.object(citation, "download") as download:
+                    metadata["license_code"] = value
+                    result, data = citation.acquire_one(client, record, [candidate], lambda: None)
+                    self.assertIsNone(data)
+                    self.assertEqual(result["status"], "licensed_locations_failed")
+                    self.assertEqual(result["attempts"][0]["error"], "PMC distribution has no explicit license code")
+                    download.assert_not_called()
+            del metadata["license_code"]
+            fallback = {"url": "https://example.org/main.pdf", "license": "cc-by"}
+            with patch.object(citation, "download", return_value=(b"synthetic", {})) as download:
+                result, data = citation.acquire_one(client, record, [candidate, fallback], lambda: None)
+                self.assertEqual(result["status"], "downloaded")
+                self.assertEqual(result["attempts"][0]["status"], "failed")
+                self.assertEqual(data, b"synthetic")
+                download.assert_called_once_with(client, fallback["url"], pace=unittest.mock.ANY, on_bytes=None)
             metadata["license_code"] = "CC BY"
             metadata["doi"] = "10.0000/different"
             with self.assertRaisesRegex(ValueError, "identifier mismatch"):

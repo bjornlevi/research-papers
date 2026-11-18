@@ -75,7 +75,7 @@ class ProjectPdfTests(unittest.TestCase):
             allowed_collections={"core"}, default_collections=["core"])
         client = app.test_client()
         base = "http://localhost:8080"
-        settings = client.get("/settings", base_url=base).get_data(as_text=True)
+        settings = client.get("/discovery", base_url=base).get_data(as_text=True)
         token = re.search(r'name="token" value="([^"]+)"', settings).group(1)
         with patch.object(literature.MetadataClient, "get", side_effect=AssertionError("Online lookup")):
             started = client.post("/settings/find-pdf", data={
@@ -190,7 +190,7 @@ class ProjectPdfTests(unittest.TestCase):
             allowed_collections={"core"}, default_collections=["core"])
         client = app.test_client()
         base = "http://localhost:8080"
-        settings = client.get("/settings", base_url=base).get_data(as_text=True)
+        settings = client.get("/discovery", base_url=base).get_data(as_text=True)
         self.assertIn('action="/settings/find-pdf"', settings)
         token = re.search(r'name="token" value="([^"]+)"', settings).group(1)
         self.assertEqual(client.post("/settings/find-pdf",
@@ -254,7 +254,8 @@ class ProjectPdfTests(unittest.TestCase):
         collections.atomic_json(folder, "neighborhood.json", graph)
         collections.atomic_json(folder, "job.json", {
             "status": "complete", "label": "References", "direction": "background",
-            "started_at": graph["acquired_at"]})
+            "started_at": graph["acquired_at"],
+            "report": {"edges": 2, "unresolved": 0, "seeds_with_provider_gaps": 0}})
 
     def test_library_discovered_attachment_is_searchable_without_becoming_a_core_seed(self):
         self.discovery()
@@ -297,7 +298,7 @@ class ProjectPdfTests(unittest.TestCase):
         self.assertEqual(status["papers"][0]["status"], "awaiting_pdf")
         self.assertEqual(status["discovered"][0]["status"], "draft")
         listing = client.get("/library?query=Discovered", base_url=base)
-        self.assertIn(b"<dd>References</dd>", listing.data)
+        self.assertIn(b"<td>References</td>", listing.data)
         self.assertIn(b">Clear-text draft<", listing.data)
         self.assertNotIn(b'action="/settings/find-pdf"', listing.data)
         sources = client.get("/sources", base_url=base)

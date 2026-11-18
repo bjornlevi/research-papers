@@ -116,7 +116,7 @@ private storage. The export refuses to overwrite an existing file.
 After checking that the PDF actually matches its registered title and DOI,
 and confirming you have permission for private extraction, attach it:
 
-In **Project settings**, click **awaiting_pdf** in a paper's status to select
+In **Manage library → Core papers and PDFs**, click **awaiting_pdf** in a paper's status to select
 a local PDF from the shared `releases/pdf-data/` folder. Choose the file, confirm that
 you checked the identity and private-use authorization, and submit. Files in
 that folder are not served and survive project reset. To use another folder,
@@ -140,6 +140,9 @@ background. The progress/result page shows failures or the saved filename and
 acquisition URL. This uses the installation's OpenAlex key when configured and
 may encounter provider quotas. It does not bypass access controls or infer rights
 from free-to-read status. A missing result is not proof that no copy exists.
+If official PubMed Central distribution metadata lacks an explicit license,
+that location is skipped and the reason is recorded; other eligible locations
+and papers in the batch can still be checked.
 Successful PDFs and DOI/checksum-bound provenance (including year, license and
 download URL) are saved in the PDF data folder. Nothing is attached or extracted
 automatically: inspect the file locally, select it, and confirm identity and
@@ -209,7 +212,7 @@ and expandable provenance retain their technical identities. Status, errors,
 identity/permission confirmations and destructive-action warnings stay visible.
 Editor metadata, structured tables, correction history and reader copy fields
 are expandable when needed.
-Find related papers presents coverage as a limitations list and per-core-paper
+Manage library presents discovery coverage as a limitations list and per-core-paper
 provider summaries, with reported/retrieved counts and errors. Technical provider
 details remain expandable rather than appearing as raw JSON.
 
@@ -220,14 +223,31 @@ text. Paper metadata, provenance, page warnings, structured tables from all page
 and correction history are expandable. The reader also links to this view for
 the current version of its retained page.
 
-Choose **Turn on edit mode** to edit the entire document in one text field and
-save all pages in a single audited draft version. Visible `[[PAGE …]]` markers
+Choose **Turn on edit mode**, or **Edit** on a paper's **Clear text** tab, to
+edit visually and save all pages in a single audited draft version. The toolbar
+offers headings, bold, italic, bulleted/numbered lists, links and undo/redo.
+Page boundaries are protected in visual mode. Use **Reading width** or **Full
+width**, or drag the lower-right edge of the editor, to adjust its width.
+Formatting is stored as Markdown, not HTML, and rendered in the paper's reading
+view. Saving a draft does not publish it.
+
+**Edit Markdown source** switches to the plain-text draft. This is also the
+fallback if JavaScript is unavailable or the draft contains HTML/image markup
+that the visual editor cannot safely preserve. Untouched pages retain their
+original text exactly. Visible `[[PAGE …]]` markers in source mode
 identify the original PDF pages. Keep every marker unchanged and in order, with
 two newlines before each marker after the first. Text between markers is assigned
 to that page for citations; move text across boundaries only when correcting its
 page assignment. Missing, duplicated, reordered or damaged markers reject the
 save and retain your draft rather than guessing provenance. Markers are editor
 scaffolding and do not appear in saved evidence or the read-only document.
+
+**Appearance** in the navigation offers **Light**, **Dark**, or the device's
+color setting, plus an **Increased contrast** option. Preferences are stored in
+this browser, not the project manifest, and do not affect other operators.
+Device increased-contrast, reduced-motion and forced-color settings also apply.
+If browser storage is blocked, the controls still work for the current page and
+show that the preference could not be saved.
 
 A page's **Edit** link under **Pages and extraction warnings** still opens the
 individual-page editor, including **Repair paragraph layout**. Metadata changes
@@ -296,7 +316,7 @@ removes its correction history too. Factory reset removes all project history.
 Saving rejects stale forms if the active snapshot changed in another tab or job.
 Invalid input is shown without discarding the form; no partial version is
 activated. Editing is blocked during discovery, PDF processing, metadata update
-or purge. Original PDFs are not served in the app.
+or purge. Retained original PDFs can be viewed in a paper's local **PDF** tab.
 
 ### Data quality actions
 
@@ -321,13 +341,14 @@ Reviews and problems are saved locally, bound to the source/extraction identity,
 without changing evidence text. Corrections preserve earlier versions and
 require a fresh quality check; they do not imply scientific validation.
 Stale forms and requests made while project-changing jobs run are rejected.
-Originals are never served to the browser. Text editing requires private
+Retained originals are available only through the private project's local **PDF**
+tab, not through evidence retrieval or MCP. Text editing requires private
 project mode; review, problem reporting, and uploaded-original inventory are
 also available for development evidence collections.
 
 ### Batch PDF location and extraction
 
-In **Project settings → Attach PDFs**, **Find all** starts the same local-first
+In **Manage library → Core papers and PDFs**, **Find all** starts the same local-first
 batch lookup for every Core paper awaiting PDF, without including discovered
 papers selected elsewhere. Existing local matches and downloads are reused.
 Review the batch results and explicitly confirm each PDF before extraction;
@@ -337,9 +358,12 @@ In **Library**, filter by relationship and PDF/extraction status, then switch
 **Locate PDF: off/on** for individual papers. These are toggle buttons, not
 identity/permission confirmations. Toggles update in place without navigating or
 changing scroll position (ordinary form navigation is retained without JavaScript).
-**Turn on this page** or **Turn on all matching
-papers** selects eligible records across pages; **Turn all off** clears the
-selection. Only records with a title and DOI awaiting PDF are eligible.
+Open **Manage PDFs for these results** to carry the Library's filters, sort order
+and page into **Manage library → Batch PDFs**. There, **Mark papers on this page
+for PDF location** selects eligible records on that page; **Mark all matching
+papers for PDF location** selects eligible records across pages. **Clear all PDF
+location marks** clears the selection. Marking papers does not start PDF location.
+Only records with a title and DOI awaiting PDF are eligible.
 
 **Locate selected PDFs** starts a sequential, rate-limited background job,
 checking local PDFs first for each paper using the same matching rules as
@@ -360,6 +384,10 @@ pair you have inspected. Accept confirms identity and private-use permission,
 but does not start extraction. Acceptance is saved across pages and app restarts
 and bound to the PDF checksum. Accepted pairs leave the pending list; a success
 message, accepted count and expandable accepted list show what has been saved.
+Use **Reject suggestion** for an incorrect match, even if the suggested file is
+missing. This dismisses the match and unmarks the paper for PDF location without
+deleting any files or removing the paper from the Library. Choose a replacement
+in the review queue, or mark the paper again to retry PDF location.
 Choose **Extract accepted PDFs** to extract all
 accepted pairs across all pages; changed PDFs require fresh acceptance.
 Confirmation pages show 25 suggested pairs.
@@ -369,13 +397,26 @@ flagged and must be replaced before confirmation.
 
 **Pause after current paper** finishes the current item before stopping.
 Selection and results are saved in private `batch-pdf.json` within the project.
-After a pause or app restart, **Locate selected / resume / retry missing PDFs**
-reuses local matches and completed downloads and retries selected missing/failed entries. Provider
+After a manual pause or an interrupted location pass, use **Resume PDF location
+from checkpoint** to continue the saved pass without repeating completed attempts.
+The paper that was in progress may be retried. **Locate selected / retry missing
+PDFs** starts a new pass, reuses local matches and completed downloads, and
+retries selected missing/failed entries. Provider
 metadata errors pause the queue so remaining papers are not repeatedly attempted
 after a quota error. Resume only after the provider permits it; daily resets are
 not scheduled automatically. Interrupted or failed extraction requires fresh
 confirmation, and already attached sources are not extracted again.
 Other project mutations are blocked while a batch is running.
+
+Open **Batch diagnostics** on the batch review page to see the last saved stage,
+paper DOI when known, UTC checkpoint time, and saved task count. The report
+distinguishes a requested pause, a provider pause, and a recorded worker error.
+For worker errors, look for `batch_pdf_worker_stopped` in the web server logs.
+If the worker disappears without recording a reason, the report shows any
+available checkpoint and whether it came from a different server instance;
+it cannot tell a restart from a crash or forced stop. Older checkpoints may
+lack a stage or timestamp. Resuming a location pass keeps the previous stop
+report visible.
 
 The same **Find PDF** and **Select PDF and attach/extract** controls are available
 on **Library** for core and discovered papers with a resolved
@@ -452,7 +493,8 @@ pages, and the text inside each page is unchanged. Headers, footers, split words
 and missing text are not guessed or repaired. An abrupt ending may be the old
 page reader's slice boundary rather than missing extracted text. Check the next
 slice/page and compare with the original before correcting a real extraction
-gap. Existing attachments need no re-extraction. Original PDFs are not served.
+gap. Existing attachments need no re-extraction. Use the paper's **PDF** tab to
+compare its checksum-verified retained original when available.
 
 To collect **metadata only** for direct references and citing works of the
 registered core papers:
@@ -468,35 +510,124 @@ seed-to-paper edges, unstructured references, response provenance and
 unresolved identifiers. `citation-edges.csv` provides one row per provider
 edge, not a deduplicated publication list; spreadsheet-formula-like cells are
 prefixed with an apostrophe. Exact provider data remains in `neighborhood.json`.
-In the web app, choose **Find related papers** in the sidebar (also linked from
-**Project settings**). **Find references** searches outgoing references
+In the web app, choose **Manage library** in the sidebar (also linked from
+**Project settings**). It is the home for discovery and saved searches,
+the Core-paper inventory and removal, the awaiting-PDF attachment queue,
+batch PDF selection/location/review, and metadata catalog updates.
+Add/import Core papers, soft/factory reset and OpenAlex API-key settings remain
+in **Project settings**. The **Library** table remains the browsing/filtering
+view with contextual per-paper PDF/text actions.
+Existing `/discovery` links and management POST endpoints continue to work.
+**Find references** searches outgoing references
 using OpenAlex and Crossref; **Find citing papers**
 searches incoming citations using OpenAlex. Either works before PDFs are
-attached. Each search runs in the background; refresh its page to see progress,
-results, unresolved counts and provider gaps. Only one search runs at a time.
+attached. Each search runs in the background; its page automatically refreshes
+every two seconds while running to show progress and then results, unresolved
+counts and provider gaps. Only one search runs at a time.
 Results and provider-response provenance persist under `PROJECT_ROOT/discovery/`,
 including `citation-edges.csv`; reopening the app preserves completed searches.
 **Library** lists both core papers and saved discovered
-papers, including searches completed before this feature was added. Discovered
-records are filtered and paginated in a local SQLite index (50 entries per page),
-not by rereading every provider graph on every visit. The index is derived private
+papers in a table, including searches completed before this feature was added.
+Columns show **Title**, **DOI**, **Library groups**, **PDF / text status**,
+**First author**, **Publication year**, and **Journal**, plus PDF/text actions.
+Click a column heading to sort ascending, then click again for descending.
+Use the filters under each heading together with the global search and click
+**Apply filters**. Text filters match substrings without case sensitivity;
+publication year requires an exact four-digit year. Filters combine, and both
+filtering and sorting apply across the full library before pagination.
+Pagination and batch selection preserve the current filters and sort order.
+**Mark papers on this page for PDF location** selects eligible papers on the displayed sorted page;
+**Mark all matching papers for PDF location** selects eligible papers across all matching pages.
+Groups can overlap, including for Core papers. Metadata columns use saved
+discovery records, show only the first listed author, and display a dash when
+unknown; no metadata is inferred or fetched just to display the table.
+Missing values sort last in either direction. On desktop the table fits the
+available page width, wrapping long titles, identifiers and controls. On screens
+900 pixels wide or smaller it scrolls horizontally without widening the page.
+
+Click a **Title** to open the paper's in-app page (`/library/paper?id=...`).
+The **DOI** column still opens the external DOI link. Entries without a DOI also
+have a page, using their saved provider identity. Six server-rendered tabs work
+with normal links and do not require JavaScript:
+
+1. **Clear text** (default): the current extracted/editorial document with an
+   **Edit** button at the upper right. There is no PDF-page navigation in the
+   reading view. Retained structured tables appear inline after the text at their
+   stored page location; exact within-page table positions are not retained.
+   Figures/images are not currently stored as inline assets and must be checked
+   in the original PDF. The editor retains page-boundary markers for citations,
+   whole-document draft import, table correction and the correction audit.
+   Saving from this view returns to the paper's Clear text tab.
+2. **References**: known papers cited by this paper, linked to their own pages.
+3. **Citing papers**: known papers citing this paper, linked to their own pages.
+   Both lists use saved one-hop relationships only, not an exhaustive bibliography
+   or proof of scientific support. Discovered papers' own citation neighborhoods
+   are not automatically searched.
+4. **PDF**: the attached original retained in this project, when available.
+   Only a Library identity is accepted, never a user-supplied path. The file must
+   match the attached source's checksum. Pages are rendered locally as lazy-loaded
+   images so the tab works without a browser PDF plugin; an **Open local PDF** link
+   also serves the original inline with byte-range support. Both use the existing
+   local host/origin restrictions and no-store policy.
+   No PDF is fetched from a provider just to view this tab,
+   and MCP/evidence retrieval still does not serve original files.
+5. **Technical information**: basic bibliography, all recorded authors,
+   journal/year, provider metadata, source identity/provenance, extraction warnings,
+   discovery coverage, correction history and Core-paper removal.
+6. **Publish** / **Published**: publication controls live here, not below the
+   reading view. An unpublished paper requires checked clear text, the manager's
+   name, a reason and source-comparison confirmation before publication.
+   **Published** shows who published the active version, when (UTC), why, and a
+   snapshot-pinned link. If no matching historical audit is available, publisher
+   and time are explicitly unknown. A newer draft does not change this tab's
+   published status; it offers publication of the updated draft as well.
+   **Unpublish** requires a name, reason and explicit confirmation and removes
+   only this source from the current AI retrieval snapshot, keeping other papers,
+   PDFs, editorial drafts and audit history. Stale snapshot forms are rejected.
+   Old snapshot links and content already retrieved by AI clients are not erased;
+   clients/servers using cached snapshots need a new retrieval session or restart.
+   Publishing and unpublishing return to this tab.
+
+The Clear text tab explicitly distinguishes drafts from published AI content and
+links to the snapshot-pinned active RAG/MCP document. An unpublished draft is not
+AI evidence; if a newer draft exists, AI still reads the previous published
+version until the manager publishes the corrected text. Publication approves
+transcription, not scientific findings.
+
+For entries without extracted content, the page offers **Find PDF** and
+identity/permission-confirmed attachment. Attaching from the page returns there
+to read and check the draft; it does not promote a discovered paper to Core papers.
+Core-paper removal still requires the existing preview and DOI confirmation.
+
+Discovered
+records are filtered and paginated in a local SQLite index (50 entries per page
+by default; **Rows per page** offers 10, 25, 50, or 100). **Go to page** jumps
+directly to a numbered page, retaining the current filters and sort order.
+Changing the page size starts at page 1. Pages use the index rather than rereading
+every provider graph on every visit. The index is derived private
 data, rebuilt on first use and whenever saved graphs, core registrations or the
 active evidence snapshot change. A first visit after such changes can take longer;
 subsequent visits and pages reuse the index. No API requests are involved.
+Paper tabs also read saved bibliography and citation connections from this index,
+rather than rereading every discovery graph. Provider metadata is loaded only
+for Technical information. Validated evidence snapshots are reused across tab
+requests and loaded once per registry per request; backing-file integrity and
+active-snapshot changes are still checked. The first visit after an index-format
+or project-data change rebuilds the derived index and can take longer.
 Discovered
 records show **Awaiting PDF** (no attached PDF; no download attempted), or
 **Metadata only — DOI unresolved** when no DOI is known. They remain separate
 from the core library and are not available to AI as evidence. DOI matches are
 combined across searches, while records without a DOI retain provider identity.
-Search by title or DOI, and follow each record's search links for provenance
+Search by title, DOI, first author, year, journal, group or status, and follow each record's search links for provenance
 and coverage gaps. Core rows retain their actual extraction status.
-**Connections to your core papers** explicitly says **Core paper [title] cites
+**Connections and discovery searches** under each title explicitly says **Core paper [title] cites
 this paper** for outgoing references, or **This paper cites core paper [title]**
 for incoming citations. Paper titles and DOIs link to the DOI landing page.
 Discovery links show the search type and timestamp, rather than a row-local
 search number, and lead to the saved provider coverage and gaps.
 Missing titles are filled from saved metadata with the same DOI when available.
-References still lacking a title sort last; sparse provider deposits may contain
+References still lacking a title sort last in the default or title order; sparse provider deposits may contain
 only a DOI or partial citation, which says nothing about PDF availability.
 Interrupted searches are labelled as interrupted; start a new search rather than
 assuming partial results are complete. Factory reset deletes these results and
@@ -511,14 +642,15 @@ additional CSV/JSON papers using the initialization formats. Validation is
 atomic: duplicate DOIs or invalid rows reject the entire import. New core
 papers await PDF attachment. Existing evidence and metadata catalogs are
 preserved; rerun discovery to include new seeds.
-Project settings keeps the attachment queue limited to papers still awaiting a
+Manage library keeps the attachment queue limited to papers still awaiting a
 PDF. Attached papers remain registered in the collapsed, searchable core-paper
-inventory, where they can still be reviewed or removed.
+inventory, where they can still be reviewed or removed. Papers awaiting a PDF
+can also be removed directly from the attachment queue.
 
 To permanently remove a core paper:
 
 1. Stop any running MCP servers so they cannot retain old evidence in memory.
-2. Click the compact **Remove…** button in that paper's settings entry to open
+2. In **Manage library → Core papers and PDFs**, click the compact **Remove…** button in that paper's entry to open
    the confirmation dialog (or a confirmation page when JavaScript is unavailable).
 3. Review the affected relationship count and checksum-matched shared PDFs.
 4. Type the full DOI and confirm. If project data changes after the preview,
@@ -581,10 +713,10 @@ available on demand. These are provider-indexed metadata counts, not a measure
 of exhaustive literature coverage or project-wide PDF availability.
 To populate **Publication metadata** and **Literature coverage**:
 
-1. Attach at least one PDF in **Project settings** or **Library**
+1. Attach at least one PDF in **Manage library** or **Library**
    to create the registry.
-2. Complete one or both searches on **Find related papers**.
-3. Open **Publication metadata** and click **Configure/update metadata catalog**.
+2. Complete one or both searches on **Manage library**.
+3. In **Manage library → Metadata catalog**, click **Configure/update metadata catalog**.
 4. Repeat step 3 after additional searches to include their saved metadata.
 
 Updates run in the background. A status page shows the current stage and
@@ -603,10 +735,40 @@ Each incomplete project run displays **Why incomplete** directly below its
 status, using reasons saved with that catalog, followed by suggested next steps.
 A finished job is not a guarantee of complete provider coverage.
 The next-step links open the newest search in the affected direction at
-**What needs attention**. Unresolved OpenAlex IDs link to provider records and
-identify the core paper whose bibliography contains the reference. A retry
-button starts a fresh search in that direction; update the catalog afterward.
-Provider records may remain missing, so retrying is optional, not a guarantee.
+**What needs attention**. IDs missing from OpenAlex's batch results are checked
+individually by the discovery pipeline. A matching direct response recovers the
+Reference without expanding its own References. HTTP 404 is recorded as a broken
+OpenAlex reference link; temporary lookup failures and mismatched returned IDs
+are recorded separately, not called broken links or silently substituted.
+The original relationship, batch lookup and direct lookup provenance are
+preserved. For now, confirmed HTTP 404s are logged and ignored: they remain in
+saved diagnostics but are excluded from unresolved-reference counts, attention
+warnings and incomplete-catalog status. They are not identified papers or
+PDF-search candidates. Other lookup failures and unverified IDs still require
+attention. Ignoring broken links does not establish exhaustive bibliography coverage.
+Crossref References with independent bibliographic information remain usable;
+they are not guessed to be replacements for broken OpenAlex IDs.
+Older saved searches show that individual verification has not been performed;
+rerun **Find references** to use these checks, then update the metadata catalog.
+
+Each diagnostic identifies the Core paper whose provider-listed References include the ID. These
+are separate identities: the Core paper's OpenAlex link identifies the citing
+paper, while the unavailable reference ID identifies a paper it cites. The
+unavailable ID is not a replacement ID for the titled Core paper. These
+are provider metadata gaps, not PDF or extraction errors. Provider links are
+optional diagnostics and may themselves report "no works page"; that does not
+provide a way to repair the missing record in this app. Inspect the Core paper's
+bibliography independently if needed. An OpenAlex ID is not a bibliography entry
+number; an unavailable record cannot be mapped to a specific entry from the ID
+alone. Do not guess its title or DOI.
+A retry button starts a fresh search in that direction; review the new search,
+then update the catalog afterward. The old saved search does not change.
+There is no manual reference-matching or "mark resolved" action. Attaching a PDF
+does not clear the gap, and adding the paper to Core papers is not required.
+Provider records may remain missing, so retrying is optional, not a guarantee;
+available results remain usable. Rebuilding the metadata catalog applies the
+current ignore policy to already-confirmed 404s without changing saved searches
+or historical catalog snapshots.
 Citation searches have no
 publication-date filter; the UI labels their date range as unrestricted rather
 than displaying the internal `1000-01-01` lower bound.

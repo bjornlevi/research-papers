@@ -1,6 +1,7 @@
 from copy import deepcopy
 import csv
 import json
+import re
 import sqlite3
 from pathlib import Path
 import subprocess
@@ -19,6 +20,69 @@ from test_releases import fixture_bundle
 
 
 class WebTests(unittest.TestCase):
+    def test_shared_appearance_controls_and_local_script(self):
+        client = self.client(release=self.release)
+        for path in ("/", "/sources", "/search"):
+            response = client.get(path)
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('<script src="/appearance.js"></script>', response.text)
+            self.assertLess(response.text.index('/appearance.js'), response.text.index('/style.css'))
+            for expected in ('<summary>Appearance</summary>', 'for="appearance-theme"',
+                             'for="appearance-contrast"', 'value="system"', 'value="light"',
+                             'value="dark"', 'value="more"', 'id="appearance-status" role="status"',
+                             '<noscript>'):
+                self.assertIn(expected, response.text)
+            self.assertNotIn("'unsafe-inline'", response.headers["Content-Security-Policy"])
+        script = client.get("/appearance.js")
+        self.assertEqual(script.status_code, 200)
+        self.assertEqual(script.headers["content-type"], "text/javascript; charset=utf-8")
+        self.assertIn("localStorage.setItem", script.text)
+        self.assertIn("Browser storage is unavailable", script.text)
+        styles = client.get("/style.css").text
+        for expected in ('prefers-color-scheme:dark', 'prefers-contrast:more',
+                         'prefers-reduced-motion:reduce', 'forced-colors:active',
+                         ':focus-visible', '[data-theme="dark"]', '[data-contrast="more"]',
+                         'prefers-contrast:more){:root:not([data-contrast="more"])',
+                         '*::before,*::after{transition:none!important'):
+            self.assertIn(expected, styles)
+        self.assertNotIn("forced-color-adjust:none", styles)
+
+    def test_theme_palette_contrast(self):
+        styles = web_server.STYLESHEET
+
+        def palette(selector):
+            block = styles.split(selector + "{", 1)[1].split("}", 1)[0]
+            return dict(re.findall(r"(--[\w-]+):([^;]+);", block))
+
+        def luminance(color):
+            color = color.lstrip("#")
+            if len(color) == 3:
+                color = "".join(channel * 2 for channel in color)
+            channels = [int(color[index:index + 2], 16) / 255 for index in (0, 2, 4)]
+            channels = [value / 12.92 if value <= .04045 else ((value + .055) / 1.055) ** 2.4
+                        for value in channels]
+            return sum(value * weight for value, weight in zip(channels, (.2126, .7152, .0722)))
+
+        for mode, colors in (("light", palette(":root")), ("dark", palette(':root[data-theme="dark"]'))):
+            pairs = [(foreground, background)
+                     for foreground in ("ink", "muted", "accent")
+                     for background in ("paper", "canvas", "raised", "accent-soft")]
+            pairs += [("heading", "canvas"), ("heading", "paper"), ("accent-ink", "accent"),
+                      ("accent-ink", "accent-hover"), ("bad-ink", "bad"), ("rail-muted", "rail")]
+            pairs += [("rail-ink", background) for background in ("rail", "rail-hover", "rail-active")]
+            pairs += [(tone, tone + "-soft") for tone in ("ok", "warn", "bad")]
+            for foreground, background in pairs:
+                with self.subTest(mode=mode, foreground=foreground, background=background):
+                    light, dark = sorted((luminance(colors["--" + foreground]),
+                                          luminance(colors["--" + background])), reverse=True)
+                    self.assertGreaterEqual((light + .05) / (dark + .05), 4.5)
+            for foreground, background in (("line-strong", "paper"), ("focus", "paper"),
+                                          ("focus", "canvas"), ("rail-edge", "rail-active")):
+                with self.subTest(mode=mode, control=foreground, background=background):
+                    light, dark = sorted((luminance(colors["--" + foreground]),
+                                          luminance(colors["--" + background])), reverse=True)
+                    self.assertGreaterEqual((light + .05) / (dark + .05), 3)
+
     def test_saved_discovery_labels_use_current_terms_without_rewriting_jobs(self):
         for direction, old, expected in (
                 ("background", "Find referenced papers", "Find references"),
@@ -61,7 +125,7 @@ class WebTests(unittest.TestCase):
         self.assertIn("10 provider reference identifiers could not be resolved", runs)
         self.assertIn("<dt>Next steps</dt>", runs)
         self.assertIn('href="/discovery?direction=background#coverage-issues"', runs)
-        self.assertIn('href="/publications"', runs)
+        self.assertIn('href="/discovery#metadata-catalog"', runs)
         self.assertNotIn("why_incomplete", run)
         missing = web_server.metadata_value({"scope": "Metadata", "runs": [run]}, project_scope=True)
         self.assertIn("does not include a detailed reason", missing)
@@ -276,7 +340,7 @@ class WebTests(unittest.TestCase):
         self.assertIn("Paper 00 &lt;script&gt;", result.text)
         self.assertNotIn("<script>", result.text)
         self.assertNotIn("javascript:", result.text)
-        self.assertIn("offset=50", result.text)
+        self.assertIn("limit=50&amp;page=2", result.text)
         self.assertEqual(result.text.count("<tr>"), 51)
         second = client.get("/library?offset=50")
         self.assertEqual(second.text.count("<tr>"), 7)
@@ -451,7 +515,15 @@ class WebTests(unittest.TestCase):
         self.assertIn("captured 2026-10-19", ranked.text)
         self.assertIn("2 iStopMM connections", ranked.text)
         self.assertNotIn('<select name="sort"><option value="">', ranked.text)
-        self.assertIn("download=awaiting&amp;sort=citations&amp;offset=50", ranked.text)
+        self.assertIn("download=awaiting&amp;sort=citations&amp;limit=50&amp;page=2", ranked.text)
+        sized = client.get("/library?download=awaiting&sort=citations&limit=10&page=2")
+        self.assertEqual(sized.status_code, 200)
+        self.assertIn("Page 2 of 6", sized.text)
+        self.assertIn('name="download" value="awaiting"', sized.text)
+        self.assertIn('name="sort" value="citations"', sized.text)
+        self.assertIn("limit=10&amp;page=3", sized.text)
+        self.assertEqual(client.get("/library?limit=101").status_code, 400)
+        self.assertEqual(client.get("/library?page=0").status_code, 400)
         last = client.get("/library?download=awaiting&sort=citations&offset=50")
         self.assertLess(last.text.index("Zero citations"), last.text.index("Unknown &lt;script&gt;"))
         self.assertIn("Unknown citations", last.text)

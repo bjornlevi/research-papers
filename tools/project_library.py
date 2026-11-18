@@ -304,8 +304,9 @@ def configure_metadata(root, *, progress=None):
                 for provider, result in seed["providers"].items():
                     if result["status"] not in {"complete_indexed_neighborhood", "complete_deposited_references"}:
                         reasons.append(f"{seed['seed_doi']} ({provider}): {result.get('error', result['status'])}")
-        if graph["unresolved"]:
-            reasons.append(f"{len(graph['unresolved'])} provider reference identifiers could not be resolved")
+        unresolved = citation_neighborhood.unresolved_references(graph)
+        if unresolved:
+            reasons.append(f"{len(unresolved)} provider reference identifiers could not be resolved")
         graph["limitations"].extend("Incomplete coverage: " + reason for reason in reasons)
         for saved in graphs:
             for key, node in saved["nodes"].items():
@@ -689,7 +690,10 @@ def discover(root, output, *, directions=None):
     failures = sum(any(provider["status"] not in {"complete_indexed_neighborhood", "complete_deposited_references"}
                        for provider in seed["providers"].values()) for seed in graph["seeds"])
     return {"seeds": len(graph["seeds"]), "nodes": len(graph["nodes"]), "edges": len(graph["edges"]),
-            "unresolved": len(graph["unresolved"]), "seeds_with_provider_gaps": failures,
+            "unresolved": len(citation_neighborhood.unresolved_references(graph)),
+            "seeds_with_provider_gaps": failures,
+            "broken_reference_links": sum(item.get("resolution_status") == "not_found"
+                                          for item in graph["unresolved"]),
             "output": str(output), "citation_edges": str(csv_path), "limitations": graph["limitations"]}
 
 

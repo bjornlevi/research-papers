@@ -58,12 +58,13 @@ discovery output, and settings. It cannot be undone.
 Registered papers start as **awaiting PDF**. After checking that a PDF matches
 the title and DOI and that you can use it privately, put it in
 `releases/pdf-data/` and click **awaiting_pdf** in that paper's status in
-Project settings. Select the matching local file, confirm its identity and authorization,
+**Manage library → Core papers and PDFs**. Select the matching local file, confirm its identity and authorization,
 then click **Attach PDF and prepare draft**. This shared folder survives either
 reset; imported project copies and extracted evidence survive only soft reset. Override the
 folder with `make web PDF_DATA_ROOT=/path/to/pdfs` (restart the web app first).
 PDFs already attached to papers in the active project are omitted from the
-selection list, based on their checksums. PDFs are never served as files.
+selection list, based on their checksums. A paper's **PDF** tab can display its
+checksum-verified retained original in the local web app; it is not exposed by MCP.
 
 Alternatively, click **Find PDF** for a core paper awaiting PDF. It first checks
 the local PDF data folder, including subfolders, using recorded DOI/checksum,
@@ -75,10 +76,11 @@ then select and confirm it before extraction; finding a PDF does not attach it.
 These controls are also available on **Library** for discovered
 papers with a DOI and title. Extracting a discovered paper creates a private draft.
 Publishing its clear text makes it available to AI without adding it to Core papers or expanding discovery seeds.
-For batches, use the per-paper **Locate PDF: off/on** buttons or select the page/all
-matching papers, then **Locate selected PDFs**. Review the saved results and
+For batches, use the per-paper **Locate PDF: off/on** buttons in **Library**, then
+**Manage PDFs for these results** to open **Manage library → Batch PDFs**.
+Select the page/all matching papers, then **Locate selected PDFs**. Review the saved results and
 individually confirm PDFs before **Attach and extract confirmed PDFs on this page**.
-**Project settings → Attach PDFs → Find all** runs local-first lookup for all
+**Manage library → Core papers and PDFs → Find all** runs local-first lookup for all
 Core papers awaiting PDF and opens that same review workflow.
 Relationship/status filters, background progress, pause/resume and failed-item
 retries are available in the [batch workflow](docs/independent-projects.md#batch-pdf-location-and-extraction).
@@ -100,19 +102,49 @@ extraction warnings. AI clients can use `get_source_document` and follow
 guess missing text or repair split words. See
 [whole-document reading](docs/independent-projects.md#read-a-whole-retained-document).
 
-Choose **Find related papers** in the sidebar for **Find references** or
+Choose **Manage library** in the sidebar for **Find references** or
 **Find citing papers**. Searches work before attaching
 PDFs, run in the background, and save metadata results with provider coverage
 and gaps. They do not download PDFs or add papers to your core library.
 Saved discoveries appear alongside core papers in **Library**,
 labelled **References**, **Citing papers**, or both, with their PDF/metadata
 status and links to the searches.
-To populate **Publication metadata**, follow the setup instructions on that page
+Click a paper's **title** to open its in-app page; the **DOI** remains an external
+link. Below the Library table, choose **Rows per page** (10, 25, 50, or 100) and
+**Update**, or use **Go to page**. Paging preserves filters and sorting; changing
+the page size starts at page 1.
+The paper page has six tabs: **Clear text**, **References**, **Citing papers**,
+**PDF**, **Technical information**, and **Publish** / **Published**. Clear text is the default, with an **Edit**
+button at the upper right. Retained structured tables appear inline with their
+page's text; figures/images are not yet stored as inline assets.
+Use **Edit** to correct text, metadata and tables against the original.
+The visual editor has headings, bold/italic, lists, links and undo/redo.
+Drag its lower-right edge to resize it, or use **Reading width** / **Full width**.
+**Edit Markdown source** exposes the retained page markers for precise corrections;
+formatting is saved as Markdown and rendered in the Clear text tab.
+Saving creates a draft; the **Publish** tab separately activates the checked
+version for RAG/MCP. Once active, **Published** shows the publisher, UTC time and
+reason, and offers **Unpublish**. Unpublishing withdraws active retrieval but keeps
+the PDF, draft and history; retained old snapshots are not erased.
+The editor bundle and license notices are packaged locally; Node is not needed
+to run the app. After changing editor dependencies or `web/paper-editor.js`,
+contributors should run `npm ci && npm run build:editor` and include the generated assets.
+
+Open **Appearance** in the sidebar to choose a light or dark theme and increased
+contrast. Choices are saved only in this browser; the default follows device
+settings. Reduced motion and system high-contrast colors are respected.
+The layout and palette adapt the public-domain
+[USWDS documentation template](https://designsystem.digital.gov/templates/documentation-page/)
+and [color tokens](https://designsystem.digital.gov/design-tokens/color/overview/).
+USWDS provides an accessibility-focused foundation, not certification of this app.
+No government branding, external fonts, or remotely loaded theme assets are used.
+To populate **Publication metadata**, open **Manage library → Metadata catalog**
 and click **Configure/update metadata catalog** after discovery completes.
 Repeat after new searches; attaching additional core PDFs preserves the catalog.
 
 Use **Project settings → Add core papers** to enter a DOI/title or import more
-papers from CSV/JSON. Each core entry also has **Remove…**: review its
+papers from CSV/JSON. In **Manage library → Core papers and PDFs**, each Core entry
+also has **Remove…**: review its
 deletion preview and type the DOI to confirm. This purges that paper, exclusive
 discovered relationships, matching PDFs (including shared-folder copies), and
 affected historical data while preserving remaining core evidence and shared

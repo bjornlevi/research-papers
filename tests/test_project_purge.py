@@ -283,12 +283,48 @@ class ProjectPurgeTests(unittest.TestCase):
         self.assertEqual(list(project_library.load(project)["papers"]), ["10.0000/untouched"])
         self.assertIsNone(project_library.status(project)["snapshot"])
 
+    def test_web_purge_awaiting_paper_from_queue_without_evidence_registry(self):
+        project = self.root.parent / "empty-project"
+        project_library.initialize(project, "Empty test", "Authorized")
+        project_library.register(project, [
+            {"doi": "10.0000/awaiting", "title": "Awaiting paper"},
+            {"doi": "10.0000/untouched", "title": "Untouched paper"}])
+        empty_pdfs = self.root.parent / "empty-pdfs"
+        empty_pdfs.mkdir()
+        app = web_server.create_app(registry=project / "registry", project_root=project,
+                                    pdf_data_root=empty_pdfs, profiles={"private_context"},
+                                    allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        base = "http://localhost:8080"
+        settings = client.get("/discovery", base_url=base).get_data(as_text=True)
+        queue = settings.split('<ul class="library-records awaiting-papers">', 1)[1].split("</ul>", 1)[0]
+        self.assertIn('aria-label="Remove Awaiting paper"', queue)
+        self.assertIn('action="/settings/purge-preview"', queue)
+        token = re.search(r'name="token" value="([^"]+)"', queue).group(1)
+        preview = client.post("/settings/purge-preview", data={
+            "token": token, "doi": "10.0000/awaiting"}, base_url=base)
+        self.assertEqual(preview.status_code, 200)
+        plan_id = re.search(r'name="plan_id" value="([^"]+)"', preview.get_data(as_text=True)).group(1)
+        response = client.post("/settings/purge-paper", data={
+            "token": token, "doi": "10.0000/awaiting", "confirmation": "10.0000/awaiting",
+            "plan_id": plan_id}, base_url=base)
+        self.assertEqual(response.status_code, 303)
+        app.extensions["core_purge"]["thread"].join(timeout=15)
+        self.assertFalse(app.extensions["core_purge"]["thread"].is_alive())
+        progress = client.get(response.location, base_url=base)
+        self.assertIn(b"permanently removed", progress.data)
+        self.assertEqual(list(project_library.load(project)["papers"]), ["10.0000/untouched"])
+        self.assertIsNone(project_library.status(project)["snapshot"])
+        settings = client.get("/discovery", base_url=base).get_data(as_text=True)
+        self.assertNotIn("Awaiting paper", settings)
+        self.assertIn("Untouched paper", settings)
+
     def test_web_add_import_preview_confirmation_and_background_purge(self):
         app = self.app()
         client = app.test_client()
         base = "http://localhost:8080"
         token = self.token(client)
-        settings = client.get("/settings", base_url=base)
+        settings = client.get("/discovery", base_url=base)
         self.assertIn(b'class="danger remove-core"', settings.data)
         self.assertIn(b'aria-label="Remove Remove this core"', settings.data)
         self.assertIn(b'<dialog id="purge-dialog"', settings.data)
