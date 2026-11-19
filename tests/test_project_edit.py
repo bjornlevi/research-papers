@@ -303,25 +303,27 @@ class ProjectEditTests(unittest.TestCase):
             allowed_collections={"core"}, default_collections=["core"])
         client = app.test_client()
         base = "http://localhost:8080"
-        url = "/library/edit?doi=10.0000/example"
+        url = "/library/paper?id=doi%3A10.0000%2Fexample"
         response = client.get(url, base_url=base)
         html = response.get_data(as_text=True)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["Cache-Control"], "no-store")
         self.assertNotIn("<textarea", html)
-        self.assertIn('name="action" value="publish"', html)
+        self.assertIn('&amp;tab=publication"', html)
         self.assertNotIn("Save corrected version", html)
-        text = re.search(r'<pre class="reading" id="document-text">(.*?)</pre>', html, re.S).group(1)
-        text = unescape(re.sub(r'</?span[^>]*>', '', text))
-        self.assertEqual(text, "\n\n".join(unit["text"] for unit in units))
-        self.assertIn("Paper metadata and provenance", html)
+        positions = [html.index(f'id="{unit["id"]}"') for unit in units]
+        self.assertEqual(positions, sorted(positions))
+        for unit in units:
+            self.assertIn(web_server.clear_text_html(unit["text"]), html)
         self.assertIn("Corrected title", html)
-        self.assertIn("Correction history (1)", html)
+        technical = client.get(url + "&tab=technical", base_url=base).text
+        self.assertIn("Correction history", technical)
+        self.assertIn("Source and extraction", technical)
         self.assertIn("<th>Measure</th>", html)
         self.assertIn("participants", html)
-        self.assertIn("Operator transcription", html)
-        self.assertIn("Extraction warnings and provenance", html)
-        edit_link = unescape(re.search(r'<a class="button" href="([^"]+)">Turn on edit mode', html).group(1))
+        self.assertIn("Operator transcription", technical)
+        self.assertIn("Extraction warnings and provenance", technical)
+        edit_link = unescape(re.search(r'<a class="button" href="([^"]+)">Edit</a>', html).group(1))
         edit_html = client.get(edit_link, base_url=base).get_data(as_text=True)
         self.assertIn('id="edit-text"', edit_html)
         self.assertIn("Return to read-only view", edit_html)
@@ -339,7 +341,7 @@ class ProjectEditTests(unittest.TestCase):
             allowed_collections={"core"}, default_collections=["core"])
         client = app.test_client()
         base = "http://localhost:8080"
-        url = "/library/edit?doi=10.0000/example&mode=edit"
+        url = "/library/paper?id=doi%3A10.0000%2Fexample&mode=edit"
         html = client.get(url, base_url=base).get_data(as_text=True)
         draft = unescape(re.search(r'<textarea id="edit-text"[^>]*>(.*?)</textarea>', html, re.S).group(1))
         self.assertEqual(draft, project_edit.document_draft(units))
@@ -431,7 +433,7 @@ class ProjectEditTests(unittest.TestCase):
             allowed_collections={"core"}, default_collections=["core"])
         client = app.test_client()
         base = "http://localhost:8080"
-        url = "/library/edit?doi=10.0000/example&mode=edit&scope=page"
+        url = "/library/paper?id=doi%3A10.0000%2Fexample&mode=edit&scope=page"
         response = client.get(url, base_url=base)
         self.assertEqual(response.status_code, 200)
         self.assertIn(self.unit["text"].encode(), response.data)
@@ -456,8 +458,9 @@ class ProjectEditTests(unittest.TestCase):
         response = client.get(response.location, base_url=base)
         self.assertNotIn(b'id="edit-text"', response.data)
         self.assertIn(self.args["text"].encode(), response.data)
-        self.assertIn(b"Correction history (1)", response.data)
-        self.assertIn(b"Test reviewer", response.data)
+        technical = client.get("/library/paper?id=doi%3A10.0000%2Fexample&tab=technical", base_url=base)
+        self.assertIn(b"Correction history", technical.data)
+        self.assertIn(b"Test reviewer", technical.data)
         self.assertIn(b"<th>Measure</th>", response.data)
         sources = client.get("/sources", base_url=base)
         self.assertNotIn(b"Corrected title", sources.data)
@@ -467,7 +470,7 @@ class ProjectEditTests(unittest.TestCase):
         self.assertIn(b"2021", sources.data)
         self.assertIn(b"example.org", sources.data)
         listing = client.get("/library", base_url=base)
-        self.assertIn(b"View and correct extracted data", listing.data)
+        self.assertIn(b'href="/library/paper?id=doi%3A10.0000%2Fexample"', listing.data)
         stale = client.post("/library/edit", data=form, base_url=base)
         self.assertEqual(stale.status_code, 400)
         self.assertIn(b"Evidence changed while editing", stale.data)
@@ -479,11 +482,12 @@ class ProjectEditTests(unittest.TestCase):
             pdf_data_root=self.pdfs, profiles={"private_context"},
             allowed_collections={"core"}, default_collections=["core"])
         client = app.test_client()
-        response = client.get("/library/edit?doi=10.0000/example&mode=edit&scope=page", base_url="http://localhost:8080")
+        response = client.get("/library/paper?id=doi%3A10.0000%2Fexample&mode=edit&scope=page", base_url="http://localhost:8080")
         self.assertIn(b"&lt;/textarea&gt;&lt;script&gt;not executable&lt;/script&gt;", response.data)
-        self.assertGreater(response.data.count(b"Long transcription with retained details."), 120)
+        draft = re.search(r'<textarea id="edit-text"[^>]*>(.*?)</textarea>', response.text, re.S).group(1)
+        self.assertEqual(unescape(draft), long_text)
         self.assertNotIn(b"<script>not executable</script>", response.data)
-        view = client.get("/library/edit?doi=10.0000/example", base_url="http://localhost:8080")
+        view = client.get("/library/paper?id=doi%3A10.0000%2Fexample", base_url="http://localhost:8080")
         self.assertIn(b"&lt;/textarea&gt;&lt;script&gt;not executable&lt;/script&gt;", view.data)
         self.assertNotIn(b"<script>not executable</script>", view.data)
         self.assertNotIn(b'id="edit-text"', view.data)
@@ -493,7 +497,7 @@ class ProjectEditTests(unittest.TestCase):
             pdf_data_root=self.pdfs, profiles={"private_context"},
             allowed_collections={"core"}, default_collections=["core"])
         client = app.test_client()
-        response = client.get("/library/edit?doi=10.0000/example&mode=edit&scope=page", base_url="http://localhost:8080")
+        response = client.get("/library/paper?id=doi%3A10.0000%2Fexample&mode=edit&scope=page", base_url="http://localhost:8080")
         html = response.get_data(as_text=True)
         self.assertNotIn('id="edit-page"', html)
         nav = re.search(r'<nav class="pager" aria-label="Retained pages">(.*?)</nav>', html).group(1)
@@ -611,7 +615,7 @@ class ProjectEditTests(unittest.TestCase):
             allowed_collections={"core"}, default_collections=["core"])
         client = app.test_client()
         base = "http://localhost:8080"
-        html = client.get("/library/edit?doi=10.0000/columns&mode=edit&scope=page", base_url=base).get_data(as_text=True)
+        html = client.get("/library/paper?id=doi%3A10.0000%2Fcolumns&mode=edit&scope=page", base_url=base).get_data(as_text=True)
         token = re.search(r'name="token" value="([^"]+)"', html).group(1)
         form = self.args["bibliography"] | args | {
             "doi": "10.0000/columns", "action": "repair-layout", "token": token,

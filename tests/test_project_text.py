@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from html import unescape
+from urllib.parse import quote
 
 import pymupdf
 
@@ -49,7 +50,7 @@ class ProjectTextTests(unittest.TestCase):
         client = web_server.create_app(registry=self.root / "registry", project_root=self.root,
             profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"]).test_client()
         base = "http://localhost:8080"
-        editor = client.get("/library/edit?doi=10.0000/text&mode=edit", base_url=base)
+        editor = client.get("/library/paper?id=doi%3A10.0000%2Ftext&mode=edit", base_url=base)
         for expected in (b'src="/paper-editor.js"', b'class="paper-edit-form"', b'id="visual-editor" hidden',
                          b'id="edit-text" name="text"', b'data-command="bold"', b'data-command="italic"',
                          b'data-command="bullets"', b'data-command="numbers"', b'data-command="link"',
@@ -89,7 +90,7 @@ class ProjectTextTests(unittest.TestCase):
         for expected in ("Synthetic article", 'id="extracted-content"', 'id="document-text"',
                          "Drafttoken original article page 1", "Drafttoken original article page 2",
                          "Not available to RAG/MCP", ">Edit</a>", ">Publish</a>",
-                         'href="/library/edit?'):
+                         'href="' + url + '&amp;mode=edit'):
             self.assertIn(expected, html)
         self.assertNotIn("Read the active RAG/MCP version", html)
         self.assertNotIn("PDF page 1", html)
@@ -103,6 +104,8 @@ class ProjectTextTests(unittest.TestCase):
         editor = client.get(editor_url, base_url=base).get_data(as_text=True)
         self.assertIn("Edit mode", editor)
         self.assertIn("Whole document text / OCR", editor)
+        self.assertIn('aria-label="Paper views"', editor)
+        self.assertIn('src="/paper-editor.js"', editor)
         self.publish()
         current = project_text.editorial_store(self.root).current()
         project_edit.correct(self.root,
@@ -195,6 +198,22 @@ class ProjectTextTests(unittest.TestCase):
         self.assertEqual(public.load(result["snapshot"]).snapshots["core"]._bundle, published.snapshots["core"]._bundle)
         self.assertTrue(self.pdf.is_file())
 
+    def test_library_actions_link_only_available_retained_pdfs(self):
+        project_library.register(self.root, [{"doi": "10.0000/missing", "title": "Awaiting PDF article"}])
+        client = web_server.create_app(registry=self.root / "registry", project_root=self.root,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"]).test_client()
+        base = "http://localhost:8080"
+        pdf_url = "/library/paper/pdf?id=doi%3A10.0000%2Ftext"
+        html = client.get("/library", base_url=base).text
+        self.assertIn(f'<td><a href="{pdf_url}">Open local PDF</a></td>', html)
+        self.assertNotIn('/library/paper/pdf?id=doi%3A10.0000%2Fmissing', html)
+        response = client.get(pdf_url, base_url=base)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "application/pdf")
+        response.close()
+        (self.root / "papers" / (self.source["sha256"] + ".pdf")).unlink()
+        self.assertNotIn("Open local PDF", client.get("/library", base_url=base).text)
+
     def test_paper_tabs_show_inline_tables_and_private_checksum_bound_pdf(self):
         project_edit.correct(self.root,
             snapshot_id=self.editorial.release_id, source_id=self.source["id"], unit_id=self.units[0]["id"],
@@ -255,6 +274,47 @@ class ProjectTextTests(unittest.TestCase):
         self.assertIn(b"No local PDF", client.get(url + "&tab=pdf", base_url=base).data)
         self.assertEqual(client.get(pdf_url, base_url=base).status_code, 404)
 
+    def test_legacy_editor_redirects_to_shared_paper_page_and_preserves_options(self):
+        client = web_server.create_app(registry=self.root / "registry", project_root=self.root,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"]).test_client()
+        base = "http://localhost:8080"
+        legacy = "/library/edit?doi=10.0000%2Ftext"
+        canonical = "/library/paper?id=doi%3A10.0000%2Ftext"
+        before = project_text.editorial_store(self.root).current().release_id
+        response = client.get(legacy, base_url=base)
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.location, canonical)
+        self.assertEqual(client.get(legacy, base_url=base, follow_redirects=True).data,
+                         client.get(canonical, base_url=base).data)
+        unit_id = self.units[-1]["id"]
+        encoded_unit = quote(unit_id, safe="")
+        response = client.get(legacy + "&unit_id=" + unit_id, base_url=base)
+        self.assertEqual(response.location, canonical + "&unit_id=" + encoded_unit + "#" + encoded_unit)
+        for options, expected in (
+                ("mode=edit", "&mode=edit"),
+                ("mode=edit&scope=page&unit_id=" + unit_id, "&unit_id=" + encoded_unit + "&mode=edit&scope=page"),
+                ("download=text", "&download=text")):
+            with self.subTest(options=options):
+                response = client.get(legacy + "&" + options, base_url=base)
+                self.assertEqual(response.status_code, 303)
+                self.assertEqual(response.location, canonical + expected)
+                redirected = client.get(legacy + "&" + options, base_url=base, follow_redirects=True)
+                self.assertEqual(redirected.status_code, 200)
+                self.assertEqual(redirected.headers["Cache-Control"], "no-store")
+                if options == "download=text":
+                    self.assertEqual(redirected.mimetype, "text/plain")
+                    self.assertEqual(redirected.text, project_edit.document_draft(self.units))
+                else:
+                    self.assertIn(b'aria-label="Paper views"', redirected.data)
+                    self.assertIn(b'id="edit-text"', redirected.data)
+                    self.assertIn(b'src="/paper-editor.js"', redirected.data)
+        for options in ("mode=invalid", "scope=invalid", "download=invalid", "unit_id=missing", "unknown=yes"):
+            with self.subTest(invalid=options):
+                self.assertEqual(client.get(legacy + "&" + options, base_url=base,
+                                            follow_redirects=True).status_code, 400)
+        self.assertEqual(client.get(canonical + "&tab=technical&mode=edit", base_url=base).status_code, 400)
+        self.assertEqual(project_text.editorial_store(self.root).current().release_id, before)
+
     def test_tab_editor_saves_and_publishes_back_to_paper_content(self):
         client = web_server.create_app(registry=self.root / "registry", project_root=self.root,
             profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"]).test_client()
@@ -264,10 +324,15 @@ class ProjectTextTests(unittest.TestCase):
         editor_url = unescape(re.search(r'href="([^"]+)">Edit</a>', html).group(1))
         editor = client.get(editor_url, base_url=base).text
         form = {name: unescape(re.search(fr'name="{name}" value="([^"]*)"', editor).group(1))
-                for name in ("token", "doi", "unit_id", "source_id", "snapshot_id", "scope", "return_to")}
+                for name in ("token", "doi", "unit_id", "source_id", "snapshot_id", "scope")}
         form.update({k: v or "" for k, v in self.source["bibliography"].items()})
         form.update(text=project_edit.document_draft(self.units).replace("Drafttoken", "Tabedited"),
                     source_url=self.source["url"], tables="[]", reviewer="Manager", reason="Compared with original")
+        invalid = client.post("/library/edit", data=form | {"tables": "invalid"}, base_url=base)
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn(b'aria-label="Paper views"', invalid.data)
+        self.assertIn(b'src="/paper-editor.js"', invalid.data)
+        self.assertIn(b"Tabedited", invalid.data)
         saved = client.post("/library/edit", data=form, base_url=base)
         self.assertEqual(saved.status_code, 303)
         self.assertEqual(saved.location, url)
@@ -385,7 +450,7 @@ class ProjectTextTests(unittest.TestCase):
             profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"])
         client = app.test_client()
         base = "http://localhost:8080"
-        html = client.get("/library/edit?doi=10.0000/text&mode=edit", base_url=base).get_data(as_text=True)
+        html = client.get("/library/paper?id=doi%3A10.0000%2Ftext&mode=edit", base_url=base).get_data(as_text=True)
         form = {name: re.search(fr'name="{name}" value="([^"]*)"', html).group(1)
                 for name in ("token", "doi", "unit_id", "source_id", "snapshot_id", "scope")}
         form.update({k: v or "" for k, v in self.source["bibliography"].items()})
@@ -398,12 +463,12 @@ class ProjectTextTests(unittest.TestCase):
                                base_url=base)
         self.assertEqual(response.status_code, 303)
         self.assertEqual(project_library.store(self.root).call("search_evidence", {"query": "Importedtoken"})["result"]["items"], [])
-        html = client.get(response.location, base_url=base).get_data(as_text=True)
+        html = client.get(response.location + "&tab=publication", base_url=base).get_data(as_text=True)
         form = {name: re.search(fr'name="{name}" value="([^"]*)"', html).group(1)
-                for name in ("token", "doi", "unit_id", "source_id", "snapshot_id")}
+                for name in ("token", "id", "snapshot_id")}
         form.update(action="publish", reviewer="Web admin", reason="Checked against PDF")
-        self.assertEqual(client.post("/library/edit", data=form, base_url=base).status_code, 400)
-        self.assertEqual(client.post("/library/edit", data=form | {"checked": "yes"}, base_url=base).status_code, 303)
+        self.assertEqual(client.post("/library/paper/publication", data=form, base_url=base).status_code, 400)
+        self.assertEqual(client.post("/library/paper/publication", data=form | {"checked": "yes"}, base_url=base).status_code, 303)
         self.assertEqual(len(project_library.store(self.root).call("search_evidence", {"query": "Importedtoken"})["result"]["items"]), 2)
 
     def test_migration_withdraws_active_text_but_preserves_original_snapshot_and_pdf(self):
