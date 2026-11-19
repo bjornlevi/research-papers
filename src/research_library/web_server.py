@@ -821,28 +821,27 @@ main.library-page{max-width:none}
 .library-table{table-layout:fixed;width:100%;min-width:0}
 .library-table thead{position:sticky;top:0;background:var(--paper);z-index:1}
 .library-table th,.library-table td{padding:.5rem;overflow-wrap:anywhere;white-space:normal}
-.library-table th:first-child{width:24%}
-.library-table th:nth-child(2){width:13%}
+.library-table th:first-child{width:25%}
+.library-table th:nth-child(2){width:14%}
 .library-table th:nth-child(3){width:10%}
 .library-table th:nth-child(4){width:11%}
 .library-table th:nth-child(5){width:10%}
 .library-table th:nth-child(6){width:7%}
 .library-table th:nth-child(7){width:12%}
-.library-table th:nth-child(8){width:13%}
+.library-table th:nth-child(8){width:11%}
 .library-table tbody th{color:var(--ink);font-size:inherit;font-weight:500;border-bottom:1px solid var(--line)}
 .library-table tbody tr:hover th{background:var(--raised)}
 .library-table .badge{white-space:normal}
 .library-table details{margin:.5rem 0 0;font-size:.85rem;font-weight:400}
 .library-table .column-filters input,.library-table .column-filters select{width:100%;min-width:0;font-size:.85rem}
 .library-table .sort-direction{color:var(--muted)}
-.library-table .library-actions form{margin:.35rem 0}
-.library-table .library-actions button{font-size:.85rem;padding:.3rem .5rem}
 .library-table button{white-space:normal;overflow-wrap:anywhere;min-width:0}
-.library-table .library-actions input:not([type="checkbox"]),.library-table .library-actions select{width:100%;min-width:0}
-.paper-tabs{display:flex;gap:.25rem;overflow-x:auto;border:1px solid var(--line);border-radius:.5rem .5rem 0 0;background:var(--paper);margin:1rem 0}
-.paper-tabs a{padding:.65rem .9rem;white-space:nowrap;text-decoration:none}
-.paper-tabs a:hover{background:var(--raised);text-decoration:underline}
-.paper-tabs a[aria-current="page"]{background:var(--accent-soft);border-bottom:3px solid var(--accent);font-weight:700}
+.library-table .column-filters button{font-size:.85rem;padding:.4rem .5rem;white-space:nowrap}
+.paper-tabs{display:flex;gap:0;overflow-x:auto;border-bottom:1px solid var(--line-strong);margin:1rem 0}
+.paper-tabs a{flex-shrink:0;padding:.65rem 1rem;white-space:nowrap;text-decoration:none;color:var(--muted);
+  border-bottom:3px solid transparent;font-weight:600}
+.paper-tabs a:hover{background:var(--raised);color:var(--ink)}
+.paper-tabs a[aria-current="page"]{color:var(--accent);border-bottom-color:var(--accent);font-weight:700}
 .paper-content-heading{display:flex;justify-content:space-between;align-items:center;gap:1rem}
 .paper-clear-text{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.75}
 .paper-clear-text.markdown{white-space:normal}
@@ -937,11 +936,11 @@ mark{background:var(--mark);color:var(--mark-ink);padding:0 .08em;border-radius:
 .actions .button{margin:0}
 
 /* Pagination */
-.pager,main>nav{display:flex;flex-wrap:wrap;gap:.5rem;margin:1.25rem 0}
+.pager,main>nav:not(.paper-tabs):not(.tabs){display:flex;flex-wrap:wrap;gap:.5rem;margin:1.25rem 0}
 .pager:empty{display:none}
-.pager a,main>nav a{display:inline-block;padding:.35rem .85rem;border:1px solid var(--line-strong);border-radius:4px;
+.pager a,main>nav:not(.paper-tabs):not(.tabs) a{display:inline-block;padding:.35rem .85rem;border:1px solid var(--line-strong);border-radius:4px;
   text-decoration:none;font-weight:500;font-size:.92rem;color:var(--ink)}
-.pager a:hover,main>nav a:hover{background:var(--raised);border-color:var(--muted);color:var(--ink)}
+.pager a:hover,main>nav:not(.paper-tabs):not(.tabs) a:hover{background:var(--raised);border-color:var(--muted);color:var(--ink)}
 .pager a[aria-current="page"]{background:var(--raised);border-color:var(--accent);font-weight:700}
 .library-pagination{align-items:center}
 .library-pagination form{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin:0}
@@ -2286,7 +2285,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                    " — Worked at acquisition; publisher access may change.</p>" if acquired_url else "")
                 + "</details></article>")
             if project_root and refs and refs[index]["collection_id"] == "core":
-                entries[-1] += (f'<p><a href="/library/edit?{escape(urlencode({"doi": source["doi"]}), quote=True)}">'
+                entries[-1] += (f'<p><a href="{escape(paper_url(collections.publication(source["doi"])), quote=True)}">'
                                 'View and correct extracted data</a></p>')
             member_cid = refs[index]["collection_id"] if store else ""
             evidence = current.snapshots[member_cid] if store else current
@@ -2536,11 +2535,14 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
     def paper_page():
         if not project_root:
             raise ValueError("Paper pages are enabled only for private project libraries")
-        if set(request.args) - {"id", "tab"} or not request.args.get("id"):
+        content_parameters = {"unit_id", "mode", "scope", "download"}
+        if set(request.args) - ({"id", "tab"} | content_parameters) or not request.args.get("id"):
             raise ValueError("Select one Library paper")
         tab = request.args.get("tab", "content")
         if tab not in {"content", "references", "citing", "pdf", "technical", "publication"}:
             raise ValueError("Unknown paper tab")
+        if tab != "content" and set(request.args) & content_parameters:
+            raise ValueError("Editor parameters require the Clear text tab")
         from .build import project_edit, project_index
         paper = project_index.paper_detail(project_root, request.args["id"], include_metadata=tab == "technical")
         current, source = paper_source(paper)
@@ -2549,7 +2551,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             paper = {**paper, "title": bibliography.get("title") or paper["title"],
                      "year": bibliography.get("year") or paper["year"]}
         if tab == "content" and source:
-            return edit_paper(paper_record=paper)
+            return paper_content(paper_record=paper)
+        if tab == "content" and set(request.args) & content_parameters:
+            raise ValueError("Attach and extract this paper before editing")
         if tab in {"references", "citing"}:
             label = "References" if tab == "references" else "Citing papers"
             body = (f'<h3>{label} ({len(paper[tab])})</h3>'
@@ -2582,7 +2586,11 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 body += '<h3>Source and extraction</h3>' + metadata_value(source)
                 units = project_edit.document_units(current.snapshots["core"]._bundle, source["id"])
                 body += '<details><summary>Extraction warnings</summary>' + "".join(
-                    source_warnings(unit) for unit in units) + '</details>'
+                    '<section><h4>' + escape(quality_location(unit["citation"]["locator"])) + '</h4>'
+                    + '<p><a href="' + escape(paper_url(paper["id"]) + "&" + urlencode({
+                        "unit_id": unit["id"], "mode": "edit", "scope": "page"}), quote=True)
+                    + '#page-editor">Edit this page</a></p>' + source_warnings(unit) + '</section>'
+                    for unit in units) + '</details>'
                 body += '<details><summary>Correction history</summary>' + metadata_value(
                     project_edit.history(project_root, source["id"])[:20]) + '</details>'
         else:
@@ -2601,11 +2609,24 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         response.headers["Cache-Control"] = "no-store"
         return response
 
-    def edit_paper(error=None, status_code=200, *, draft_text=None, paper_record=None):
+    def edit_paper():
         if not project_root:
             raise ValueError("Editing is enabled only for private project libraries")
-        if paper_record is None and request.method == "GET" and set(request.args) - {"doi", "unit_id", "mode", "scope", "download", "return_to"}:
+        if set(request.args) - {"doi", "unit_id", "mode", "scope", "download", "return_to"}:
             raise ValueError("Unknown editor parameter")
+        identity = collections.publication(request.args.get("doi", ""))
+        if not identity.startswith("doi:"):
+            raise ValueError("Select one Library paper")
+        parameters = {key: request.args[key] for key in ("unit_id", "mode", "scope", "download")
+                      if key in request.args}
+        url = paper_url(identity) + ("&" + urlencode(parameters) if parameters else "")
+        if parameters.get("unit_id") and parameters.get("mode", "view") == "view" and not parameters.get("download"):
+            url += "#" + quote(parameters["unit_id"], safe="")
+        return redirect(url, code=303)
+
+    def paper_content(error=None, status_code=200, *, draft_text=None, paper_record=None):
+        if not project_root:
+            raise ValueError("Editing is enabled only for private project libraries")
         mode = request.args.get("mode", "view")
         if mode not in {"view", "edit"}:
             raise ValueError("Unknown editor mode")
@@ -2614,9 +2635,14 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if scope not in {"document", "page"}:
             raise ValueError("Unknown correction scope")
         whole_document = scope == "document"
-        from .build import project_edit, project_library, project_text
-        doi = paper_record["doi"] if paper_record else request.values.get("doi", "")
-        current = paper_snapshot(editorial=True) if paper_record else project_text.editorial_store(project_root).current()
+        from .build import project_edit, project_index, project_text
+        if paper_record is None:
+            paper_record = project_index.paper_detail(
+                project_root, collections.publication(request.form.get("doi", "")), include_metadata=False)
+        doi = paper_record["doi"]
+        current = paper_snapshot(editorial=True)
+        if current is None:
+            raise ValueError("Attach and extract this paper before editing")
         evidence = current.snapshots["core"]
         source = next((source for source in evidence._bundle["sources"]
                        if collections.publication(source["doi"]) == collections.publication(doi)), None)
@@ -2630,11 +2656,10 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             raise ValueError("Select an extracted page belonging to this paper")
         tables = [table for table in evidence._bundle["tables"]
                   if table["citation"]["source_id"] == source["id"]
-                  and (whole_document or table["citation"]["locator"] == unit["citation"]["locator"])]
+                  and (not editing or whole_document or table["citation"]["locator"] == unit["citation"]["locator"])]
         bibliography = source.get("bibliography") or {key: None for key in project_edit.BIB_FIELDS}
-        if paper_record:
-            paper_record = {**paper_record, "title": bibliography.get("title") or paper_record["title"],
-                            "year": bibliography.get("year") or paper_record["year"]}
+        paper_record = {**paper_record, "title": bibliography.get("title") or paper_record["title"],
+                        "year": bibliography.get("year") or paper_record["year"]}
         if request.args.get("download") == "text":
             response = Response(project_edit.document_draft(project_edit.document_units(evidence._bundle, source["id"])),
                                 mimetype="text/plain")
@@ -2667,23 +2692,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             return rendered
 
         def finish(body):
-            if paper_record:
-                response = page(paper_record["title"] or "Paper", paper_tabs(paper_record, body))
-                response.status_code = status_code
-                response.headers["Cache-Control"] = "no-store"
-                return response
-            history = project_edit.history(project_root, source["id"])
-            body += f'<details><summary>Correction history ({len(history)})</summary>'
-            for event in history[:20]:
-                body += ('<details><summary>' + escape(event["at"] + " — " + event["reviewer"])
-                         + '</summary>' + metadata_value({
-                             "Reason": event["reason"], "Original PDF checksum": event["source_sha256"],
-                             "Parent snapshot": event["parent_snapshot"], "New version": event["release"],
-                             "Before": event["before"], "After": event["after"]}) + '</details>')
-            body += ('</details><p>'
-                     f'<a href="{escape(paper_url(collections.publication(doi)), quote=True)}">Paper information and content</a> | '
-                     '<a href="/library">Library</a> | <a href="/sources">Sources available to AI</a></p>')
-            response = page("View and correct extracted data", body, editor_script=editing)
+            response = page(paper_record["title"] or "Paper",
+                            paper_tabs(paper_record, body, selected="content"), editor_script=editing)
             response.status_code = status_code
             response.headers["Cache-Control"] = "no-store"
             return response
@@ -2691,16 +2701,15 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         labels = {"title": "Title", "year": "Publication year (YYYY)",
                   "acquired_from": "Acquired from URL", "acquisition_method": "Acquisition method",
                   "acquired_at": "Acquisition date/time (ISO format)"}
-        return_to_paper = paper_record is not None or request.values.get("return_to") == "/library/paper"
-        view_url = "/library/edit?" + urlencode({
-            "doi": doi, "unit_id": unit_id, **({"return_to": "/library/paper"} if return_to_paper else {})})
-        if paper_record:
+        view_url = paper_url(paper_record["id"])
+        if not editing:
             published = paper_snapshot(editorial=False)
             text_status = project_text.publication_state(
                 evidence._bundle, published.snapshots["core"]._bundle, source["id"])
             body = ('<section id="extracted-content">'
                     '<header class="paper-content-heading"><h3>Clear text</h3>'
-                    f'<a class="button" href="{escape(view_url + "&mode=edit#page-editor", quote=True)}">Edit</a></header>')
+                    f'<a class="button" href="{escape(view_url + "&mode=edit#page-editor", quote=True)}">Edit</a></header>'
+                    f'<p><a href="{escape(view_url + "&download=text", quote=True)}">Download clear-text draft</a></p>')
             if text_status == "draft":
                 body += '<p class="meta">Not available to RAG/MCP: this text is an unpublished draft.</p>'
             else:
@@ -2713,103 +2722,17 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 body += '<p role="alert">Some extracted text is incomplete or missing. Check the original PDF.</p>'
             body += '<article id="document-text" aria-label="Current clear text">'
             for item in units:
-                body += '<div class="paper-clear-text markdown">' + clear_text_html(item["text"]) + '</div>'
+                body += (f'<div id="{escape(item["id"], quote=True)}" class="paper-clear-text markdown">'
+                         + clear_text_html(item["text"]) + '</div>')
                 inline_tables = [table for table in tables
                                  if table["citation"]["locator"] == item["citation"]["locator"]]
                 if inline_tables:
                     body += rendered_tables(inline_tables)
             body += '</article></section>'
             return finish(body)
-        if not editing:
-            published = project_library.store(project_root).current()
-            text_status = project_text.publication_state(evidence._bundle, published.snapshots["core"]._bundle, source["id"])
-            body = (f'<h3>{escape(bibliography["title"] or source["doi"])}</h3>'
-                    f'<p><strong>Clear-text status: {escape(text_status.replace("_", " "))}.</strong> '
-                    'Drafts are private editorial content, not RAG evidence. Publication approves transcription, not scientific findings.</p>'
-                    '<p>Read-only view of all retained pages. Text is unchanged, with two newlines between pages. '
-                    'Missing text and split words are not automatically repaired. Original PDFs are not served here.</p>'
-                    f'<p>DOI: <code>{escape(source["doi"])}</code></p>'
-                    f'<p><a class="button" href="{escape(view_url + "&mode=edit#page-editor", quote=True)}">'
-                    'Turn on edit mode</a> | '
-                    f'<a href="{escape(view_url + "&download=text", quote=True)}">Download clear-text draft</a></p>'
-                    '<nav class="pager" aria-label="Retained pages">')
-            published_source = next((item for item in published.snapshots["core"]._bundle["sources"]
-                                     if item["id"] == source["id"]), None)
-            retrieval = ('<section id="extracted-content"><h3>Extracted content</h3>'
-                         '<p>The text below is the latest retained extraction/editorial version. '
-                         'The library manager is responsible for comparing it with the original PDF, correcting '
-                         'text, tables and omissions, and publishing the checked version.</p>')
-            if published_source:
-                active_url = document_reader_url({"snapshot_id": published.release_id}, "core", source["id"])
-                retrieval += (f'<p><a href="{escape(active_url, quote=True)}">Read the active RAG/MCP version</a>. '
-                              + ('The latest text below is published for AI retrieval.</p>' if text_status == "published"
-                                 else 'AI still uses the previously published version, not the latest draft below.</p>'))
-            else:
-                retrieval += '<p><strong>Not available to RAG/MCP: this text is an unpublished draft.</strong></p>'
-            acquisition = project_library.downloaded_pdf_metadata(pdf_data_root).get(
-                (collections.publication(doi), source["sha256"]))
-            pdf_url = acquisition.get("final_url") if acquisition else None
-            retrieval += ('<p>PDF/source link: ' + metadata_value(pdf_url or source["url"])
-                          + '. Use the paper&#39;s PDF tab to compare its retained original when available.</p>')
-            body = retrieval + body
-            warnings, text = [], []
-            for index, item in enumerate(units):
-                location = quality_location(item["citation"]["locator"])
-                page_url = "/library/edit?" + urlencode({"doi": doi, "unit_id": item["id"]})
-                body += (f'<a href="{escape(page_url, quote=True)}#document-page-{index}"'
-                         + (' aria-current="page"' if item["id"] == unit_id else '')
-                         + f'>{escape(location)}</a> ')
-                text.append(f'<span id="document-page-{index}">{escape(item["text"])}</span>')
-                warnings.append(
-                    f'<section><h4>{escape(location)}</h4>'
-                    f'<p><a href="{escape(page_url + "&mode=edit&scope=page#page-editor", quote=True)}">Edit {escape(location)}</a></p>'
-                    + source_warnings(item)
-                    + ('<p><strong>Stored extraction is marked incomplete.</strong></p>' if item["truncated"] else '')
-                    + ('<p>No text retained here; check the original PDF.</p>' if not item["text"] else '')
-                    + '</section>')
-            body += '</nav>'
-            if any("ocr" in " ".join(item["caveats"]).lower() for item in units):
-                body += '<p><strong>Includes OCR transcription; compare with the original PDF.</strong></p>'
-            if any(item["truncated"] or not item["text"] for item in units):
-                body += '<p><strong>Some pages have incomplete or missing retained text.</strong></p>'
-            body += ('<details><summary>Paper metadata and provenance</summary><dl>'
-                     + "".join(f'<dt>{escape(labels[key])}</dt><dd>{metadata_value(bibliography.get(key))}</dd>'
-                               for key in project_edit.BIB_FIELDS)
-                     + f'<dt>Citation/source URL</dt><dd>{metadata_value(source["url"])}</dd>'
-                     + f'<dt>Source ID</dt><dd>{metadata_value(source["id"])}</dd>'
-                     + f'<dt>Original PDF checksum</dt><dd>{metadata_value(source["sha256"])}</dd>'
-                     + '</dl></details><details><summary>Pages and extraction warnings</summary>'
-                     + "".join(warnings) + '</details>'
-                     + '<h4>Whole extracted text</h4><pre class="reading" id="document-text">'
-                     + "\n\n".join(text) + '</pre>')
-            all_tables = [table for table in evidence._bundle["tables"]
-                          if table["citation"]["source_id"] == source["id"]]
-            body += f'<details><summary>Structured tables ({len(all_tables)})</summary>'
-            for table in all_tables:
-                body += (f'<h4>{escape(quality_location(table["citation"]["locator"]))}</h4>'
-                         + rendered_tables([table]))
-            if not all_tables:
-                body += '<p>No structured tables retained. Tables may still appear in the extracted page text.</p>'
-            body += ('</details><h4>Publish clear text for retrieval</h4>'
-                     '<p>Publish only after checking the clear text, tables, page boundaries and omissions against the PDF. '
-                     'Use your own tools or LLM for cleanup; no external model is called by this app.</p>'
-                     '<form method="post" action="/library/edit">'
-                     f'<input type="hidden" name="token" value="{provide_token}">'
-                     f'<input type="hidden" name="doi" value="{escape(doi, quote=True)}">'
-                     f'<input type="hidden" name="unit_id" value="{escape(unit_id, quote=True)}">'
-                     f'<input type="hidden" name="source_id" value="{escape(source["id"], quote=True)}">'
-                     f'<input type="hidden" name="snapshot_id" value="{current.release_id}">'
-                     '<input type="hidden" name="action" value="publish">'
-                     '<label>Your name<input name="reviewer" required maxlength="200"></label>'
-                     '<label>Publication reason<input name="reason" required maxlength="2000"></label>'
-                     '<label><input type="checkbox" name="checked" value="yes" required>'
-                     ' I checked this clear text against the source and approve it for retrieval.</label>'
-                     '<button>Publish clear text for retrieval</button></form></section>')
-            return finish(body)
-
         body = (f'<h3>{escape(bibliography["title"] or source["doi"])}</h3>'
                 '<p><strong>Edit mode</strong> — saving creates a draft, not published RAG evidence.</p>'
-                f'<p><a href="{escape(paper_url(collections.publication(doi)) if return_to_paper else view_url, quote=True)}">'
+                f'<p><a href="{escape(view_url, quote=True)}">'
                 'Return to read-only view (discard unsaved changes)</a></p>'
                 + help_note("Editing extracted data", '<p>Edit retained page text/OCR, paper metadata and structured tables. '
                 'Compare against the original PDF using the paper&#39;s PDF tab or your local copy. '
@@ -2831,14 +2754,13 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                      'before saving. This replaces the text draft, not the retained evidence.</p>')
         if not whole_document:
             body += ('<nav class="pager" aria-label="Retained pages">'
-                 + "".join('<a href="/library/edit?'
-                           + escape(urlencode({"doi": doi, "unit_id": item["id"], "mode": "edit", "scope": "page"}), quote=True) + '#page-editor"'
+                 + "".join('<a href="'
+                           + escape(view_url + "&" + urlencode({"unit_id": item["id"], "mode": "edit", "scope": "page"}), quote=True) + '#page-editor"'
                            + (' aria-current="page"' if item["id"] == unit_id else '')
                            + f'>{escape(quality_location(item["citation"]["locator"]))}</a> ' for item in units)
                  + '</nav>')
         body += ('<form class="paper-edit-form" method="post" enctype="multipart/form-data" action="/library/edit">'
                  f'<input type="hidden" name="token" value="{provide_token}">'
-                 + ('<input type="hidden" name="return_to" value="/library/paper">' if return_to_paper else '')
                  + f'<input type="hidden" name="doi" value="{escape(doi, quote=True)}">'
                  f'<input type="hidden" name="unit_id" value="{escape(unit_id, quote=True)}">'
                  f'<input type="hidden" name="scope" value="{scope}">'
@@ -2939,16 +2861,15 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                         source_id=request.form.get("source_id", ""), reviewer=request.form.get("reviewer", ""),
                         reason=request.form.get("reason", ""), checked=request.form.get("checked") == "yes")
                     store.clear_cache()
-                    if request.form.get("return_to") == "/library/paper":
-                        return redirect(paper_url(collections.publication(request.form.get("doi", ""))), code=303)
-                    return redirect("/library/edit?" + urlencode({"doi": request.form.get("doi", "")}), code=303)
+                    return redirect(paper_url(collections.publication(request.form.get("doi", "")))
+                                    + "&tab=publication", code=303)
                 if request.form.get("action") == "repair-layout":
                     if request.form.get("scope", "page") != "page":
                         raise ValueError("Paragraph-layout repair is available in the individual page editor")
                     draft = project_edit.paragraph_draft(project_root,
                         snapshot_id=request.form.get("snapshot_id", ""), source_id=request.form.get("source_id", ""),
                         unit_id=request.form.get("unit_id", ""))
-                    return edit_paper(draft_text=draft)
+                    return paper_content(draft_text=draft)
                 try:
                     tables = json.loads(request.form.get("tables", "[]"))
                 except ValueError as error:
@@ -2971,12 +2892,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     whole_document=request.form.get("scope", "page") == "document")
         except (ValueError, ValidationError) as error:
             diagnostic("web_correction_rejected", exception_type=type(error).__name__)
-            return edit_paper(str(error), 400, draft_text=imported_text)
+            return paper_content(str(error), 400, draft_text=imported_text)
         store.clear_cache()
-        if request.form.get("return_to") == "/library/paper":
-            return redirect(paper_url(collections.publication(request.form.get("doi", ""))), code=303)
-        return redirect("/library/edit?" + urlencode({
-            "doi": request.form.get("doi", ""), "unit_id": request.form.get("unit_id", "")}), code=303)
+        return redirect(paper_url(collections.publication(request.form.get("doi", ""))), code=303)
 
     def batch_action():
         from .build import project_batch, project_index, project_library
@@ -3324,9 +3242,6 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         pagination = library_pager(result["matching"], offset, limit)
         job = project_batch.load(project_root)
         selected_count = sum(item["selected"] for item in job["items"].values())
-        batch_hidden = (f'<input type="hidden" name="token" value="{provide_token}">'
-                        + "".join(f'<input type="hidden" name="{name}" value="{escape(str(value), quote=True)}">'
-                                  for name, value in {**view, "offset": offset, "limit": limit}.items()))
         def filter_select(name, label, options, selected):
             return (f'<label class="visually-hidden" for="library-{name}">{label}</label>'
                     f'<select id="library-{name}" name="{name}" form="library-filters">' + "".join(
@@ -3403,8 +3318,14 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             return f'<a href="{escape(url, quote=True)}">{escape(title)}</a>'
 
         search_jobs = dict(searches)
-        pdfs = available_project_pdfs()
-        for index, row in enumerate(result["rows"]):
+        current = paper_snapshot(editorial=True)
+        sources = {collections.publication(source["doi"]): source
+                   for source in current.snapshots["core"]._bundle["sources"]} if current else {}
+        for row in result["rows"]:
+            source = sources.get(row["id"])
+            pdf_link = (
+                '<a href="' + escape("/library/paper/pdf?" + urlencode({"id": row["id"]}), quote=True)
+                + '">Open local PDF</a>' if local_paper_pdf(source) else "—")
             connections = ""
             for direction, doi in sorted(row["relations"]):
                 related = papers.get(doi.removeprefix("doi:"))
@@ -3430,28 +3351,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 f'<td>{badge(row["status"])}</td>'
                 + "".join(f'<td>{escape(row[field]) if row[field] else "—"}</td>'
                           for field in ("first_author", "year", "journal"))
-                + '<td class="library-actions">'
-                + ('<form method="post" action="/library/batch">' + batch_hidden
-                   + f'<input type="hidden" name="doi" value="{escape(row["doi"], quote=True)}">'
-                   f'<button name="action" value="toggle" class="secondary locate-toggle" '
-                   f'aria-label="Locate PDF for {escape(row["title"], quote=True)}" aria-pressed="'
-                   + ("true" if job["items"].get(row["doi"], {}).get("selected") else "false")
-                   + '">Locate PDF: '
-                   + ("on" if job["items"].get(row["doi"], {}).get("selected") else "off")
-                   + '</button><span data-toggle-status role="alert"></span></form>'
-                   if row["doi"] and row["title"] and row["status"] == "Awaiting PDF" else "")
-                + '<details><summary>PDF and text actions</summary>'
-                + ('<p>A resolved DOI and title are required to locate or attach a PDF.</p>'
-                   if not row["doi"] or not row["title"] else "")
-                + (pdf_controls(row["doi"], row["title"], prefix=f"library-{index}", pdfs=pdfs,
-                                return_to="/library")
-                   if row["doi"] and row["title"] and row["status"] == "Awaiting PDF" else "")
-                + (f'<p><a href="/library/edit?{escape(urlencode({"doi": row["doi"]}), quote=True)}">'
-                   'View and correct extracted data</a> | '
-                   f'<a href="/sources?{escape(urlencode({"paper": row["doi"], "collection": "core"}), quote=True)}">'
-                   'Published documents</a></p>'
-                   if row["doi"] and row["status"] not in {"Awaiting PDF", "Metadata only — DOI unresolved"} else "")
-                + '</details></td></tr>')
+                + '<td>' + pdf_link + '</td></tr>')
         if not result["rows"]:
             body += ('<tr><td colspan="8"><p class="empty-state">No papers match these filters. '
                      '<a href="/library">Clear filters and sorting</a>.</p></td></tr>')
@@ -4373,7 +4273,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             body += (f'<p><a class="button secondary" href="{escape(document_reader_url(pin, cid, source_id), quote=True)}">'
                      'Read whole document</a> - all retained pages in one continuous view.</p>')
         if project_root and cid == "core":
-            body += (f'<p><a href="/library/edit?{escape(urlencode({"doi": source["doi"], "unit_id": unit_id}), quote=True)}">'
+            body += (f'<p><a href="{escape(paper_url(collections.publication(source["doi"])) + "#" + unit_id, quote=True)}">'
                      'View and correct this page in the active evidence version</a></p>')
         body += '<details><summary>Copy citation and excerpt</summary>'
         body += help_note("Copying citations", "<p>These fields are selectable even if clipboard access is unavailable. "
@@ -4631,8 +4531,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                          + action_form("problem", operator_fields, "Report error") + '</details>')
             if project_root and cid == "core":
                 if unit_id:
-                    body += ('<p><a class="button" href="/library/edit?'
-                             + escape(urlencode({"doi": finding["publication_id"], "unit_id": unit_id}), quote=True)
+                    body += ('<p><a class="button" href="'
+                             + escape(paper_url(collections.publication(finding["publication_id"])) + "&"
+                                      + urlencode({"unit_id": unit_id, "mode": "edit", "scope": "page"}), quote=True)
                              + '#page-editor">Edit extracted data</a></p>')
                 elif finding["code"] == "missing_unit":
                     body += ('<details><summary>Add missing page text</summary>'

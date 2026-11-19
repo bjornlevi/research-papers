@@ -67,6 +67,23 @@ class ProjectBatchTests(unittest.TestCase):
         table = client.get("/library", base_url=base).get_data(as_text=True)
         self.assertIn('href="/library/paper?id=doi%3A10.0000%2F1">Neighbor 001</a>', table)
         self.assertIn('href="https://doi.org/10.0000/1">10.0000/1</a>', table)
+        self.assertIn('>Actions</th>', table)
+        self.assertNotIn('class="library-actions"', table)
+        self.assertNotIn('PDF and text actions', table)
+        self.assertNotIn('class="secondary locate-toggle"', table)
+        header = re.search(r'<thead><tr>(.*?)</tr>', table, re.S).group(1)
+        self.assertEqual(header.count('<th '), 8)
+        filters = re.search(r'<tr class="column-filters">(.*?)</tr>', table, re.S).group(1)
+        self.assertEqual(filters.count('<td>'), 8)
+        self.assertTrue(filters.endswith(
+            '<td><button type="submit" form="library-filters">Apply filters</button></td>'))
+        self.assertNotIn('Open local PDF', table)
+        rows = re.search(r'<tbody>(.*?)</tbody>', table, re.S).group(1)
+        for row in re.findall(r'<tr[^>]*>(.*?)</tr>', rows, re.S):
+            self.assertEqual(row.count('<td>'), 7)
+            self.assertEqual(row.count('<th scope="row">'), 1)
+        empty = client.get("/library?query=nonexistent-library-paper", base_url=base).text
+        self.assertIn('<td colspan="8">', empty)
         detail = project_index.paper_detail(self.root, "doi:10.0000/1")
         self.assertEqual(detail["doi"], "10.0000/1")
         self.assertEqual(detail["references"], [])
@@ -161,11 +178,11 @@ class ProjectBatchTests(unittest.TestCase):
         table = html.split('<tbody>', 1)[1]
         self.assertLess(table.index('>Neighbor 009</a>'), table.index('>Neighbor 000</a>'))
         self.assertNotIn('>Neighbor 010</a>', table)
-        token = re.search(r'name="token" value="([^"]+)"', html).group(1)
         management_url = unescape(re.search(
             r'href="([^"]+)">Manage PDFs for these results</a>', html).group(1))
         manager = client.get(management_url, base_url=base)
         self.assertEqual(manager.status_code, 200)
+        token = re.search(r'name="token" value="([^"]+)"', manager.text).group(1)
         management_view = parse_qs(urlsplit(management_url).query)
         self.assertEqual(management_view["library_offset"], ["50"])
         for name, value in view.items():
@@ -439,12 +456,13 @@ class ProjectBatchTests(unittest.TestCase):
         base = "http://localhost:8080"
         listing = client.get("/library?relationship=background&status=awaiting", base_url=base)
         self.assertIn(b"30 matching records", listing.data)
-        self.assertIn(b'aria-pressed="false">Locate PDF: off', listing.data)
+        self.assertIn(b">Actions</th>", listing.data)
         self.assertIn(b'<script src="/library.js" defer></script>', listing.data)
         script = client.get("/library.js", base_url=base)
         self.assertEqual(script.status_code, 200)
         self.assertIn(b"fetch(form.getAttribute('action')", script.data)
-        token = re.search(r'name="token" value="([^"]+)"', listing.get_data(as_text=True)).group(1)
+        token = re.search(r'name="token" value="([^"]+)"',
+                          client.get("/discovery", base_url=base).text).group(1)
         self.assertEqual(client.post("/library/batch", data={"action": "all"}, base_url=base).status_code, 403)
         form = {"token": token, "action": "toggle", "doi": self.row["doi"], "relationship": "background",
                 "status": "awaiting", "offset": "0"}
@@ -452,8 +470,8 @@ class ProjectBatchTests(unittest.TestCase):
         self.assertEqual(response.status_code, 303)
         self.assertIn("#locate-", response.location)
         self.assertTrue(project_batch.load(self.root)["items"][self.row["doi"]]["selected"])
-        self.assertIn(b'aria-pressed="true">Locate PDF: on',
-                      client.get(response.location.split("#")[0], base_url=base).data)
+        self.assertIn(b'1</span> papers marked for PDF location',
+                      client.get("/library", base_url=base).data)
         client.post("/library/batch", data=form, base_url=base)
         self.assertFalse(project_batch.load(self.root)["items"][self.row["doi"]]["selected"])
         for selected in [True, False]:
@@ -499,7 +517,7 @@ class ProjectBatchTests(unittest.TestCase):
         client = app.test_client()
         base = "http://localhost:8080"
         token = re.search(r'name="token" value="([^"]+)"',
-            client.get("/library", base_url=base).get_data(as_text=True)).group(1)
+            client.get("/discovery", base_url=base).get_data(as_text=True)).group(1)
         started, finish = threading.Event(), threading.Event()
 
         def locate(*args, **kwargs):

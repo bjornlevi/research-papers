@@ -217,13 +217,14 @@ provider summaries, with reported/retrieved counts and errors. Technical provide
 details remain expandable rather than appearing as raw JSON.
 
 For an extracted paper in **Library** or **Sources available to AI**, click
-**View and correct extracted data**. It opens in read-only mode with the whole
-retained document in page order, separated by two newlines without altering page
-text. Paper metadata, provenance, page warnings, structured tables from all pages
-and correction history are expandable. The reader also links to this view for
-the current version of its retained page.
+**View and correct extracted data**. It opens the paper's **Clear text** tab with
+the whole retained document in page order and tables inline. Metadata, provenance,
+page warnings, links to individual page editors and correction history are under
+**Technical information**; publication is under **Publish**. The reader also links
+to the current version of its retained page. Old `/library/edit?doi=...` links
+redirect to this same paper page, preserving editor, page and download options.
 
-Choose **Turn on edit mode**, or **Edit** on a paper's **Clear text** tab, to
+Choose **Edit** on the paper's **Clear text** tab to
 edit visually and save all pages in a single audited draft version. The toolbar
 offers headings, bold, italic, bulleted/numbered lists, links and undo/redo.
 Page boundaries are protected in visual mode. Use **Reading width** or **Full
@@ -354,10 +355,9 @@ papers selected elsewhere. Existing local matches and downloads are reused.
 Review the batch results and explicitly confirm each PDF before extraction;
 finding PDFs does not attach them or start discovery.
 
-In **Library**, filter by relationship and PDF/extraction status, then switch
-**Locate PDF: off/on** for individual papers. These are toggle buttons, not
-identity/permission confirmations. Toggles update in place without navigating or
-changing scroll position (ordinary form navigation is retained without JavaScript).
+In **Library**, filter by relationship and PDF/extraction status. Click a paper's
+title to open its PDF and clear-text controls. The **Actions** column links to
+the retained local PDF when available; its header contains **Apply filters**.
 Open **Manage PDFs for these results** to carry the Library's filters, sort order
 and page into **Manage library → Batch PDFs**. There, **Mark papers on this page
 for PDF location** selects eligible records on that page; **Mark all matching
