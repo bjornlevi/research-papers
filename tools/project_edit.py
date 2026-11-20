@@ -240,7 +240,6 @@ def correct(root, *, snapshot_id, source_id, unit_id, text, bibliography, source
                 for child in value:
                     update_citations(child)
         update_citations(bundle)
-        releases.validate_bundle(bundle)
         if bundle == original._bundle:
             raise ValueError("No data changed")
         audit_note = " Admin-edited draft; original extraction retained in prior snapshots; not published for retrieval."
@@ -286,6 +285,8 @@ def correct(root, *, snapshot_id, source_id, unit_id, text, bibliography, source
             # Registry publication is the last operation: failed staging leaves active evidence unchanged.
             snapshot = registry.publish(document)
             activated = True
+            project_text.export_git_markdown(root, bundle, source_id=source_id,
+                                             kind="draft", release_id=release_id)
             return {"snapshot": snapshot, "release": release_id, "audit": str(run / "correction.json")}
         finally:
             if not activated:

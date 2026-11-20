@@ -2,8 +2,11 @@
 
 from copy import deepcopy
 from datetime import datetime, timezone
+import os
 from pathlib import Path
+import re
 import shutil
+import subprocess
 import tempfile
 
 from research_library import collections, releases
@@ -137,6 +140,182 @@ def publication_state(editorial, published, source_id):
             else "draft_revision")
 
 
+def _git_markdown_directory(root):
+    result = subprocess.run(
+        ["git", "-C", str(Path(root).resolve()), "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise ValueError("Git Markdown tracking requires the project to be inside a Git repository")
+    repository = Path(result.stdout.strip()).resolve()
+    destination = repository / "project-markdown"
+    if destination.is_symlink():
+        raise ValueError("Git Markdown output directory cannot be a symlink")
+    destination.mkdir(exist_ok=True)
+    return destination
+
+
+def _markdown_cell(value):
+    return str(value if value is not None else "").replace("|", r"\|").replace("\r\n", "\n").replace("\n", "<br>")
+
+
+def _markdown_version(bundle, source_id, kind, release_id, known):
+    from . import literature_text
+
+    source = next((item for item in bundle["sources"] if item["id"] == source_id), None)
+    if source is None:
+        raise ValueError("Cannot export Markdown for a missing source")
+    units = [item for item in bundle["units"] if item["citation"]["source_id"] == source_id]
+    content = [f"> Version type: **{kind}**<br>\n> Release: `{release_id}`\n\n",
+               literature_text.render(source, units, {}, known)]
+    tables = [table for table in bundle["tables"] if table["citation"]["source_id"] == source_id]
+    if tables:
+        content.append("\n## Structured tables\n\n")
+    for table in tables:
+        page = table["citation"]["locator"].get("pdf_page")
+        content.append(f"### {_markdown_cell(table['title'])}\n\n")
+        if page is not None:
+            content.append(f"PDF page: {page}\n\n")
+        headers = [header + (f" ({unit})" if unit else "")
+                   for header, unit in zip(table["headers"], table["units"])]
+        content.extend([
+            "| " + " | ".join(_markdown_cell(value) for value in headers) + " |\n",
+            "| " + " | ".join("---" for _ in headers) + " |\n",
+        ])
+        for row in table["rows"]:
+            content.append("| " + " | ".join(_markdown_cell(value) for value in row) + " |\n")
+        if table["footnotes"]:
+            content.append("\n" + "\n".join(f"- {_markdown_cell(note)}" for note in table["footnotes"]) + "\n")
+        content.append("\n")
+    lines = []
+    for line in "".join(content).splitlines():
+        trailing = len(line) - len(line.rstrip(" \t"))
+        lines.append(line.rstrip(" \t") + ("<br>" if trailing >= 2 else ""))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def export_git_markdown(root, bundle, *, source_id, kind, release_id, force=False,
+                        known=None, refresh_index=True, output_root=None, stage=True):
+    from . import literature_text, project_library
+
+    if not force and not project_library.load(root).get("git_markdown_tracking", False):
+        return None
+    if kind not in {"extracted", "draft", "published"} or not re.fullmatch(r"[0-9a-f]{64}", release_id):
+        raise ValueError("Invalid Git Markdown version identity")
+    source = next((item for item in bundle["sources"] if item["id"] == source_id), None)
+    if source is None:
+        raise ValueError("Cannot export Markdown for a missing source")
+    if known is None:
+        known = literature_text.evidence(bundle["units"])
+    directory = (output_root or _git_markdown_directory(root)) / literature_text.slug(source)
+    if directory.is_symlink():
+        raise ValueError("Git Markdown paper directory cannot be a symlink")
+    directory.mkdir(exist_ok=True)
+    target = directory / f"{kind}-{release_id}.md"
+    if target.is_symlink():
+        raise ValueError("Git Markdown version cannot be a symlink")
+    content = _markdown_version(bundle, source_id, kind, release_id, known)
+    if target.exists():
+        if target.read_text(encoding="utf-8") == content:
+            if refresh_index:
+                _write_git_markdown_index(directory.parent)
+            if stage:
+                paths = [target]
+                if refresh_index:
+                    paths.append(directory.parent / "index.md")
+                _stage_git_markdown(directory.parent, paths)
+            return target
+    descriptor, temporary = tempfile.mkstemp(prefix=".markdown-", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    if refresh_index:
+        _write_git_markdown_index(directory.parent)
+    if stage:
+        paths = [target]
+        if refresh_index:
+            paths.append(directory.parent / "index.md")
+        _stage_git_markdown(directory.parent, paths)
+    return target
+
+
+def _write_git_markdown_index(directory):
+    lines = ["# Project paper Markdown\n\n",
+             "Generated from immutable project releases. Commit these files to retain their history in Git.\n\n"]
+    for paper in sorted(path for path in directory.iterdir() if path.is_dir()):
+        if paper.is_symlink():
+            raise ValueError("Git Markdown paper directory cannot be a symlink")
+        versions = sorted(path for path in paper.glob("*.md") if path.name != "index.md")
+        if not versions:
+            continue
+        lines.append(f"## {paper.name}\n\n")
+        for version in versions:
+            if version.is_symlink():
+                raise ValueError("Git Markdown version cannot be a symlink")
+            lines.append(f"- [{version.stem}]({paper.name}/{version.name})\n")
+        lines.append("\n")
+    target = directory / "index.md"
+    if target.is_symlink():
+        raise ValueError("Git Markdown index cannot be a symlink")
+    descriptor, temporary = tempfile.mkstemp(prefix=".index-", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write("".join(lines).rstrip() + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _stage_git_markdown(directory, paths):
+    repository = directory.parent
+    names = [path.relative_to(repository).as_posix() for path in paths]
+    result = subprocess.run(
+        ["git", "-C", str(repository), "add", "--", *names],
+        capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise ValueError("Could not stage generated Git Markdown: " + result.stderr.strip())
+
+
+def backfill_git_markdown(root):
+    from . import literature_text, project_library
+
+    count = 0
+    output = _git_markdown_directory(root)
+    staged = []
+    workspace = editorial_store(root)
+    if (workspace.root / "active.json").is_file():
+        snapshot = workspace.current().snapshots["core"]
+        known = literature_text.evidence(snapshot._bundle["units"])
+        for source in snapshot._bundle["sources"]:
+            export_git_markdown(root, snapshot._bundle, source_id=source["id"],
+                                kind="draft", release_id=snapshot.release_id, force=True,
+                                known=known, refresh_index=False, output_root=output, stage=False)
+            staged.append(output / literature_text.slug(source) /
+                          f"draft-{snapshot.release_id}.md")
+            count += 1
+    published_store = project_library.store(root)
+    if (published_store.root / "active.json").is_file():
+        snapshot = published_store.current().snapshots["core"]
+        known = literature_text.evidence(snapshot._bundle["units"])
+        for source in snapshot._bundle["sources"]:
+            export_git_markdown(root, snapshot._bundle, source_id=source["id"],
+                                kind="published", release_id=snapshot.release_id, force=True,
+                                known=known, refresh_index=False, output_root=output, stage=False)
+            staged.append(output / literature_text.slug(source) /
+                          f"published-{snapshot.release_id}.md")
+            count += 1
+    if count:
+        _write_git_markdown_index(output)
+        _stage_git_markdown(output, [*staged, output / "index.md"])
+    return count
+
+
 def publish(root, *, snapshot_id, source_id, reviewer, reason, checked):
     from . import project_library, project_edit
     root = Path(root)
@@ -204,8 +383,11 @@ def publish(root, *, snapshot_id, source_id, reviewer, reason, checked):
             entry = next(entry for entry in document["collections"] if entry["id"] == "core")
             entry.update(release_id=release_id, version="published-" + release_id[:16],
                          coverage="Admin-published clear text; transcription approval is not scientific validation.")
+            # Export a published Markdown version only after retrieval activation succeeds.
             snapshot = project_library.store(root).publish(document)
             activated = True
+            export_git_markdown(root, selected, source_id=source_id,
+                                kind="published", release_id=release_id)
             return {"snapshot": snapshot, "release": release_id, "audit": str(run / "correction.json")}
         finally:
             if not activated:

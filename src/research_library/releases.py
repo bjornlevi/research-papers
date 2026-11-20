@@ -2,6 +2,7 @@
 
 from contextlib import closing
 from copy import deepcopy
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -93,6 +94,18 @@ def safe_file(root: Path, name: str) -> Path:
 def _record_schema(name):
     document = deepcopy(contracts.DOCUMENT)
     document.pop("$id", None)
+    record = document["$defs"][name]
+    if record.get("allOf") == [{"$ref": "#/$defs/evidence"}]:
+        evidence = document["$defs"]["evidence"]
+        record.pop("allOf")
+        record.pop("unevaluatedProperties")
+        record["properties"] = {**evidence["properties"], **record["properties"]}
+        record["required"] = list(dict.fromkeys(
+            evidence["required"] + record["required"]))
+        for keyword in ("if", "then"):
+            if keyword in evidence:
+                record[keyword] = evidence[keyword]
+        record["additionalProperties"] = False
     document["$ref"] = "#/$defs/" + name
     if name == "table":
         # Storage is complete; response pagination, not export, imposes 100 rows.
@@ -100,17 +113,15 @@ def _record_schema(name):
     return document
 
 
-def validate_bundle(bundle):
-    if not isinstance(bundle, dict) or set(bundle) != {"schema_version", "caveats", *SECTIONS}:
-        raise ReleaseError("Evidence bundle has unexpected or missing sections")
-    if type(bundle["schema_version"]) is not int or bundle["schema_version"] != MANIFEST_SCHEMA:
-        raise ReleaseError("Unsupported evidence bundle schema")
-    if any(not isinstance(bundle[section], list) for section in SECTIONS):
-        raise ReleaseError("Every evidence section must be an array")
-    Draft202012Validator(contracts.DOCUMENT["$defs"]["caveats"] |
-                         {"$defs": contracts.DOCUMENT["$defs"]}).validate(bundle["caveats"])
-    registry = {}
-    source_schema = {
+@lru_cache(maxsize=1)
+def _caveat_validator():
+    schema = contracts.DOCUMENT["$defs"]["caveats"] | {"$defs": contracts.DOCUMENT["$defs"]}
+    return Draft202012Validator(schema)
+
+
+@lru_cache(maxsize=1)
+def _source_validator():
+    schema = {
         "type": "object", "additionalProperties": False,
         "required": ["id", "doi", "sha256", "format", "url", "provenance", "rights", "omission"],
         "properties": {
@@ -124,19 +135,37 @@ def validate_bundle(bundle):
             "bibliography": contracts.ref("source_bibliography"),
         }, "$defs": contracts.DOCUMENT["$defs"],
     }
-    source_validator = Draft202012Validator(source_schema)
+    return Draft202012Validator(schema)
+
+
+@lru_cache(maxsize=10)
+def _record_validator(name, unbounded_text=False):
+    schema = _record_schema(name)
+    if unbounded_text:
+        schema["$defs"][name]["properties"]["text"] = {"type": "string"}
+    return Draft202012Validator(schema)
+
+
+def validate_bundle(bundle):
+    if not isinstance(bundle, dict) or set(bundle) != {"schema_version", "caveats", *SECTIONS}:
+        raise ReleaseError("Evidence bundle has unexpected or missing sections")
+    if type(bundle["schema_version"]) is not int or bundle["schema_version"] != MANIFEST_SCHEMA:
+        raise ReleaseError("Unsupported evidence bundle schema")
+    if any(not isinstance(bundle[section], list) for section in SECTIONS):
+        raise ReleaseError("Every evidence section must be an array")
+    _caveat_validator().validate(bundle["caveats"])
+    registry = {}
+    source_validator = _source_validator()
     for source in bundle["sources"]:
         source_validator.validate(source)
         if source["id"] in registry:
             raise ReleaseError("Duplicate source ID")
         registry[source["id"]] = source
     ids = {}
-    validators = {key: Draft202012Validator(_record_schema(kind)) for key, kind in (
+    validators = {key: _record_validator(kind) for key, kind in (
         ("claims", "claim"), ("units", "context"), ("tables", "table"),
         ("issues", "issue"), ("relationships", "relationship"))}
-    unit_schema = _record_schema("context")
-    unit_schema["$defs"]["context"]["properties"]["text"] = {"type": "string"}
-    unit_validator = Draft202012Validator(unit_schema)
+    unit_validator = _record_validator("context", unbounded_text=True)
     for section in SECTIONS[1:]:
         if not isinstance(bundle[section], list):
             raise ReleaseError(f"Expected array: {section}")

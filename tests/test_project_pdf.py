@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 import pymupdf
 
@@ -267,32 +268,37 @@ class ProjectPdfTests(unittest.TestCase):
             allowed_collections={"core"}, default_collections=["core"])
         client = app.test_client()
         base = "http://localhost:8080"
+        paper_url = "/library/paper?" + urlencode({"id": "doi:10.0000/neighbor"})
         listing = client.get("/library", base_url=base)
-        self.assertIn(b'name="doi" value="10.0000/neighbor"', listing.data)
-        self.assertNotIn(b'name="doi" value=""', listing.data)
-        self.assertIn(b'Select PDF and attach/extract', listing.data)
-        token = re.search(r'name="token" value="([^"]+)"', listing.get_data(as_text=True)).group(1)
+        self.assertIn(f'href="{paper_url}"'.encode(), listing.data)
+        self.assertNotIn(b'action="/settings/attach-pdf"', listing.data)
+        paper = client.get(paper_url, base_url=base)
+        self.assertEqual(paper.status_code, 200)
+        self.assertIn(b'name="doi" value="10.0000/neighbor"', paper.data)
+        self.assertNotIn(b'name="doi" value=""', paper.data)
+        self.assertIn(b'Select PDF and attach/extract', paper.data)
+        token = re.search(r'name="token" value="([^"]+)"', paper.get_data(as_text=True)).group(1)
         with patch.object(project_library, "find_pdf", return_value={
             "status": "downloaded", "doi": "10.0000/neighbor", "filename": pdf.name,
             "final_url": "https://example.org/paper.pdf", "acquisition": {"license": "cc-by"},
         }) as find:
             response = client.post("/settings/find-pdf", data={
                 "token": token, "doi": "10.0000/neighbor", "title": "Discovered synthetic paper",
-                "return_to": "/library"}, base_url=base)
+                "return_to": "/library/paper"}, base_url=base)
             self.assertEqual(response.status_code, 303)
             app.extensions["find_pdf"]["thread"].join(5)
             find.assert_called_once_with(self.root, "10.0000/neighbor", self.pdf_root,
                                          title="Discovered synthetic paper")
             result = client.get(response.location, base_url=base)
             self.assertIn(b'value="discovered-paper.pdf" selected', result.data)
-            self.assertIn(b'name="return_to" value="/library"', result.data)
+            self.assertIn(b'name="return_to" value="/library/paper"', result.data)
         form = {"token": token, "doi": "10.0000/neighbor", "pdf": pdf.name,
-                "title": "Discovered synthetic paper", "return_to": "/library"}
+                "title": "Discovered synthetic paper", "return_to": "/library/paper"}
         self.assertEqual(client.post("/settings/attach-pdf", data=form, base_url=base).status_code, 400)
         form["confirm_identity"] = "yes"
         response = client.post("/settings/attach-pdf", data=form, base_url=base)
         self.assertEqual(response.status_code, 303)
-        self.assertEqual(response.location, "/library")
+        self.assertEqual(response.location, paper_url)
         status = project_library.status(self.root)
         self.assertEqual([paper["doi"] for paper in status["papers"]], ["10.0000/example"])
         self.assertEqual(status["papers"][0]["status"], "awaiting_pdf")

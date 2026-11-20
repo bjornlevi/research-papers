@@ -307,6 +307,20 @@ operator-reviewed, not independently scientifically validated; existing
 extraction/OCR caveats are retained. The immutable source
 checksum continues to identify the original PDF, not the corrected transcription.
 
+### Track Markdown versions in Git
+
+Project PDFs, releases and extracted text remain ignored by default. To opt in,
+open **Project settings → Track Markdown in Git**, confirm that the repository
+and its remote are authorized for the paper text, and enable tracking. The
+current editorial drafts and published versions are exported under
+`project-markdown/`; new PDF attachments, saved drafts and publications add
+release-stamped Markdown files there. Structured tables are included as
+Markdown tables. Each version is retained rather than overwritten, and
+`project-markdown/index.md` links the versions. Generated files are staged
+automatically, but not committed; review and commit them through the normal Git
+workflow. Disabling tracking stops future exports but leaves existing Git files
+intact. No PDFs or immutable release files are copied into the Git directory.
+
 Existing evidence releases and snapshot-pinned links keep their original data.
 The editor shows a before/after correction history including reviewer, reason,
 time, source checksum, parent snapshot and new release. Saved corrections live

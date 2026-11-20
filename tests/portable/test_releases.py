@@ -184,6 +184,24 @@ class ReleaseTests(unittest.TestCase):
         manifest["release_id"] = releases.sha256(releases.encode(manifest))
         target.write_bytes(releases.encode(manifest))
 
+    def test_record_validators_reject_unknown_fields_and_keep_evidence_conditions(self):
+        record = releases._record_schema("context")["$defs"]["context"]
+        self.assertNotIn("allOf", record)
+        self.assertNotIn("unevaluatedProperties", record)
+        self.assertIs(record["additionalProperties"], False)
+
+        unit = deepcopy(self.bundle["units"][0])
+        releases._record_validator("context", unbounded_text=True).validate(unit)
+        unit["unexpected"] = True
+        with self.assertRaises(ValidationError):
+            releases._record_validator("context", unbounded_text=True).validate(unit)
+
+        claim = deepcopy(self.bundle["claims"][0])
+        claim["verification_status"] = "source_checked_by_human"
+        claim["human_verification"] = "not_reviewed"
+        with self.assertRaises(ValidationError):
+            releases._record_validator("claim").validate(claim)
+
     def test_deterministic_export_and_no_workspace_mutation(self):
         before = snapshots(self.root)
         first, path = self.export()

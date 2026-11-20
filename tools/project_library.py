@@ -22,7 +22,10 @@ from . import citation_neighborhood, literature_ingest, literature_text, literat
 
 def load(root):
     document = literature_ingest.read(Path(root) / "project.json")
-    if set(document) != {"schema_version", "name", "authorization", "papers"} or document["schema_version"] != 1:
+    if (set(document) - {"schema_version", "name", "authorization", "papers", "git_markdown_tracking"}
+            or not {"schema_version", "name", "authorization", "papers"} <= set(document)
+            or document["schema_version"] != 1
+            or type(document.get("git_markdown_tracking", False)) is not bool):
         raise ValueError("Invalid project configuration")
     return document
 
@@ -445,7 +448,8 @@ def initialize(root, name, authorization, rows=None):
         stage = Path(tempfile.mkdtemp(prefix="." + root.name + "-init-", dir=root.parent))
         try:
             collections.atomic_json(stage, "project.json", {
-                "schema_version": 1, "name": name.strip(), "authorization": authorization.strip(), "papers": papers})
+                "schema_version": 1, "name": name.strip(), "authorization": authorization.strip(),
+                "papers": papers, "git_markdown_tracking": False})
             project_preservation.restore(stage, papers, preserved_for=root)
             stage.rename(root)
         finally:
@@ -480,6 +484,24 @@ def register(root, rows):
         project_preservation.restore(root, added)
         collections.atomic_json(Path(root), "project.json", project)
         return added
+
+
+def set_git_markdown_tracking(root, enabled):
+    from . import project_text
+    root = Path(root)
+    if type(enabled) is not bool:
+        raise ValueError("Git Markdown tracking must be enabled or disabled")
+    with literature_update.writer_lock(root):
+        project = load(root)
+        if project.get("git_markdown_tracking", False) == enabled:
+            return {"enabled": enabled, "files": 0}
+        project["git_markdown_tracking"] = enabled
+        if enabled:
+            count = project_text.backfill_git_markdown(root)
+        else:
+            count = 0
+        collections.atomic_json(root, "project.json", project)
+        return {"enabled": enabled, "files": count}
 
 
 def attach(root, doi, pdf, *, identity_confirmed, license=None, title=None, expected_sha256=None, extract=True):
@@ -586,6 +608,8 @@ def attach(root, doi, pdf, *, identity_confirmed, license=None, title=None, expe
             "release_id": installed, "publications": {},
         }]}
         snapshot = registry.publish(document)
+        project_text.export_git_markdown(root, bundle, source_id=built["bundle"]["sources"][0]["id"],
+                                         kind="extracted", release_id=installed)
         return {"doi": doi, "snapshot": snapshot, "release": evidence_id, "pages": len(result["pages"]),
                 "extraction": result["status"], "ocr": built["ocr"],
                 "text_status": "draft", "retrievable": False,

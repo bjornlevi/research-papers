@@ -55,7 +55,14 @@ def clear_text_html(text):
     renderer = MarkdownIt("commonmark", {"html": False, "breaks": True})
     renderer.enable("table")
     renderer.disable("image")
-    return renderer.render(text)
+    rendered = renderer.render(text)
+    return re.sub(
+        r"<table>(.*?)</table>",
+        r'<div class="table-scroll markdown-table-scroll" role="region" '
+        r'aria-label="Scrollable table" tabindex="0"><table>\1</table></div>',
+        rendered,
+        flags=re.DOTALL,
+    )
 
 
 def page(title, body, *, reader_script=False, settings_script=False, library_script=False, editor_script=False):
@@ -1776,6 +1783,20 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                      f'{len(project["papers"])} Core papers registered.</p>'
                      '<p><a href="/discovery">Manage library</a> to review or remove Core papers, attach PDFs, '
                      'find related papers, run batch PDF tools and update the metadata catalog.</p>')
+            tracking_enabled = project.get("git_markdown_tracking", False)
+            body += ('<section class="panel"><h3>Track Markdown in Git</h3>'
+                     '<p>Store extracted, draft and published Markdown versions in '
+                     '<code>project-markdown/</code> at the Git repository root. This includes article text; '
+                     'commit and push only if your repository is authorized for that content. Existing Git files '
+                     'are left in place when tracking is disabled.</p>'
+                     '<form method="post" action="/settings/git-markdown">'
+                     f'<input type="hidden" name="token" value="{provide_token}">'
+                     f'<input type="hidden" name="enabled" value="{"false" if tracking_enabled else "true"}">'
+                     + ('<label><input type="checkbox" name="confirm_rights" value="yes" required> '
+                        'I am authorized to store these texts in this Git repository and its remote.</label>'
+                        if not tracking_enabled else "")
+                     + f'<button>{"Disable" if tracking_enabled else "Enable"} Git Markdown tracking</button>'
+                     '</form></section>')
             body += (
                 '<section class="panel" id="add-core-papers"><h3>Add core papers</h3>'
                 + help_note("Adding core papers", '<p>New papers start awaiting PDF. Adding a paper does not download it. '
@@ -2009,6 +2030,26 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         else:
             project_library.save_openalex_key(project_root, request.form.get("api_key", ""))
         return redirect("/settings", code=303)
+
+    def configure_git_markdown():
+        if not project_root:
+            raise ValueError("Project settings are not enabled")
+        if not hmac.compare_digest(request.form.get("token", ""), provide_token):
+            return Response("Settings form expired; reload the page.", status=403, mimetype="text/plain")
+        enabled = request.form.get("enabled") == "true"
+        if enabled and request.form.get("confirm_rights") != "yes":
+            return project_settings("Confirm authorization before tracking article text in Git.", 400)
+        from .build import project_library
+        try:
+            with discovery_lock:
+                require_idle_project()
+                result = project_library.set_git_markdown_tracking(project_root, enabled)
+        except ValueError as error:
+            return project_settings(str(error), 400)
+        message = ("Git Markdown tracking enabled; "
+                   f"{result['files']} current versions exported." if enabled
+                   else "Git Markdown tracking disabled; existing files were retained.")
+        return project_settings(message)
 
     def initialize_project():
         if not project_root:
@@ -4764,6 +4805,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
     app.add_url_rule("/settings/metadata-progress", "metadata_progress", metadata_progress, methods=["GET"])
     app.add_url_rule("/settings/openalex-key", "save_project_openalex_key",
                      save_project_openalex_key, methods=["POST"])
+    app.add_url_rule("/settings/git-markdown", "configure_git_markdown",
+                     configure_git_markdown, methods=["POST"])
     app.add_url_rule("/settings/add-papers", "add_project_papers", add_project_papers, methods=["POST"])
     app.add_url_rule("/settings/import-papers", "import_project_papers", add_project_papers, methods=["POST"])
     app.add_url_rule("/settings/purge-preview", "purge_preview", purge_core_paper, methods=["POST"])
