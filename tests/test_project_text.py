@@ -2,6 +2,7 @@ import io
 import json
 from pathlib import Path
 import re
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -11,7 +12,7 @@ from urllib.parse import quote
 import pymupdf
 
 from research_library import collections, web_server
-from research_library.build import project_edit, project_library, project_purge, project_text
+from research_library.build import literature_text, project_edit, project_library, project_purge, project_text
 
 
 class ProjectTextTests(unittest.TestCase):
@@ -38,9 +39,87 @@ class ProjectTextTests(unittest.TestCase):
             "source_id": self.source["id"], "reviewer": "Synthetic admin",
             "reason": "Checked synthetic transcription", "checked": True, **changes})
 
+    def test_git_markdown_tracking_backfills_and_keeps_each_version(self):
+        subprocess.run(["git", "init", "-q", str(self.root.parent)], check=True)
+        client = web_server.create_app(registry=self.root / "registry", project_root=self.root,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"]).test_client()
+        settings = client.get("/settings", base_url="http://localhost:8080").get_data(as_text=True)
+        token = re.search(
+            r'<form method="post" action="/settings/git-markdown">.*?name="token" value="([^"]+)"',
+            settings, re.S).group(1)
+        denied = client.post("/settings/git-markdown",
+                             data={"token": token, "enabled": "true"}, base_url="http://localhost:8080")
+        self.assertEqual(denied.status_code, 400)
+        enabled = client.post("/settings/git-markdown",
+                              data={"token": token, "enabled": "true", "confirm_rights": "yes"},
+                              base_url="http://localhost:8080")
+        self.assertEqual(enabled.status_code, 200)
+        self.assertIn("1 current versions exported", enabled.get_data(as_text=True))
+        output = self.root.parent / "project-markdown"
+        initial = next(output.glob("*/draft-*.md"))
+        self.assertIn("Drafttoken original article page 1", initial.read_text())
+        project_library.register(self.root, [{"doi": "10.0000/extracted", "title": "Extracted article"}])
+        extracted_pdf = self.root.parent / "extracted.pdf"
+        native_text = "Freshly extracted synthetic page with enough native text for this fixture."
+        with pymupdf.open() as pdf:
+            pdf.new_page().insert_text((50, 50), native_text)
+            pdf.save(extracted_pdf)
+        attached = project_library.attach(self.root, "10.0000/extracted", extracted_pdf, identity_confirmed=True)
+        self.assertIsNone(attached["ocr"])
+        extracted = next(output.glob("*/extracted-*.md"))
+        self.assertIn(native_text, extracted.read_text())
+        self.assertEqual(subprocess.run(
+            ["git", "-C", str(self.root.parent), "ls-files", "--error-unmatch",
+             extracted.relative_to(self.root.parent).as_posix()],
+            capture_output=True, check=False).returncode, 0)
+
+        current = project_text.editorial_store(self.root).current()
+        project_edit.correct(
+            self.root, snapshot_id=current.release_id, source_id=self.source["id"], unit_id=self.units[0]["id"],
+            text="Edited markdown with a structured table.",
+            bibliography={key: value or "" for key, value in self.source["bibliography"].items()},
+            source_url=self.source["url"], tables=[{
+                "id": "", "title": "Synthetic values", "headers": ["Measure", "Value"],
+                "units": [None, None], "rows": [["Count", 3]], "footnotes": ["Synthetic fixture."],
+            }], reviewer="Synthetic admin", reason="Track markdown versions", checked=False)
+        current = project_text.editorial_store(self.root).current()
+        latest_draft_path = (output / literature_text.slug(self.source)
+                             / f"draft-{current.snapshots['core'].release_id}.md")
+        self.assertTrue(latest_draft_path.is_file())
+        latest_draft = latest_draft_path.read_text()
+        self.assertIn("Edited markdown with a structured table.", latest_draft)
+        self.assertIn("## Structured tables", latest_draft)
+        self.assertIn("| Count | 3 |", latest_draft)
+        self.assertEqual(subprocess.run(
+            ["git", "-C", str(self.root.parent), "ls-files", "--error-unmatch",
+             latest_draft_path.relative_to(self.root.parent).as_posix()],
+            capture_output=True, check=False).returncode, 0)
+        self.assertIn(initial.name, (output / "index.md").read_text())
+
+        current = project_text.editorial_store(self.root).current()
+        publication = project_text.publish(
+            self.root, snapshot_id=current.release_id, source_id=self.source["id"],
+            reviewer="Synthetic admin", reason="Publish tracked markdown", checked=True)
+        published = (output / literature_text.slug(self.source)
+                     / f"published-{publication['release']}.md")
+        self.assertIn("Edited markdown with a structured table.", published.read_text())
+        self.assertEqual(subprocess.run(
+            ["git", "-C", str(self.root.parent), "ls-files", "--error-unmatch",
+             published.relative_to(self.root.parent).as_posix()],
+            capture_output=True, check=False).returncode, 0)
+        self.assertIn("project-markdown", str(published))
+
+        disabled = client.post("/settings/git-markdown",
+                               data={"token": token, "enabled": "false"},
+                               base_url="http://localhost:8080")
+        self.assertEqual(disabled.status_code, 200)
+        self.assertTrue(initial.is_file())
+        self.assertTrue(published.is_file())
+
     def test_visual_editor_assets_fallback_and_safe_markdown_reading(self):
         markdown = ("## Checked heading\n\n**Bold** and *italic* [source](https://example.org/paper)\n\n"
                     "- First item\n- Second item\n\n<script>alert('unsafe')</script>\n\n"
+                    "| Measure | Value |\n|---|---:|\n| Example | 42 |\n\n"
                     "[unsafe](javascript:alert(1))\n\n![private](https://example.org/private.png)")
         current = project_text.editorial_store(self.root).current()
         project_edit.correct(self.root,
@@ -68,7 +147,10 @@ class ProjectTextTests(unittest.TestCase):
         html = client.get("/library/paper?id=doi%3A10.0000%2Ftext", base_url=base).text
         article = html.split('<article id="document-text"', 1)[1].split("</article>", 1)[0]
         for expected in ("<h2>Checked heading</h2>", "<strong>Bold</strong>", "<em>italic</em>",
-                         'href="https://example.org/paper"', "<li>First item</li>", "&lt;script&gt;"):
+                         'href="https://example.org/paper"', "<li>First item</li>", "&lt;script&gt;",
+                         '<div class="table-scroll markdown-table-scroll" role="region" '
+                         'aria-label="Scrollable table" tabindex="0"><table>',
+                         "<th>Measure</th>", '<td style="text-align:right">42</td>', "</table></div>"):
             self.assertIn(expected, article)
         for unexpected in ("<script>", "<img", 'href="javascript:'):
             self.assertNotIn(unexpected, article)
