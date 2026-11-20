@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 from pathlib import Path
@@ -10,9 +11,10 @@ from html import unescape
 from urllib.parse import quote
 
 import pymupdf
+from mcp.shared.memory import create_connected_server_and_client_session
 
-from research_library import collections, web_server
-from research_library.build import literature_text, project_edit, project_library, project_purge, project_text
+from research_library import collections, passage_context, server, web_server
+from research_library.build import literature_text, project_chunks, project_edit, project_library, project_purge, project_text
 
 
 class ProjectTextTests(unittest.TestCase):
@@ -38,6 +40,54 @@ class ProjectTextTests(unittest.TestCase):
             "snapshot_id": project_text.editorial_store(self.root).current().release_id,
             "source_id": self.source["id"], "reviewer": "Synthetic admin",
             "reason": "Checked synthetic transcription", "checked": True, **changes})
+
+    def test_exact_evidence_through_mcp(self):
+        edited = (
+            "The text mentions Table 1 and Figure 1C but gives no values.\n\n"
+            "## Table 1: Results\n\n| Target | Study group (n = 10) |\n| --- | --- |\n"
+            "| Example | 7 (70%) a |\n| Other | 3 |\n\n**a** Tested subset only.\n\n"
+            "**Figure 1** Selected examples. **(A)** First control. **(B)** Second control. "
+            "**(C)** Third observation."
+        )
+        project_edit.correct(self.root, snapshot_id=self.editorial.release_id, source_id=self.source["id"],
+            unit_id=self.units[0]["id"], text=edited,
+            bibliography={key: value or "" for key, value in self.source["bibliography"].items()},
+            source_url=self.source["url"], tables=[], reviewer="Manager", reason="Compared with original",
+            checked=False)
+        self.publish()
+        registry = project_library.store(self.root)
+        baseline = registry.current()
+        snapshot = baseline.snapshots["core"]
+        units = snapshot.document_units(self.source["id"])
+        blocks = passage_context.document_blocks(units, title=self.source["bibliography"]["title"])
+        self.assertIn("Tested subset only", blocks[2][0]["text"][blocks[2][1]:blocks[2][2]])
+        ranges = ["1", "2-3", *(str(i) for i in range(4, len(blocks) + 1))]
+        project_chunks.update(self.root, source_id=self.source["id"], snapshot_id=baseline.release_id,
+                              form={"ranges": ", ".join(ranges)},
+                              activate=True)
+
+        async def exercise():
+            async with create_connected_server_and_client_session(server.create_server(None, registry)) as client:
+                for query, label, expected in (
+                    ("What does Table 1 report for Example in the study group?", "Table 1: Example",
+                     ("Study group (n = 10)", "7 (70%) a", "Tested subset only")),
+                    ("What does Figure 1C show?", "Figure 1C", ("Selected examples", "Third observation")),
+                ):
+                    response = (await client.call_tool("search_evidence", {"query": query})).structuredContent
+                    hit = response["result"]["items"][0]
+                    self.assertEqual(hit["exact_evidence"]["label"], label)
+                    for text in expected:
+                        self.assertIn(text, hit["exact_evidence"]["text"])
+                    self.assertNotIn("First control", hit["exact_evidence"]["text"])
+                    self.assertEqual(hit["citation"]["locator"], {"kind": "pdf", "pdf_page": 1})
+                    old = (await client.call_tool("search_evidence", {
+                        "query": query, "snapshot_id": baseline.release_id,
+                    })).structuredContent
+                    self.assertFalse(any("exact_evidence" in hit for hit in old["result"]["items"]))
+                missing = (await client.call_tool("search_evidence", {"query": "Figure 1Z"})).structuredContent
+                self.assertFalse(any("exact_evidence" in hit for hit in missing["result"]["items"]))
+
+        asyncio.run(exercise())
 
     def test_git_markdown_tracking_backfills_and_keeps_each_version(self):
         subprocess.run(["git", "init", "-q", str(self.root.parent)], check=True)
@@ -201,10 +251,13 @@ class ProjectTextTests(unittest.TestCase):
         self.assertIn("Correctedtoken", text)
         self.assertNotIn("Drafttoken", text)
         self.assertIn("AI still uses the previously published version", html)
-        active_url = unescape(re.search(r'href="([^"]+)">Read the active RAG/MCP version', html).group(1))
+        active_url = unescape(re.search(r'href="([^"]+)">Open RAG/MCP', html).group(1))
         active = client.get(active_url, base_url=base)
         self.assertEqual(active.status_code, 200)
         self.assertIn(b"Drafttoken original article page 1", active.data)
+        self.assertIn(b"Retrieval by PDF page", active.data)
+        self.assertIn("<summary>Synthetic article · from block 1</summary>", active.text)
+        self.assertNotIn("Sections: Synthetic article", active.text)
         self.assertNotIn(b"Correctedtoken", active.data)
         self.assertEqual(project_library.store(self.root).call(
             "search_evidence", {"query": "Correctedtoken"})["result"]["items"], [])
@@ -451,6 +504,230 @@ class ProjectTextTests(unittest.TestCase):
         self.assertIn("Tabedited", client.get(url, base_url=base).text)
         self.assertEqual(project_library.store(self.root).call(
             "search_evidence", {"query": "Tabedited"})["result"]["items"], [])
+
+    def test_rag_suggestions_follow_sections_not_page_boundaries(self):
+        pages = [{**self.units[0], "text": "## Results\n\nThe result continues"},
+                 {**self.units[1], "text": "on the next page.\n## References\n\nA reference."}]
+        blocks = passage_context.document_blocks(pages)
+        self.assertEqual(project_chunks.suggestions(blocks), [[1, 2], [3, 3]])
+        self.assertEqual([block[3][0] for block in blocks], [[["Results"]], [["Results"]], [["References"]]])
+
+    def test_rag_draft_preview_activation_and_republication(self):
+        source_id = self.source["id"]
+        first_page = self.units[0]["id"]
+
+        def correct(text):
+            project_edit.correct(self.root, snapshot_id=project_text.editorial_store(self.root).current().release_id,
+                source_id=source_id, unit_id=first_page, text=text,
+                bibliography={key: value or "" for key, value in self.source["bibliography"].items()},
+                source_url=self.source["url"], tables=[], reviewer="Manager", reason="Compared with original",
+                checked=False)
+
+        correct("## Results\n\nNeedle first paragraph.\n\nShared bridge.\n\n**Figure 1** Needle final paragraph.")
+        self.publish()
+        registry = project_library.store(self.root)
+        before = registry.current()
+        app = web_server.create_app(registry=self.root / "registry", project_root=self.root,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"])
+        client = app.test_client()
+        base = "http://localhost:8080"
+        url = "/library/paper?id=doi%3A10.0000%2Ftext&tab=rag"
+        html = client.get(url, base_url=base).text
+        self.assertLess(html.index(">Published</a>"), html.index(">RAG/MCP</a>"))
+        self.assertIn("Retrieval by PDF page", html)
+        self.assertIn("Start with the suggested ranges", html)
+        workflow = ["Live retrieval", "1. Review searchable passages", "2. Test a search", "3. Save or apply",
+                    "Reference: numbered source text", "<details><summary>See what live search can return"]
+        positions = [html.index(marker) for marker in workflow]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('value="activate">Apply to live search</button>', html)
+        self.assertIn('<script src="/rag-editor.js" defer></script>', html)
+        self.assertIn('<details id="rag-advanced" open>', html)
+        self.assertIn('data-rag-block="1"', html)
+        self.assertEqual(client.get("/rag-editor.js", base_url=base).mimetype, "text/javascript")
+        self.assertIn("Sections: Results", html)
+        self.assertIn("DOI 10.0000/text", html)
+        form = {name: unescape(re.search(fr'name="{name}" value="([^"]*)"', html).group(1))
+                for name in ("token", "id", "snapshot_id")}
+        label = "Rare outcome (uncommon result): frequency and counts"
+        form.update({"ranges": "1-2, 2-4", "labels": f"2: {label}", "query": "needle"})
+        expected_plan = {first_page: {"ranges": [[1, 2], [2, 4]], "labels": {"2": label}}}
+        endpoint = "/library/paper/rag"
+        self.assertIn("Test query (required for preview only)", html)
+        for blank in ("", " \t "):
+            rejected = client.post(endpoint, data=form | {"action": "preview", "query": blank}, base_url=base)
+            self.assertEqual(rejected.status_code, 400)
+            self.assertIn("Enter a test query before previewing draft search.", rejected.text)
+            self.assertIn(form["ranges"], rejected.text)
+            self.assertIn(form["labels"], rejected.text)
+            self.assertNotIn("minLength", rejected.text)
+        self.assertEqual(registry.current().release_id, before.release_id)
+        rejected = client.post(endpoint, data=form | {"action": "preview", "ranges": "1, 3", "labels": ""}, base_url=base)
+        self.assertEqual(rejected.status_code, 400)
+        for invalid in ("3: not a chunk start", "2: repeated\n2: repeated", "2: " + "x" * 201):
+            rejected = client.post(endpoint, data=form | {"action": "preview", "labels": invalid}, base_url=base)
+            self.assertEqual(rejected.status_code, 400)
+        preview = client.post(endpoint, data=form | {"action": "preview"}, base_url=base)
+        self.assertEqual(preview.status_code, 200)
+        self.assertIn(b"Draft search preview", preview.data)
+        self.assertIn("Check that the top results contain the evidence", preview.text)
+        self.assertLess(preview.text.index("3. Save or apply"), preview.text.index("Draft search preview"))
+        self.assertIn(b"Figure 1", preview.data)
+        self.assertIn(b"PDF pages 1, 2", preview.data)
+        self.assertEqual(client.post(endpoint, data=form | {"action": "save", "query": ""}, base_url=base).status_code, 303)
+        self.assertEqual(registry.current().release_id, before.release_id)
+        saved = client.get(url, base_url=base).text
+        self.assertIn(f"2: {label}", saved)
+        self.assertIn("You have a saved draft that is not live.", saved)
+        frequency = {"query": "How common was rare outcome?"}
+        self.assertFalse(registry.call("search_evidence", frequency)["result"]["items"])
+        labeled_preview = client.post(endpoint, data=form | frequency | {"action": "preview"}, base_url=base)
+        self.assertEqual(labeled_preview.status_code, 200)
+        self.assertIn(f"Extra search terms: {label}", labeled_preview.text)
+        check_form = form | frequency | {
+            "action": "add-check", "expected_page": "1", "expected_excerpt": "Shared   bridge.",
+        }
+        rejected = client.post(endpoint, data=check_form | {"expected_page": "2"}, base_url=base)
+        self.assertEqual(rejected.status_code, 400)
+        self.assertIn("must appear on the selected published PDF page", rejected.text)
+        saved_check = client.post(endpoint, data=check_form, base_url=base)
+        self.assertEqual(saved_check.status_code, 200)
+        self.assertIn("Search check saved.", saved_check.text)
+        comparison = client.post(endpoint, data=form | {"action": "run-checks"}, base_url=base)
+        self.assertEqual(comparison.status_code, 200)
+        self.assertIn("<td>Not in top 5</td><td>Rank 1</td>", comparison.text)
+        self.assertEqual(registry.current().release_id, before.release_id)
+        self.assertEqual(client.post(endpoint, data=form | {"action": "activate", "query": ""}, base_url=base).status_code, 303)
+        active = registry.current()
+        self.assertNotEqual(active.release_id, before.release_id)
+        live = client.get(url, base_url=base).text
+        self.assertIn("Search and MCP use custom chunks", live)
+        self.assertIn("No action needed if live retrieval works for you", live)
+        self.assertNotIn("You have a saved draft that is not live.", live)
+        query = {"query": "needle"}
+        hits = registry.call("search_evidence", query)["result"]["items"]
+        self.assertEqual(len(hits), 2)
+        for hit in hits:
+            self.assertEqual(hit["citation"]["locator"], {"kind": "pdf", "pdf_page": 1})
+            context = registry.call("get_source_context", {
+                "unit_id": hit["id"], "snapshot_id": active.release_id,
+            })["result"]
+            self.assertIn("Shared bridge", context["text"])
+            self.assertEqual(context["text"].count("Needle"), 1)
+            metadata = hit["passage_context"]
+            window = registry.call("get_source_context", {"unit_id": hit["id"], "snapshot_id": active.release_id,
+                                                           "max_characters": 10})["result"]
+            tail = registry.call("get_source_context", {"unit_id": hit["id"], "snapshot_id": active.release_id,
+                                                         "offset": window["next_offset"]})["result"]
+            self.assertEqual(window["text"] + tail["text"], context["text"])
+            self.assertIsNone(tail["next_offset"])
+            self.assertEqual(context["passage_context"], metadata)
+            self.assertEqual(metadata["paper_title"], "Synthetic article")
+            self.assertEqual(metadata["section_paths"], [["Results"]])
+            final = "final paragraph" in context["text"]
+            self.assertEqual(metadata["elements"], (
+                [{"kind": "figure", "label": "Figure 1", "role": "label"}] if final else []))
+            self.assertEqual(metadata["block_range"], {"first": 2, "last": 4} if final else {"first": 1, "last": 2})
+            self.assertEqual(metadata["block_scope"], "document")
+            self.assertEqual([span["citation"]["locator"]["pdf_page"] for span in metadata["source_spans"]],
+                             [1, 2] if final else [1])
+            pages = {unit["id"]: unit["text"] for unit in before.snapshots["core"].document_units(source_id)}
+            self.assertEqual(context["text"], "\n".join(
+                pages[span["unit_id"]][span["start"]:span["end"]] for span in metadata["source_spans"]))
+        self.assertEqual(active.snapshots["core"].document_units(source_id),
+                         before.snapshots["core"].document_units(source_id))
+        self.assertEqual(before.snapshots["core"].call("search_evidence", query)["result"]["items"][0]["id"],
+                         first_page)
+        filtered = active._search(["core"], {"query": "needle", "limit": 10, "offset": 0, "mode": "plain"},
+                                  papers={"doi:10.0000/text"})[0]["items"]
+        self.assertEqual({hit["id"] for hit in filtered}, {hit["id"] for hit in hits})
+        self.assertEqual({hit["id"]: hit["passage_context"] for hit in filtered},
+                         {hit["id"]: hit["passage_context"] for hit in hits})
+        labeled = registry.call("search_evidence", frequency)["result"]["items"]
+        self.assertEqual(len(labeled), 1)
+        paraphrase = {"query": "What proportion had an uncommon result?"}
+        self.assertFalse(registry.call("search_evidence", paraphrase)["result"]["items"])
+        paraphrase = {"query": "What proportion had uncommon result?"}
+        self.assertEqual(registry.call("search_evidence", paraphrase)["result"]["items"], labeled)
+        self.assertFalse(registry.call("search_evidence", paraphrase | {
+            "mode": "fts5", "query": '"What proportion had uncommon result"',
+        })["result"]["items"])
+        hit, = labeled
+        self.assertEqual(hit["passage_context"]["editorial_label"], label)
+        self.assertEqual(hit["passage_context"]["block_range"], {"first": 2, "last": 4})
+        self.assertNotIn(label, hit["snippet"])
+        self.assertIn("Needle final paragraph", hit["snippet"])
+        self.assertEqual(registry.call("search_evidence", frequency | {"paper": "10.0000/text"})["result"]["items"],
+                         labeled)
+        self.assertFalse(registry.call("search_evidence", frequency | {"paper": "10.0000/other"})["result"]["items"])
+        self.assertFalse(registry.call("search_evidence", {"query": "rare AND outcome", "mode": "fts5"})["result"]["items"])
+        for scope in ({"doi:10.0000/text"}, {"doi:10.0000/other"}):
+            matches, _ = active._search(["core"], paraphrase | {"limit": 1, "offset": 0, "mode": "plain"}, papers=scope)
+            self.assertEqual(matches["items"], labeled if "doi:10.0000/text" in scope else [])
+        broad = {"query": "needle", "limit": 1}
+        first = registry.call("search_evidence", broad)["result"]
+        self.assertEqual(first["next_offset"], 1)
+        last = registry.call("search_evidence", broad | {
+            "offset": first["next_offset"], "snapshot_id": active.release_id,
+        })["result"]
+        self.assertEqual(first["items"] + last["items"], hits)
+        self.assertIsNone(last["next_offset"])
+        continuing = registry.call("search_evidence", {"query": "Drafttoken needle"})["result"]["items"][0]
+        self.assertEqual(len(continuing["passage_context"]["source_spans"]), 2)
+        self.assertEqual(continuing["passage_context"]["section_paths"], [["Results"]])
+        project_library.register(self.root, [{"doi": "10.0000/other", "title": "Another synthetic paper"}])
+        other_pdf = self.root.parent / "other.pdf"
+        with pymupdf.open() as pdf:
+            pdf.new_page().insert_text((50, 50), "This unrelated synthetic paper has sufficient native text to extract.")
+            pdf.save(other_pdf)
+        project_library.attach(self.root, "10.0000/other", other_pdf, identity_confirmed=True)
+        editorial = project_text.editorial_store(self.root).current()
+        other = next(s for s in editorial.snapshots["core"]._bundle["sources"] if s["doi"] == "10.0000/other")
+        self.publish(source_id=other["id"])
+        self.assertEqual(registry.current().snapshots["core"].chunk_plans, expected_plan)
+        current = registry.current()
+        project_text.unpublish(self.root, snapshot_id=current.release_id, source_id=other["id"],
+                               reviewer="Manager", reason="Synthetic withdrawal", checked=True)
+        self.assertEqual(registry.current().snapshots["core"].chunk_plans, expected_plan)
+        correct("Newneedle revised paragraph.\n\nAnother reported result.")
+        self.publish()
+        self.assertEqual(registry.current().snapshots["core"].chunk_plans, {})
+        self.assertEqual(registry.call("search_evidence", {"query": "Newneedle"})["result"]["items"][0]["id"],
+                         first_page)
+        html = client.get(url, base_url=base).text
+        self.assertIn("Previous active chunks are stale", html)
+        self.assertIn("saved draft is stale", html)
+        self.assertIn("Review the ranges for this publication", html)
+        self.assertIn("Extra search terms: Needs review", html)
+        self.assertIn(label, html)
+        self.assertIn("Shared bridge.", html)
+        current_form = {name: unescape(re.search(fr'name="{name}" value="([^"]*)"', html).group(1))
+                        for name in ("token", "id", "snapshot_id")}
+        current_form["ranges"] = unescape(re.search(r'name="ranges"[^>]*>([^<]*)', html).group(1))
+        stale = client.post(endpoint, data=current_form | {"action": "run-checks"}, base_url=base)
+        self.assertEqual(stale.status_code, 200)
+        self.assertIn("<td>Review expected excerpt</td><td>Review expected excerpt</td>", stale.text)
+        self.assertEqual(client.post(endpoint, data=current_form | {"action": "save"}, base_url=base).status_code, 303)
+        saved = client.get(url, base_url=base).text
+        self.assertIn("Extra search terms: Needs review", saved)
+        first = current_form["ranges"].split(",")[0].split("-")[0].strip()
+        self.assertEqual(client.post(endpoint, data=current_form | {
+            "action": "save", "labels": f"{first}: {label}",
+        }, base_url=base).status_code, 303)
+        self.assertNotIn("Extra search terms: Needs review", client.get(url, base_url=base).text)
+        check_id = re.search(r'value="remove-check:([a-f0-9]+)"', saved).group(1)
+        removed = client.post(endpoint, data=current_form | {"action": f"remove-check:{check_id}"}, base_url=base)
+        self.assertEqual(removed.status_code, 200)
+        self.assertIn("Search check removed.", removed.text)
+
+    def test_search_terms_follow_a_unique_passage_not_its_old_number(self):
+        page = {"text": "Other\nSame passage", "citation": {"locator": {"pdf_page": 2}}}
+        before = [(page, 6, 18, None)]
+        after = [(page, 0, 5, None), *before]
+        old = project_chunks.passage_anchors(before, [[1, 1]])["1"] | {"terms": "synonym"}
+        self.assertEqual(project_chunks.suggest_terms(after, [[1, 1], [2, 2]], [old]),
+                         ({"2": "synonym"}, []))
+        self.assertEqual(project_chunks.suggest_terms(after, [[1, 2]], [old]), ({}, [old]))
 
     def test_unpublish_preserves_editorial_history_other_sources_and_old_snapshots(self):
         project_library.register(self.root, [{"doi": "10.0000/other", "title": "Other source"}])

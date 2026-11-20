@@ -153,15 +153,32 @@ class CollectionSnapshot:
             result = response["result"]
             refs = [self.reference(cid, record, index) for index, record in enumerate(result["items"])]
             return result, refs
+        target = releases.passage_context.explicit_target(arguments["query"], arguments["mode"])
+        if target:
+            exact = [(score, cid, hit) for cid in selected for score, hit in self.snapshots[cid].exact_search(
+                target, paper=arguments.get("paper"),
+                includes=None if papers is None else lambda doi: publication(doi) in papers)]
+            if exact:
+                exact.sort(key=lambda hit: (-hit[0], hit[2]["id"], hit[2]["exact_evidence"]["label"], hit[1]))
+                distinct = {}
+                for _, cid, hit in exact:
+                    key = (self._aliases[cid, hit["citation"]["doi"]], hit["citation"]["source_sha256"],
+                           releases.encode(hit["passage_context"]["source_spans"]), releases.encode(hit["exact_evidence"]))
+                    distinct.setdefault(key, []).append((cid, hit))
+                page, continuation = releases.exact_page(list(distinct.values()), arguments)
+                return ({"items": [group[0][1] for group in page], "next_offset": continuation,
+                         "scope": contracts.CORPUS_SCOPE},
+                        [self.reference(cid, hit, i) for i, group in enumerate(page) for cid, hit in group])
         # One derived index per query means filtering precedes BM25 and pagination.
-        # Only immutable canonical units are indexed; no release files are changed.
+        # Index the pinned retrieval units without changing release files.
         documents = {}
         for cid in selected:
             snapshot = self.snapshots[cid]
-            for unit in snapshot._bundle["units"]:
+            for unit in snapshot.retrieval_units():
                 citation = unit["citation"]
                 if papers is not None and publication(citation["doi"]) not in papers:
                     continue
+                label = snapshot.editorial_labels.get(unit["id"])
                 identity = releases.sha256(releases.encode({
                     "publication": self._aliases[cid, citation["doi"]],
                     "sha256": citation["source_sha256"], "locator": citation["locator"],
@@ -170,28 +187,35 @@ class CollectionSnapshot:
                 }))
                 if arguments.get("paper") is not None and retrieval.paper_id(citation["doi"]) != retrieval.paper_id(arguments["paper"]):
                     continue
-                item = documents.setdefault(identity, {"unit": unit, "refs": []})
+                item = documents.setdefault(identity, {"refs": [], "labels": set()})
                 item["refs"].append((cid, unit))
+                if label:
+                    item["labels"].add(label)
         with closing(sqlite3.connect(":memory:")) as db:
-            db.execute("CREATE VIRTUAL TABLE search USING fts5(identity UNINDEXED, text, "
+            db.execute("CREATE VIRTUAL TABLE content_search USING fts5(unit_id UNINDEXED, paper_id UNINDEXED, text, "
                        "tokenize='unicode61 remove_diacritics 2')")
-            db.executemany("INSERT INTO search VALUES (?, ?)",
-                           [(key, item["unit"]["text"]) for key, item in sorted(documents.items())])
-            rows = db.execute(
-                "SELECT identity, snippet(search,1,'[',']','...',35) FROM search "
-                "WHERE search MATCH ? ORDER BY bm25(search),identity LIMIT ? OFFSET ?",
-                (retrieval.search_expression(arguments["query"], arguments["mode"]),
-                 arguments["limit"] + 1, arguments["offset"]),
-            ).fetchall()
+            db.executemany("INSERT INTO content_search VALUES (?, '', ?)",
+                           [(key, item["refs"][0][1]["text"]) for key, item in sorted(documents.items())])
+            labels = [(key, label) for key, item in documents.items() for label in item["labels"]]
+            if labels and arguments["mode"] == "plain":
+                retrieval.create_label_index(db, labels)
+            rows = retrieval.ranked_passages(db, arguments["query"], arguments["mode"],
+                limit=arguments["limit"] + 1, offset=arguments["offset"],
+                editorial=any(self.snapshots[cid].profile == "private_context" for cid in selected))
         items, refs = [], []
-        for identity, snippet in rows[:arguments["limit"]]:
+        for identity, snippet, matched_label in rows[:arguments["limit"]]:
             item = documents[identity]
-            unit = deepcopy(item["unit"])
-            unit.pop("text")
+            cid, record = next(
+                ((cid, unit) for cid, unit in item["refs"]
+                 if self.snapshots[cid].editorial_labels.get(unit["id"]) == matched_label),
+                item["refs"][0],
+            ) if matched_label else item["refs"][0]
+            unit = deepcopy(record)
+            text = unit.pop("text")
             unit.pop("truncated")
-            unit["snippet"] = snippet[:2048]
+            unit["snippet"] = (text if snippet is None else snippet)[:2048]
             refs += [self.reference(cid, record, len(items)) for cid, record in item["refs"]]
-            items.append(unit)
+            items.append(self.snapshots[cid].annotate_passage(unit))
         continuation = arguments["offset"] + len(items) if len(rows) > arguments["limit"] else None
         if continuation is not None and continuation > retrieval.MAX_OFFSET:
             raise releases.ReleaseError("Search pagination offset ceiling exceeded")

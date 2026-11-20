@@ -37,11 +37,21 @@ DESCRIPTIONS = {
                         "Legacy single-release endpoints return an empty list.",
     "corpus_status": "Release identity, coverage, rights and lexical retrieval limitations; not participant data.",
     "search_evidence": "Bounded lexical source search. Plain text is safe by default, including LC-MGUS. "
-                       "All words must match in one source unit; start with a few distinctive terms "
-                       "and shorten if no results. Use mode='fts5' for explicit advanced syntax. "
+                       "All search terms must match in source text or in a private editorial label. "
+                       "Private plain search recognizes frequency questions like 'How common was ...?' "
+                       "and 'What proportion had ...?'. "
+                       "Use mode='fts5' for explicit advanced syntax without editorial ranking. "
+                       "Private PDF hits can include passage_context with the paper title, section paths "
+                       "and figure/table labels. An editorial_label is search metadata, not author text. "
+                       "Explicit table-row, figure or figure-panel searches can return "
+                       "exact_evidence with the relevant printed context. Cite all source_spans when present. "
                        "No match is not global scientific absence.",
     "get_claim": "Complete claim, numerical context, adjustment, citations and linked source issues.",
-    "get_source_context": "Short source passage with original PDF or Office locator; permissions apply.",
+    "get_source_context": "Short source passage with original PDF or Office locator; permissions apply. "
+                          "Optional passage_context describes the unit separately from the source text; "
+                          "source_spans lists every contributing PDF page for document chunks. "
+                          "Follow next_offset, or use reading_parts offsets to read a table row (with its header "
+                          "and notes), figure panel, or reference entry. Offsets are in the same pinned unit.",
     "get_source_document": "Read one retained PDF as continuous text in original page order. Get source_id from "
                            "list_sources or a passage citation. Keep one collection and snapshot_id pinned; "
                            "follow next_offset with the same source_id until null. Offsets count characters, "

@@ -603,10 +603,69 @@ with normal links and do not require JavaScript:
    Publishing and unpublishing return to this tab.
 
 The Clear text tab explicitly distinguishes drafts from published AI content and
-links to the snapshot-pinned active RAG/MCP document. An unpublished draft is not
+links to the **RAG/MCP** tab after **Published**. An unpublished draft is not
 AI evidence; if a newer draft exists, AI still reads the previous published
 version until the manager publishes the corrected text. Publication approves
 transcription, not scientific findings.
+
+The **RAG/MCP** tab starts with what search and MCP use now and the next step
+for this paper. Retrieval defaults to whole PDF pages. Under **Review
+searchable passages**, open a passage to read it. Use **Split after this
+text** at a boundary or **Join with next passage** to keep related evidence
+together. These edits don't affect live search until applied. A passage can
+cross PDF pages and keeps every contributing page citation. Open **See what
+live search can return** to inspect the active passages.
+
+Use **Advanced: edit numbered ranges** to type ranges or to overlap them
+(for example `1-3, 3-5`). A block is a numbered piece of the published text.
+Use **Reference: numbered source text** to look up those numbers by section.
+The opening group uses the published paper title when it has no section
+heading. The title is document metadata, not a parent section.
+Leave ranges blank to use whole-page retrieval for the paper. Existing
+page-bound plans stay active until replaced; their block numbers are not
+silently reused in the new editor.
+Enter a **Test query** before choosing **Preview draft search**. Preview runs
+lexical search against the proposed ranges and shows MCP's bounded source context.
+Saving or applying ranges does not require a query. **Save draft** keeps the
+ranges private without changing retrieval. **Apply to live search** makes
+changed ranges available to search and MCP without rewriting published
+Markdown. Republishing changed content marks the older ranges stale and
+restores whole-page retrieval for that paper. Review the current block
+numbers before reusing old ranges or labels.
+
+Use **Extra search terms** on a passage for words a reader is likely to search
+for but that the paper phrases differently. Terms are saved as editorial
+metadata, never as quoted source text. When splitting, the first part keeps
+the terms; when joining, the terms from both passages are kept if they fit.
+In Advanced, enter one `first block: extra terms` per line. Use `frequency`
+only for passages that report how common something was.
+
+After publication, saved terms from uniquely matching passages are proposed
+for the new draft, not applied to live search. Terms that cannot be matched
+remain saved under **Needs review**, with the previous excerpt when available.
+Open a passage and choose **Attach saved terms** to use them again.
+
+Under **Search checks**, save a question from the preview with an exact
+published excerpt and PDF page. **Run saved checks** compares the expected
+evidence's rank in the first five results from live search and the draft on
+screen. A check survives republication; if the expected text changed, review
+the check instead of assuming a retrieval regression. Checks measure
+retrieval, not generated answers.
+
+Keep a table and its explanatory notes in the same range. The preview can
+expand the full chunk and open marked table rows with their header and notes,
+figure panels with their caption introduction, and bibliography entries.
+
+Each block, active unit and preview shows its paper title (if published), DOI,
+PDF page and any explicit section or figure/table labels. MCP returns the same
+source context separately from the evidence text. Use Markdown headings such as
+`## Results` and `### Follow-up` where the paper identifies those sections.
+Headings carry forward across PDF pages until another heading changes the path.
+Write captions with a distinct label such as `**Figure 1**` or `Table 1:`.
+Label editorial text separately, for example `**Figure 1 description:**`.
+Keep the original caption intact and table units and footnotes with the values
+they qualify. See the [research-paper retrieval guidelines](./architecture.md#retrieval-design-for-research-papers)
+for what to preserve and how to evaluate retrieval changes.
 
 For entries without extracted content, the page offers **Find PDF** and
 identity/permission-confirmed attachment. Attaching from the page returns there

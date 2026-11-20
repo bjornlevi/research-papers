@@ -362,19 +362,26 @@ def publish(root, *, snapshot_id, source_id, reviewer, reason, checked):
             bundle[section].extend(selected[section])
         grants = deepcopy(original._manifest["authorization"])
         grants[source_id] = evidence._manifest["authorization"][source_id]
+        old_units = {unit["id"] for unit in original.document_units(source_id)} if any(
+            item["id"] == source_id for item in original._bundle["sources"]) else set()
+        chunks_stale = bool(old_units & original.chunk_plans.keys()) and (
+            content_identity(original._bundle, source_id) != content_identity(selected, source_id))
+        plans = {key: value for key, value in original.chunk_plans.items()
+                 if not chunks_stale or key not in old_units}
         (root / "runs").mkdir(exist_ok=True)
         run = Path(tempfile.mkdtemp(prefix="correction-publication-", dir=root / "runs"))
         activated = False
         try:
             # Audit and immutable release are staged before the retrieval registry changes.
-            release_id = releases.export(bundle, run / "evidence", profile="private_context", authorization=grants)
+            release_id = releases.export(bundle, run / "evidence", profile="private_context", authorization=grants,
+                                         chunk_plans=plans)
             project_library.store(root).releases.install(run / "evidence")
             project_library.write_text_views(run / "text", selected)
             event = {"schema_version": 1, "at": datetime.now(timezone.utc).isoformat(),
                      "reviewer": reviewer, "reason": reason, "scope": "publication", "source_id": source_id,
                      "source_sha256": selected["sources"][0]["sha256"], "unit_id": None,
                      "parent_snapshot": published.release_id, "parent_release": original.release_id,
-                     "editorial_snapshot": current.release_id, "release": release_id,
+                     "editorial_snapshot": current.release_id, "release": release_id, "chunks_stale": chunks_stale,
                      "before": {"content_identity": (content_identity(original._bundle, source_id)
                                 if any(s["id"] == source_id for s in original._bundle["sources"]) else None)},
                      "after": {"content_identity": content_identity(selected, source_id)}}
@@ -434,11 +441,13 @@ def unpublish(root, *, snapshot_id, source_id, reviewer, reason, checked):
                               if (item["id"] if section == "sources" else item["citation"]["source_id"]) != source_id]
         grants = deepcopy(original._manifest["authorization"])
         grants.pop(source_id, None)
+        retained = {unit["id"] for unit in bundle["units"]}
         (root / "runs").mkdir(exist_ok=True)
         run = Path(tempfile.mkdtemp(prefix="correction-unpublication-", dir=root / "runs"))
         activated = False
         try:
-            release_id = releases.export(bundle, run / "evidence", profile="private_context", authorization=grants)
+            release_id = releases.export(bundle, run / "evidence", profile="private_context", authorization=grants,
+                chunk_plans={key: value for key, value in original.chunk_plans.items() if key in retained})
             registry.releases.install(run / "evidence")
             event = {"schema_version": 1, "at": datetime.now(timezone.utc).isoformat(),
                      "reviewer": reviewer, "reason": reason, "scope": "unpublication", "source_id": source_id,
