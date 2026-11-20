@@ -98,9 +98,7 @@
     groups.forEach(([first, last], index) => {
       const card = element("details");
       const start = blocks[first - 1].dataset;
-      const end = blocks[last - 1].dataset;
-      const pages = start.page === end.page ? `PDF page ${start.page}` : `PDF pages ${start.page}-${end.page}`;
-      card.append(element("summary", [start.section, start.excerpt, pages].filter(Boolean).join(" · ")));
+      card.append(element("summary", [start.section, start.excerpt].filter(Boolean).join(" · ")));
       const input = element("input");
       input.type = "text";
       input.maxLength = 200;
@@ -170,8 +168,7 @@
         for (let number = first; number <= last; number++) {
           const source = blocks[number - 1];
           const part = element("div");
-          part.append(element("p", `PDF page ${source.dataset.page}`),
-                      source.querySelector(".paper-clear-text").cloneNode(true));
+          part.append(source.querySelector(".paper-clear-text").cloneNode(true));
           if (number < last) {
             part.append(button("Split after this text", () => {
               const next = groups.slice();

@@ -1,9 +1,25 @@
+import sqlite3
 import unittest
+from contextlib import closing
 
-from research_library import passage_context
+from research_library import passage_context, retrieval
 
 
 class PassageContextTests(unittest.TestCase):
+    def test_frequency_question_prefers_labeled_evidence_to_incidental_text_match(self):
+        with closing(sqlite3.connect(":memory:")) as db:
+            db.execute("CREATE VIRTUAL TABLE content_search USING fts5(unit_id UNINDEXED, paper_id UNINDEXED, text)")
+            db.executemany("INSERT INTO content_search VALUES (?, '', ?)", [
+                ("methods", "Persistent uncommon result"),
+                ("counts", "Three of forty participants reported it."),
+                *((f"other{i}", "Unrelated study results.") for i in range(10)),
+            ])
+            retrieval.create_label_index(db, [("counts", "Persistent uncommon result: frequency")])
+            def ids(query):
+                return [row[0] for row in retrieval.ranked_passages(db, query, "plain", limit=2, offset=0)]
+            self.assertEqual(ids("How often did uncommon result persist?"), ["counts", "methods"])
+            self.assertEqual(ids("persistent uncommon result"), ["methods", "counts"])
+
     def test_reading_parts_preserve_table_notes_and_figure_boundaries(self):
         table = ("| Target | n |\n| --- | --- |\n| Example | 7 |\n\n"
                  "**Note:** Test.\n\n**a** Prior study.\n\nUnrelated finding.")

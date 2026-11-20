@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 from html import unescape
 from urllib.parse import quote
+from urllib.parse import urlencode
 
 import pymupdf
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -349,6 +350,43 @@ class ProjectTextTests(unittest.TestCase):
         (self.root / "papers" / (self.source["sha256"] + ".pdf")).unlink()
         self.assertNotIn("Open local PDF", client.get("/library", base_url=base).text)
 
+    def test_draft_renders_only_images_from_its_checksum_bound_pdf_page(self):
+        doi = "10.0000/figure"
+        project_library.register(self.root, [{"doi": doi, "title": "Synthetic figure"}])
+        path = self.root.parent / "figure.pdf"
+        pixmap = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 8, 8), False)
+        pixmap.clear_with(120)
+        image = pixmap.tobytes("jpeg")
+        with pymupdf.open() as pdf:
+            page = pdf.new_page()
+            page.insert_text((50, 50), "This synthetic page has enough native text for the figure fixture.")
+            xref = page.insert_image(pymupdf.Rect(50, 80, 90, 120), stream=image)
+            pdf.save(path)
+        project_library.attach(self.root, doi, path, identity_confirmed=True)
+        current = project_text.editorial_store(self.root).current()
+        bundle = current.snapshots["core"]._bundle
+        source = next(item for item in bundle["sources"] if item["doi"] == doi)
+        unit = project_edit.document_units(bundle, source["id"])[0]
+        query = {"id": "doi:" + doi, "page": 1, "sha256": source["sha256"], "xref": xref}
+        url = "/library/paper/pdf-page?" + urlencode(query)
+        project_edit.correct(
+            self.root, snapshot_id=current.release_id, source_id=source["id"], unit_id=unit["id"],
+            text=f"![Synthetic figure]({url})\n\n![Remote figure](https://example.org/figure.jpg)",
+            bibliography={key: value or "" for key, value in source["bibliography"].items()},
+            source_url="", tables=[], reviewer="Synthetic admin", reason="Add figure", checked=False)
+        client = web_server.create_app(registry=self.root / "registry", project_root=self.root,
+            profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"]).test_client()
+        base = "http://localhost:8080"
+        paper = client.get("/library/paper?" + urlencode({"id": query["id"], "tab": "content"}), base_url=base)
+        self.assertIn(f'<img src="{url.replace("&", "&amp;")}"'.encode(), paper.data)
+        self.assertNotIn(b"https://example.org/figure.jpg", paper.data)
+        asset = client.get(url, base_url=base)
+        self.assertEqual(asset.mimetype, "image/jpeg")
+        self.assertEqual(asset.data, image)
+        for change in ({"sha256": "0" * 64}, {"xref": xref + 100}, {"page": 2}):
+            rejected = client.get("/library/paper/pdf-page?" + urlencode(query | change), base_url=base)
+            self.assertIn(rejected.status_code, (400, 404))
+
     def test_paper_tabs_show_inline_tables_and_private_checksum_bound_pdf(self):
         project_edit.correct(self.root,
             snapshot_id=self.editorial.release_id, source_id=self.source["id"], unit_id=self.units[0]["id"],
@@ -549,7 +587,7 @@ class ProjectTextTests(unittest.TestCase):
         self.assertIn("DOI 10.0000/text", html)
         form = {name: unescape(re.search(fr'name="{name}" value="([^"]*)"', html).group(1))
                 for name in ("token", "id", "snapshot_id")}
-        label = "Rare outcome (uncommon result): frequency and counts"
+        label = "Persistent rare outcome (uncommon result): frequency and counts"
         form.update({"ranges": "1-2, 2-4", "labels": f"2: {label}", "query": "needle"})
         expected_plan = {first_page: {"ranges": [[1, 2], [2, 4]], "labels": {"2": label}}}
         endpoint = "/library/paper/rag"
@@ -649,6 +687,8 @@ class ProjectTextTests(unittest.TestCase):
         self.assertFalse(registry.call("search_evidence", paraphrase)["result"]["items"])
         paraphrase = {"query": "What proportion had uncommon result?"}
         self.assertEqual(registry.call("search_evidence", paraphrase)["result"]["items"], labeled)
+        persistence = {"query": "How often did uncommon result persist?"}
+        self.assertEqual(registry.call("search_evidence", persistence)["result"]["items"], labeled)
         self.assertFalse(registry.call("search_evidence", paraphrase | {
             "mode": "fts5", "query": '"What proportion had uncommon result"',
         })["result"]["items"])

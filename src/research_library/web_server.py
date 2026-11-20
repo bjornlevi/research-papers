@@ -51,10 +51,19 @@ def help_note(label, body):
             f'<div class="help-content"><strong>{escape(label)}</strong>{body}</div></details>')
 
 
-def clear_text_html(text):
+def clear_text_html(text, *, figure_prefix=None):
     renderer = MarkdownIt("commonmark", {"html": False, "breaks": True})
     renderer.enable("table")
-    renderer.disable("image")
+
+    def render_image(tokens, index, options, env):
+        token = tokens[index]
+        src = token.attrGet("src") or ""
+        if figure_prefix and re.fullmatch(re.escape(figure_prefix) + r"[1-9][0-9]{0,8}", src):
+            token.attrSet("class", "paper-pdf-page")
+            return renderer.renderer.image(tokens, index, options, env)
+        return escape(renderer.renderer.renderInlineAsText(token.children or [], options, env))
+
+    renderer.renderer.rules["image"] = render_image
     rendered = renderer.render(text)
     return re.sub(
         r"<table>(.*?)</table>",
@@ -2750,8 +2759,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             excerpt = " ".join(text.lstrip("# ").split())[:110]
             path = paths[-1][-1] if paths else ""
             body += (f'<section data-rag-block="{block}" data-excerpt="{escape(excerpt, quote=True)}" '
-                     f'data-section="{escape(path, quote=True)}" '
-                     f'data-page="{unit["citation"]["locator"]["pdf_page"]}">'
+                     f'data-section="{escape(path, quote=True)}">'
                      f'<h4>Block {block}</h4>' + display(text, unit["citation"], metadata) + '</section>')
         if section is not None:
             body += '</details>'
@@ -2848,7 +2856,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                          download_name="paper.pdf", conditional=True)
 
     def paper_pdf_image():
-        if not project_root or set(request.args) != {"id", "page"}:
+        params = set(request.args)
+        if not project_root or params not in ({"id", "page"}, {"id", "page", "sha256", "xref"}):
             raise ValueError("Select one private project PDF page")
         from .build import project_index
         import pymupdf
@@ -2862,6 +2871,16 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             if not 1 <= number <= len(document):
                 raise ValueError("Invalid PDF page")
             pdf_page = document[number - 1]
+            if "xref" in params:
+                xref = int(request.args["xref"])
+                if request.args["sha256"] != source["sha256"] or xref <= 0 or not any(
+                        image["xref"] == xref for image in pdf_page.get_image_info(xrefs=True)):
+                    raise retrieval.NotFoundError("No matching image on this PDF page")
+                image = document.extract_image(xref)
+                mime = {"jpeg": "image/jpeg", "png": "image/png"}.get(image["ext"]) if image else None
+                if not mime or image["smask"]:
+                    raise retrieval.NotFoundError("No supported standalone image on this PDF page")
+                return Response(image["image"], mimetype=mime)
             scale = min(1.5, (4000000 / max(1, pdf_page.rect.get_area())) ** .5)
             image = pdf_page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
             return Response(image.tobytes("png"), mimetype="image/png")
@@ -3075,8 +3094,12 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 body += '<p role="alert">Some extracted text is incomplete or missing. Check the original PDF.</p>'
             body += '<article id="document-text" aria-label="Current clear text">'
             for item in units:
+                locator = item["citation"]["locator"]
+                figure_prefix = ("/library/paper/pdf-page?" + urlencode({
+                    "id": paper_record["id"], "page": locator["pdf_page"], "sha256": source["sha256"],
+                }) + "&xref=") if locator["kind"] == "pdf" else None
                 body += (f'<div id="{escape(item["id"], quote=True)}" class="paper-clear-text markdown">'
-                         + clear_text_html(item["text"]) + '</div>')
+                         + clear_text_html(item["text"], figure_prefix=figure_prefix) + '</div>')
                 inline_tables = [table for table in tables
                                  if table["citation"]["locator"] == item["citation"]["locator"]]
                 if inline_tables:
