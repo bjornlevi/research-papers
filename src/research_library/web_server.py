@@ -421,6 +421,14 @@ def quality_location(locator):
     return "Word package part: " + locator["package_member"]
 
 
+def passage_location(citation, metadata=None):
+    spans = (metadata or {}).get("source_spans", [])
+    pages = list(dict.fromkeys(span["citation"]["locator"]["pdf_page"] for span in spans))
+    if len(pages) > 1:
+        return "PDF pages " + ", ".join(map(str, pages))
+    return quality_location(citation["locator"])
+
+
 def quality_order(unit):
     locator = unit["citation"]["locator"]
     return (locator["kind"] not in {"pdf", "word_paragraph", "word_table", "worksheet"},
@@ -2395,7 +2403,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         navigation = '<nav class="paper-tabs" aria-label="Paper views">'
         for key, label in (("content", "Clear text"), ("references", "References"),
                            ("citing", "Citing papers"), ("pdf", "PDF"), ("technical", "Technical information"),
-                           ("publication", "Published" if is_published else "Publish")):
+                           ("publication", "Published" if is_published else "Publish"), ("rag", "RAG/MCP")):
             url = paper_url(paper["id"]) + "&tab=" + key
             navigation += (f'<a href="{escape(url, quote=True)}"'
                            + (' aria-current="page"' if key == selected else '') + f'>{label}</a>')
@@ -2445,8 +2453,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                          + '</dd><dt>Publication reason</dt><dd>' + escape(event["reason"]) + '</dd></dl>')
             else:
                 body += '<p>No matching publication audit is available for this retained version; publisher and date are unknown.</p>'
-            active_url = document_reader_url({"snapshot_id": publication["snapshot"]}, "core", source["id"])
-            body += f'<p><a href="{escape(active_url, quote=True)}">Read the active RAG/MCP version</a>.</p>'
+            active_url = paper_url(paper["id"]) + "&tab=rag"
+            body += f'<p><a href="{escape(active_url, quote=True)}">Open RAG/MCP</a>.</p>'
             published = paper_snapshot(editorial=False)
             state = project_text.publication_state(
                 current.snapshots["core"]._bundle, published.snapshots["core"]._bundle, source["id"])
@@ -2512,6 +2520,308 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             return response
         store.clear_cache()
         return redirect(paper_url(paper["id"]) + "&tab=publication", code=303)
+
+    def paper_rag(paper, *, form=None, hits=None, check_results=None, notice=None, error=None):
+        from . import passage_context
+        from .build import project_chunks
+        publication = paper_publication(paper)
+        body = f'<p role="alert">{escape(error)}</p>' if error else ""
+        if notice:
+            body += f'<p role="status">{escape(notice)}</p>'
+        if not publication:
+            return body + '<p>Publish the clear text before configuring RAG/MCP retrieval.</p>'
+        _, source = paper_source(paper)
+        snapshot = paper_snapshot(editorial=False).snapshots["core"]
+        units = snapshot.document_units(source["id"])
+        draft = project_chunks.load_draft(project_root, source["id"])
+        checks = project_chunks.load_checks(project_root, source["id"])
+        pending = project_chunks.term_review(project_root, source["id"], draft, publication["content_identity"])
+        stale = draft is not None and draft["content_identity"] != publication["content_identity"]
+        active = {unit["id"]: snapshot.chunk_plans[unit["id"]]
+                  for unit in units if unit["id"] in snapshot.chunk_plans}
+        anchor = units[0]["id"]
+        document_plan = active.get(anchor)
+        live_status = ("Search and MCP use custom chunks. Citations still point to PDF pages."
+                       if isinstance(document_plan, dict) else
+                       "Search and MCP use older chunks that cannot cross PDF pages." if active else
+                       "Retrieval by PDF page. Search and MCP use whole PDF pages.")
+        body += f'<h3>Live retrieval</h3><p>{live_status}</p>'
+        if not active and (publication["event"] or {}).get("chunks_stale"):
+            body += '<p>Previous active chunks are stale because the publication changed.</p>'
+        if stale:
+            body += ('<p>The saved draft is stale because the published text changed. Review the current block numbers '
+                     'before reusing old ranges or labels.</p>')
+        elif draft is not None and draft["plans"] != active:
+            body += '<p>You have a saved draft that is not live.</p>'
+        if hits:
+            next_step = "Check that the top results contain the evidence you expected before applying the changes."
+        elif hits is not None:
+            next_step = "No matches for this preview. Try a shorter query or a term used in the paper."
+        elif stale or pending:
+            next_step = "Review the ranges for this publication and any extra search terms, then run your search checks."
+        elif draft is not None and draft["plans"] != active:
+            next_step = "Test your saved draft before applying it to live search."
+        elif isinstance(document_plan, dict) or (draft is not None and draft["plans"] == active):
+            next_step = "No action needed if live retrieval works for you. Preview a query to check it or test an edit."
+        else:
+            next_step = "Start with the suggested ranges, then test a query before applying them."
+        body += f'<p><strong>Next step:</strong> {next_step}</p>'
+        title = next((item.get("bibliography") or {}).get("title") for item in snapshot._bundle["sources"]
+                     if item["id"] == source["id"])
+        body += f'<p>{escape(title or paper["title"] or source["doi"])} · DOI {escape(source["doi"])}</p>'
+
+        def display(text, citation, metadata):
+            context = [
+                metadata.get("paper_title"),
+                "DOI " + citation["doi"],
+                passage_location(citation, metadata),
+            ]
+            if metadata["section_paths"]:
+                context.append("Sections: " + "; ".join(" / ".join(path) for path in metadata["section_paths"]))
+            if label := metadata.get("editorial_label"):
+                context.append("Extra search terms: " + label)
+            if metadata["elements"]:
+                context.append("; ".join(element["label"] + (
+                    " (added description)" if element["role"] == "description" else "")
+                    for element in metadata["elements"]))
+            if bounds := metadata.get("block_range"):
+                label = "Document block" if metadata.get("block_scope") == "document" else "Page block"
+                context.append(f'{label}s {bounds["first"]}–{bounds["last"]}' if bounds["first"] != bounds["last"]
+                               else f'{label} {bounds["first"]}')
+            estimate = (len(text) + 3) // 4
+            return ('<p class="meta">' + " · ".join(escape(item) for item in context if item)
+                    + f'</p><p class="meta">~{estimate} tokens (character-based estimate)</p>'
+                    + '<div class="paper-clear-text markdown">' + clear_text_html(text) + '</div>')
+
+        def display_parts(text, parts):
+            header = next((text[p["start"]:p["end"]] for p in parts if p["kind"] == "table_header"), "")
+            notes = next((text[p["start"]:p["end"]] for p in parts if p["kind"] == "table_notes"), "")
+            intro = next((text[p["start"]:p["end"]] for p in parts if p["kind"] == "figure_intro"), "")
+            result = ""
+            for part in parts:
+                excerpt = text[part["start"]:part["end"]]
+                if part["kind"] == "table_row":
+                    excerpt = header + "\n" + excerpt + "\n\n" + notes
+                elif part["kind"] == "figure_panel":
+                    excerpt = intro + excerpt
+                elif part["kind"] != "reference":
+                    continue
+                result += (f'<details><summary>{escape(part["label"])}</summary>'
+                           '<div class="paper-clear-text markdown">' + clear_text_html(excerpt) + '</div></details>')
+            return result
+
+        def display_preview():
+            result = ('<h3>Draft search preview</h3><p>Uses the same lexical search and source context as MCP, '
+                      'filtered to this paper.</p>')
+            if not hits:
+                return result + '<p>No matching units.</p>'
+            for rank, (hit, context, full_text) in enumerate(hits, 1):
+                if exact := hit.get("exact_evidence"):
+                    result += (f'<h4>{rank}. {escape(exact["label"])}</h4>'
+                               + display(exact["text"], hit["citation"], hit["passage_context"])
+                               + '<details><summary>Read surrounding context</summary>')
+                location = escape(passage_location(hit["citation"], hit["passage_context"]))
+                heading = location if exact else f"{rank}. {location}"
+                result += (f'<h4>{heading}</h4>'
+                           f'<p>{escape(hit["snippet"])}</p>'
+                           + display(context["text"], context["citation"], context["passage_context"]))
+                if context["truncated"]:
+                    result += ('<p>MCP returns this excerpt first. Follow its next_offset to read the rest.</p>'
+                               '<details><summary>Read full draft chunk</summary>'
+                               '<div class="paper-clear-text markdown">' + clear_text_html(full_text) + '</div></details>')
+                result += display_parts(full_text, context.get("reading_parts", []))
+                if exact:
+                    result += '</details>'
+            return result
+
+        body += ('<h3>1. Review searchable passages</h3><p>A passage is a piece of this paper that search can return. '
+                 'Keep evidence that belongs together, such as a table and its notes, in the same passage. '
+                 'A passage can cross PDF pages without changing its citations.</p>'
+                 '<script src="/rag-editor.js" defer></script>'
+                 '<form id="rag-editor" method="post" action="/library/paper/rag">'
+                 f'<input type="hidden" name="token" value="{provide_token}">'
+                 f'<input type="hidden" name="id" value="{escape(paper["id"], quote=True)}">'
+                 f'<input type="hidden" name="snapshot_id" value="{publication["snapshot"]}">')
+        blocks = passage_context.document_blocks(units, title=title)
+        suggestions = project_chunks.suggestions(blocks)
+        suggested_value = ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in suggestions)
+        carried = {}
+        if form is not None:
+            value = form.get("ranges", "")
+            labels = form.get("labels", "")
+        else:
+            saved_plans = draft["plans"] if draft is not None and not stale else active
+            saved = saved_plans.get(anchor)
+            labels = ""
+            if isinstance(saved, dict):
+                plan = saved["ranges"]
+                labels = "\n".join(f"{key}: {label}" for key, label in
+                                   sorted(saved.get("labels", {}).items(), key=lambda item: int(item[0])))
+            elif draft is not None and not stale and not saved_plans:
+                plan = []
+            else:
+                plan = suggestions
+                if saved_plans:
+                    body += '<p>Legacy page ranges are not translated automatically. Review the new suggestions.</p>'
+                if not plan:
+                    body += '<p>No valid automatic ranges fit the chunk limits. Page retrieval remains available.</p>'
+                carried, pending = project_chunks.suggest_terms(blocks, plan, pending)
+                labels = "\n".join(f"{key}: {label}" for key, label in carried.items())
+            value = ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in plan)
+        body += (f'<div id="rag-passages" data-suggested="{suggested_value}" hidden></div>'
+                 '<p id="rag-edit-status" role="status"></p>'
+                 '<details id="rag-advanced" open><summary>Advanced: edit numbered ranges</summary>'
+                 '<p>A block is one numbered piece of the published text. '
+                 'For example, <code>1-3, 4-5</code> makes two passages. '
+                 'Repeat a block for overlap (<code>1-3, 3-5</code>). '
+                 'Cover the whole paper, or clear both fields to use PDF pages instead.</p>'
+                 f'<label>Document block ranges<textarea name="ranges" rows="3" maxlength="36000">'
+                 f'{escape(value)}</textarea></label>'
+                 '<label>Extra search terms by first block (optional)<textarea name="labels" rows="3">'
+                 f'{escape(labels)}</textarea></label>'
+                 '<p>Use one <code>first block: extra terms</code> per line.</p></details>')
+        if carried:
+            body += '<p>Extra search terms from matching passages were suggested in this draft. Review them before applying.</p>'
+        if pending:
+            body += ('<details open><summary>Extra search terms: Needs review</summary>'
+                     '<p>These terms are still saved. Attach them to a passage to use them in search. '
+                     'They do not affect live search unless attached to a live passage.</p><ul>')
+            for entry in pending:
+                body += f'<li data-rag-unassigned="{escape(entry["terms"], quote=True)}"><strong>{escape(entry["terms"])}</strong>'
+                if entry.get("excerpt"):
+                    body += f' <span>Previous PDF page {entry["page"]}: {escape(entry["excerpt"])}</span>'
+                body += '</li>'
+            body += '</ul></details>'
+        query = form.get("query", "") if form is not None else ""
+        body += ('<h3>2. Test a search</h3><label>Test query (required for preview only)'
+                 f'<input name="query" type="search" value="{escape(query, quote=True)}" maxlength="500"></label>'
+                 '<p>Try a distinctive term from this paper or a request like <code>What does Figure 1 show?</code>. '
+                 'Preview does not change live search.</p>'
+                 '<button name="action" value="preview">Preview draft search</button> ')
+        results_by_id = {result["id"]: result for result in check_results or []}
+        def rank_text(result, mode):
+            if result is None:
+                return "Not run"
+            if not result["expected_present"]:
+                return "Review expected excerpt"
+            rank = result[mode]
+            return f"Rank {rank}" if rank else "Not in top 5"
+
+        body += (f'<details{(" open" if hits is not None or check_results is not None or notice or error else "")}>'
+                 f'<summary>Search checks ({len(checks)})</summary>'
+                 '<p>Save the test query above with a short, exact quote from the published text and its PDF page. '
+                 'Checks compare the first five results for live search and the draft currently in this form.</p>'
+                 '<label>Expected PDF page'
+                 f'<input name="expected_page" inputmode="numeric" maxlength="7" value="{escape(form.get("expected_page", "") if form and not notice else "", quote=True)}"></label>'
+                 '<label>Expected excerpt'
+                 f'<textarea name="expected_excerpt" rows="2" maxlength="500">{escape(form.get("expected_excerpt", "") if form and not notice else "")}</textarea></label>'
+                 '<button name="action" value="add-check" class="secondary">Save query as a check</button> ')
+        if checks:
+            body += ('<button name="action" value="run-checks" class="secondary">Run saved checks</button>'
+                     '<table><caption>Saved search checks</caption><thead><tr><th scope="col">Query and evidence</th>'
+                     '<th scope="col">Live</th><th scope="col">Draft</th><th scope="col">Manage</th>'
+                     '</tr></thead><tbody>')
+            for check in checks:
+                result = results_by_id.get(check["id"])
+                body += (f'<tr><th scope="row">{escape(check["query"])}<br>'
+                         f'PDF page {check["page"]}: {escape(check["excerpt"])}</th>'
+                         f'<td>{rank_text(result, "live")}</td><td>{rank_text(result, "draft")}</td>'
+                         f'<td><button name="action" value="remove-check:{check["id"]}" class="secondary" '
+                         f'aria-label="{escape("Remove check: " + check["query"], quote=True)}">Remove</button></td></tr>')
+            body += '</tbody></table>'
+        body += ('</details><h3>3. Save or apply</h3><p>Save draft keeps your edits private without changing search. '
+                 'Apply to live search updates what search and MCP retrieve without editing the published text.</p>'
+                 '<button name="action" value="save">Save draft</button> '
+                 '<button name="action" value="activate">Apply to live search</button></form>')
+        if hits is not None:
+            body += display_preview()
+        body += f'<details id="rag-blocks"><summary>Reference: numbered source text ({len(blocks)})</summary>'
+        section = None
+        details = [block[3] for block in blocks]
+        for block, (unit, start, end, (paths, _)) in enumerate(blocks, 1):
+            label = " / ".join(paths[-1]) if paths else (title or "No section heading")
+            if label != section:
+                if section is not None:
+                    body += '</details>'
+                body += f'<details><summary>{escape(label)} · from block {block}</summary>'
+                section = label
+            metadata = passage_context.describe(title, details, block, block) | {"block_scope": "document"}
+            text = unit["text"][start:end]
+            excerpt = " ".join(text.lstrip("# ").split())[:110]
+            path = paths[-1][-1] if paths else ""
+            body += (f'<section data-rag-block="{block}" data-excerpt="{escape(excerpt, quote=True)}" '
+                     f'data-section="{escape(path, quote=True)}" '
+                     f'data-page="{unit["citation"]["locator"]["pdf_page"]}">'
+                     f'<h4>Block {block}</h4>' + display(text, unit["citation"], metadata) + '</section>')
+        if section is not None:
+            body += '</details>'
+        body += '</details>'
+        rows = [row for unit in units for row in snapshot._chunk_records.get(unit["id"], (unit,))]
+        body += f'<details><summary>See what live search can return ({len(rows)})</summary>'
+        for index, row in enumerate(rows, 1):
+            metadata = snapshot.passage_metadata(row)
+            location = passage_location(row["citation"], metadata)
+            body += (f'<details><summary>{"Passage " + str(index) + " · " if active else ""}{escape(location)}</summary>'
+                     + display(row["text"], row["citation"], metadata)
+                     + display_parts(row["text"], passage_context.reading_parts(row["text"], metadata))
+                     + '</details>')
+        return body + '</details>'
+
+    def paper_rag_action():
+        if not project_root:
+            raise ValueError("Retrieval editing requires a private project library")
+        if not hmac.compare_digest(request.form.get("token", ""), provide_token):
+            return Response("Retrieval form expired; reload the page.", status=403, mimetype="text/plain")
+        from .build import project_chunks, project_index
+        paper = project_index.paper_detail(project_root, request.form.get("id", ""), include_metadata=False)
+        publication = paper_publication(paper)
+        status, error, hits, check_results, notice = 200, None, None, None, None
+        matches = publication and publication["snapshot"] == request.form.get("snapshot_id")
+        try:
+            if not matches:
+                raise ValueError("Published retrieval changed; reload before working on chunks")
+            _, source = paper_source(paper)
+            action = request.form.get("action")
+            if action == "preview":
+                query = request.form.get("query", "").strip()
+                if not query:
+                    raise ValueError("Enter a test query before previewing draft search.")
+                snapshot = paper_snapshot(editorial=False).snapshots["core"]
+                units = snapshot.document_units(source["id"])
+                hits = project_chunks.preview(snapshot, source, units, project_chunks.parse(units, request.form),
+                                              query)
+            elif action == "run-checks":
+                snapshot = paper_snapshot(editorial=False).snapshots["core"]
+                units = snapshot.document_units(source["id"])
+                check_results = project_chunks.run_checks(
+                    snapshot, source, units, project_chunks.parse(units, request.form),
+                    project_chunks.load_checks(project_root, source["id"]))
+            elif action == "add-check" or (action or "").startswith("remove-check:"):
+                with discovery_lock:
+                    require_idle_project()
+                    project_chunks.update_check(project_root, source_id=source["id"],
+                        snapshot_id=publication["snapshot"],
+                        form={**request.form, "check_id": action.removeprefix("remove-check:")},
+                        remove=action != "add-check")
+                notice = "Search check saved." if action == "add-check" else "Search check removed."
+            elif action in {"save", "activate"}:
+                with discovery_lock:
+                    require_idle_project()
+                    project_chunks.update(project_root, source_id=source["id"], snapshot_id=publication["snapshot"],
+                                          form=request.form, activate=action == "activate")
+                if action == "activate":
+                    store.clear_cache()
+                return redirect(paper_url(paper["id"]) + "&tab=rag", code=303)
+            else:
+                raise ValueError("Unknown retrieval action")
+        except (ValueError, ValidationError) as exc:
+            diagnostic("web_rag_rejected", exception_type=type(exc).__name__)
+            error, status = str(exc), 400
+        body = paper_rag(paper, form=request.form if matches else None, hits=hits,
+                         check_results=check_results, notice=notice, error=error)
+        response = page(paper["title"] or "Paper", paper_tabs(paper, body, selected="rag"))
+        response.status_code = status
+        return response
 
     def local_paper_pdf(source):
         if source is None or source["format"] != "pdf":
@@ -2580,7 +2890,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if set(request.args) - ({"id", "tab"} | content_parameters) or not request.args.get("id"):
             raise ValueError("Select one Library paper")
         tab = request.args.get("tab", "content")
-        if tab not in {"content", "references", "citing", "pdf", "technical", "publication"}:
+        if tab not in {"content", "references", "citing", "pdf", "technical", "publication", "rag"}:
             raise ValueError("Unknown paper tab")
         if tab != "content" and set(request.args) & content_parameters:
             raise ValueError("Editor parameters require the Clear text tab")
@@ -2621,6 +2931,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 body = '<p>No local PDF is available for this paper.</p>'
         elif tab == "publication":
             body = paper_publication_tools(paper)
+        elif tab == "rag":
+            body = paper_rag(paper)
         elif tab == "technical":
             body = paper_information(paper) + paper_connections(paper)
             if source:
@@ -2754,11 +3066,11 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             if text_status == "draft":
                 body += '<p class="meta">Not available to RAG/MCP: this text is an unpublished draft.</p>'
             else:
-                active_url = document_reader_url({"snapshot_id": published.release_id}, "core", source["id"])
+                active_url = paper_url(paper_record["id"]) + "&tab=rag"
                 body += ('<p class="meta">'
                          + ('The latest text below is published for AI retrieval. ' if text_status == "published"
                             else 'AI still uses the previously published version, not the latest draft below. ')
-                         + f'<a href="{escape(active_url, quote=True)}">Read the active RAG/MCP version</a>.</p>')
+                         + f'<a href="{escape(active_url, quote=True)}">Open RAG/MCP</a>.</p>')
             if any(item["truncated"] or not item["text"] for item in units):
                 body += '<p role="alert">Some extracted text is incomplete or missing. Check the original PDF.</p>'
             body += '<article id="document-text" aria-label="Current clear text">'
@@ -4232,8 +4544,12 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                           if source["id"] == result["citation"]["source_id"])
             body += ('<article><h3 class="hit-title">' + escape(browser_title(current, result_cid, source)) + "</h3>"
                      f'<p class="meta"><span class="chip">{escape(quality_document(source["id"].rsplit(":", 1)[-1]))}</span> '
-                     f"{escape(quality_location(result['citation']['locator']))} <code>{escape(source['doi'])}</code></p>"
-                     f"<blockquote>{highlight(result['snippet'], query)}</blockquote>"
+                     f"{escape(passage_location(result['citation'], result.get('passage_context')))} "
+                     f"<code>{escape(source['doi'])}</code></p>"
+                     + (f'<h4>{escape(result["exact_evidence"]["label"])}</h4>'
+                        '<div class="paper-clear-text markdown">'
+                        + clear_text_html(result["exact_evidence"]["text"]) + '</div>'
+                        if "exact_evidence" in result else f"<blockquote>{highlight(result['snippet'], query)}</blockquote>")
                      + source_warnings(result) + '<p class="actions">')
             for ref in matches:
                 member_cid = ref["collection_id"] if store else ""
@@ -4277,7 +4593,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             return redirect(canonical)
         source = next(source for source in evidence._bundle["sources"] if source["id"] == source_id)
         title = browser_title(current, cid, source)
-        location = quality_location(unit["citation"]["locator"])
+        location = passage_location(unit["citation"], unit.get("passage_context"))
         role = quality_document(source_id.rsplit(":", 1)[-1])
         absolute_url = request.url_root.rstrip("/") + canonical
         citation = (f"{title}. {role}; {location}. Publication: {source['doi']}. "
@@ -4779,6 +5095,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             ("/paper-editor.js", "paper_editor_script", lambda: Response(
                 files("research_library").joinpath("assets/paper-editor.js").read_text(encoding="utf-8"),
                 mimetype="text/javascript")),
+            ("/rag-editor.js", "rag_editor_script", lambda: Response(
+                files("research_library").joinpath("assets/rag-editor.js").read_text(encoding="utf-8"),
+                mimetype="text/javascript")),
             ("/paper-editor-licenses.txt", "paper_editor_licenses", lambda: Response(
                 files("research_library").joinpath("assets/paper-editor-licenses.txt").read_text(encoding="utf-8"),
                 mimetype="text/plain")),
@@ -4798,6 +5117,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
     app.add_url_rule("/library/edit", "save_paper_correction", save_paper_correction, methods=["POST"])
     app.add_url_rule("/library/paper/publication", "paper_publication_action",
                      paper_publication_action, methods=["POST"])
+    app.add_url_rule("/library/paper/rag", "paper_rag_action", paper_rag_action, methods=["POST"])
     app.add_url_rule("/quality", "quality_action", quality_action, methods=["POST"])
     app.add_url_rule("/discovery", "start_discovery", start_discovery, methods=["POST"])
     app.add_url_rule("/settings/configure-metadata", "configure_project_metadata",

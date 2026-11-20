@@ -273,7 +273,10 @@ def purge(root, doi, pdf_data_root, *, progress=None, expected_plan=None):
                 if bundle["sources"]:
                     destination = stage / "retained-evidence"
                     grants = {key: value for key, value in original._manifest["authorization"].items() if key in ids}
-                    releases.export(bundle, destination, profile="private_context", authorization=grants)
+                    retained_units = {unit["id"] for unit in bundle["units"]}
+                    releases.export(bundle, destination, profile="private_context", authorization=grants,
+                        chunk_plans={key: value for key, value in original.chunk_plans.items()
+                                     if key in retained_units})
                     installed = registry.releases.install(destination)
                     entry = deepcopy(next(entry for entry in old.document["collections"] if entry["id"] == "core"))
                     entry["release_id"] = installed
@@ -307,6 +310,21 @@ def purge(root, doi, pdf_data_root, *, progress=None, expected_plan=None):
                         for event in project_edit.history(root, source["id"]):
                             collections.atomic_json(stage / "corrections",
                                 releases.sha256(releases.encode(event)) + ".json", event)
+            from . import project_chunks
+            retained_snapshots = [old.snapshots["core"]] if old else []
+            if (root / "editorial/active.json").exists():
+                retained_snapshots.append(draft)
+            for snapshot in retained_snapshots:
+                for source in snapshot._bundle["sources"]:
+                    if _doi(source["doi"]) not in data["removed_dois"]:
+                        chunk_draft = project_chunks.load_draft(root, source["id"])
+                        if chunk_draft is not None:
+                            collections.atomic_json(stage / "chunk-drafts",
+                                                     project_chunks.draft_name(source["id"]), chunk_draft)
+                        checks = project_chunks.load_checks(root, source["id"])
+                        if checks:
+                            collections.atomic_json(stage / "chunk-checks",
+                                                     project_chunks.draft_name(source["id"]), checks)
             if (root / "papers").exists():
                 for path in (root / "papers").iterdir():
                     if path.is_file() and releases.sha256(path.read_bytes()) not in data["digests"]:

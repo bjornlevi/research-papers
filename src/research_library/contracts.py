@@ -89,8 +89,9 @@ TOOLS: dict[ToolName, ToolSpec] = {
     "list_sources": ToolSpec({"paper": ref("id"), **PAGING}, (), "source_inventory", True),
     "search_evidence": ToolSpec({
         "query": {"type": "string", "minLength": 1, "maxLength": MAX_QUERY_LENGTH, "pattern": "\\S",
-                  "description": "Plain text by default: punctuation separates words and all words must "
-                                 "match within a source unit. Use short queries; no semantic expansion. "
+                  "description": "Plain text by default: all search terms must match within source text or "
+                                 "a private editorial label. Private search strips recognized frequency-question "
+                                 "prefixes. Use short queries; no semantic expansion. "
                                  "FTS5 expressions require mode='fts5'."},
         "mode": {"type": "string", "enum": ["plain", "fts5"], "default": "plain",
                  "description": "plain treats operators, quotes and hyphens as ordinary text. "
@@ -101,6 +102,7 @@ TOOLS: dict[ToolName, ToolSpec] = {
     "get_claim": ToolSpec({"claim_id": ref("id")}, ("claim_id",), "claim"),
     "get_source_context": ToolSpec({
         "unit_id": ref("id"),
+        "offset": {"type": "integer", "minimum": 0, "maximum": MAX_DOCUMENT_OFFSET},
         "max_characters": {"type": "integer", "minimum": 1, "maximum": 2048, "default": 1024},
     }, ("unit_id",), "context"),
     "get_source_document": ToolSpec({
@@ -408,8 +410,13 @@ def validate_response(tool: ToolName, arguments: dict[str, Any], response: Succe
         continuation = result["next_offset"]
         if continuation is not None and (not items or continuation != selected["offset"] + len(items)):
             raise ValueError("next_offset must advance by the number of returned records")
-    if tool == "get_source_context" and len(result["text"]) > selected["max_characters"]:
-        raise ValueError("Context exceeds requested character limit")
+    if tool == "get_source_context":
+        length = len(result["text"])
+        if length > selected["max_characters"]:
+            raise ValueError("Context exceeds requested character limit")
+        if result.get("next_offset") is not None and (
+                not length or result["next_offset"] != selected.get("offset", 0) + length):
+            raise ValueError("Context continuation must advance by returned characters")
     if tool == "get_source_document":
         if result["source_id"] != selected["source_id"] or result["offset"] != selected["offset"]:
             raise ValueError("Document does not match the requested source or offset")

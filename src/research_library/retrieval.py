@@ -88,10 +88,69 @@ def search_expression(text: str, mode: str) -> str:
     return text
 
 
+_FREQUENCY_QUESTION = re.compile(
+    r"^\s*(?:how\s+common\s+(?:was|were|is|are)|what\s+(?:proportion|percentage)\s+had)"
+    r"\s+(.+?)\s*\??\s*$", re.I,
+)
+
+
+def passage_query(text, mode):
+    query_text(text)
+    match = _FREQUENCY_QUESTION.fullmatch(text) if mode == "plain" else None
+    if match and re.search(r"\w", match[1]):
+        return search_expression(match[1], mode), True
+    return search_expression(text, mode), False
+
+
+def create_label_index(db, labels):
+    db.execute("CREATE VIRTUAL TABLE passage_labels USING fts5(unit_id UNINDEXED,label,"
+               "tokenize='unicode61 remove_diacritics 2')")
+    db.executemany("INSERT INTO passage_labels VALUES (?,?)", sorted(labels))
+
+
+def ranked_passages(db, text, mode, *, paper=None, limit, offset, editorial=True):
+    expression, frequency = passage_query(text, mode) if editorial else (search_expression(text, mode), False)
+    has_labels = editorial and mode == "plain" and db.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='passage_labels' AND type='table'").fetchone()
+    where = "" if paper is None else " AND paper_id=?"
+    params = [expression] + ([] if paper is None else [paper])
+    body = ("SELECT unit_id, snippet(content_search,2,'[',']','...',35) AS excerpt,"
+            " bm25(content_search) AS score FROM content_search WHERE content_search MATCH ?" + where)
+    if not has_labels:
+        return db.execute("SELECT unit_id, excerpt, NULL FROM (" + body +
+                          " ORDER BY score,unit_id LIMIT ? OFFSET ?)", (*params, limit, offset)).fetchall()
+    label_query = expression + (' AND "frequency"' if frequency else '')
+    label_scope = "" if paper is None else " JOIN content_units USING(unit_id)"
+    return db.execute(f"""
+        WITH body AS MATERIALIZED ({body}),
+        labels AS MATERIALIZED (
+            SELECT passage_labels.unit_id, min(label) AS matched_label FROM passage_labels{label_scope}
+            WHERE passage_labels MATCH ? {where} GROUP BY passage_labels.unit_id
+        ),
+        ids AS (SELECT unit_id FROM body UNION SELECT unit_id FROM labels)
+        SELECT ids.unit_id, body.excerpt, labels.matched_label
+        FROM ids LEFT JOIN body USING(unit_id) LEFT JOIN labels USING(unit_id)
+        ORDER BY coalesce(body.score, 0) - CASE WHEN labels.unit_id IS NULL THEN 0 ELSE 0.75 END,
+                 ids.unit_id LIMIT ? OFFSET ?
+        """, (*params, label_query, *params[1:], limit, offset)).fetchall()
+
+
 def search(db: sqlite3.Connection, text: str, *, paper: str | None = None,
            limit: int = 10, offset: int = 0,
-           mode: str = "fts5") -> list[dict[str, Any]]:
+           mode: str = "fts5", editorial: bool = False) -> list[dict[str, Any]]:
     pagination(limit, offset)
+    if editorial:
+        rows = ranked_passages(db, text, mode, paper=paper_id(paper) if paper is not None else None,
+                               limit=limit, offset=offset)
+        matches = []
+        for unit_id, snippet, _ in rows:
+            record, doi = db.execute(
+                "SELECT payload_json,doi FROM content_units JOIN papers USING(paper_id) WHERE unit_id=?",
+                (unit_id,)).fetchone()
+            unit = payload(record)
+            source_text = unit.pop("text")
+            matches.append({**unit, "snippet": snippet if snippet is not None else source_text[:2048], "doi": doi})
+        return matches
     text = search_expression(text, mode)
     sql = """SELECT content_units.payload_json,
                     snippet(content_search,2,'[',']','...',35),papers.doi

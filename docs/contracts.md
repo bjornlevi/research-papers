@@ -66,7 +66,7 @@ All inputs reject unknown properties, including arbitrary SQL or file paths.
 | `catalog_status` | none | none | Coverage for each selected catalog |
 | `search_evidence` | `query` | `paper`, `mode`, `limit`, `offset` | Page of cited search hits |
 | `get_claim` | `claim_id` | none | Whole contextual claim and numerical records |
-| `get_source_context` | `unit_id` | `max_characters` | Bounded cited context |
+| `get_source_context` | `unit_id` | `offset`, `max_characters` | Bounded cited context |
 | `get_source_document` | `source_id` | `offset`, `max_characters` | Continuous PDF text slice, page segments and continuation |
 | `get_table` | `table_id` | `limit`, `offset` | Headers, units, rows, footnotes and continuation |
 | `get_source_issue` | `issue_id` | none | Status, explanation, exact quotes and citations |
@@ -80,6 +80,53 @@ IDs are opaque, stable within a schema family, nonblank and at most 256
 characters. `paper` accepts a DOI or the existing normalized paper ID.
 Word/Excel source-unit IDs do not imply PDF pagination. The exporter
 preserves existing record IDs and maps source units explicitly.
+
+Private project snapshots can index opted-in document-wide chunks instead of
+whole pages. `search_evidence` may return a chunk ID; use that ID with
+`get_source_context` in the same pinned snapshot. `get_source_document` and
+source-unit inventories continue to use original page units.
+
+Private PDF hits and source-context records include optional `passage_context`.
+`paper_title` is included when available in published source metadata.
+`section_paths` lists explicit Markdown heading paths in reading order and
+`elements` lists explicit figure/table labels and marked descriptions.
+An empty list means no corresponding markup was identified. `block_range`,
+when present, is an inclusive, one-based range of numbered blocks. When
+`block_scope` is `document`, numbering spans the paper; otherwise it is
+page-local. Document-wide chunks include `source_spans` in reading order,
+each with the canonical page unit ID, citation, and zero-based, half-open
+character offsets within that page. Chunk text joins the original slices with
+a newline. For compatibility, the top-level `citation` is the first span;
+clients should use `source_spans` to cite all contributing pages. Metadata
+describes the whole unit even if the returned text is clipped. Metadata is
+derived from the pinned publication, not appended to quoted text or indexed
+for search. Clients should not assume the field is present on legacy or Office
+records.
+
+Use `next_offset` with the same unit and snapshot to continue a context read.
+Some private PDF units also expose `reading_parts` with zero-based, half-open
+offsets into the full unit. For a table row, also read the header and any notes;
+for a figure panel, also read the caption introduction. Reference entries are
+bibliographic leads, not evidence from the cited works.
+
+An optional `passage_context.editorial_label` is operator-supplied search
+metadata, not author text. Private plain-text search indexes labels separately
+and boosts matches on all search terms. For `How common was/is ...?` (also
+`were`/`are`) or `What proportion/percentage had ...?`, search removes the
+question prefix and prefers matching labels marked with the word `frequency`.
+Labels can include a plain-language synonym when it accurately describes the
+same evidence; search does not infer synonyms. Explicit table/figure lookups
+and advanced FTS5 search do not use this boost.
+
+On document-chunk plans, a plain query naming one table and a matching row
+label, an explicit figure such as `Figure 2`, or a panel such as `Figure 1C`, can return
+`exact_evidence` first instead of ordinary lexical hits. A table row includes
+the printed headers and marked notes; a figure returns its printed caption,
+and a panel includes the caption introduction.
+These are assembled source excerpts, not generated answers. The result ID
+still identifies the enclosing chunk for pinned follow-up. If no exact part
+matches, search uses ordinary lexical retrieval; do not treat a mention as
+the requested evidence. Advanced FTS5 queries retain their existing behavior.
 
 ## Bounds and ordering
 

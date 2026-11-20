@@ -597,7 +597,8 @@ def attach(root, doi, pdf, *, identity_confirmed, license=None, title=None, expe
         releases.validate_bundle(bundle)
         write_text_views(run / "text", bundle)
         destination = run / "evidence"
-        evidence_id = releases.export(bundle, destination, profile="private_context", authorization=grants)
+        evidence_id = releases.export(bundle, destination, profile="private_context", authorization=grants,
+                                     chunk_plans=parent.chunk_plans if current else None)
         installed = registry.releases.install(destination)
         version = "core-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
         document = {"schema_version": 1, "collections": [
