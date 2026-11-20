@@ -92,6 +92,7 @@ _FREQUENCY_QUESTION = re.compile(
     r"^\s*(?:how\s+common\s+(?:was|were|is|are)|what\s+(?:proportion|percentage)\s+had)"
     r"\s+(.+?)\s*\??\s*$", re.I,
 )
+_PERSISTENCE_QUESTION = re.compile(r"^\s*how\s+often\s+did\s+(.+?)\s+persist\s*\??\s*$", re.I)
 
 
 def passage_query(text, mode):
@@ -99,6 +100,9 @@ def passage_query(text, mode):
     match = _FREQUENCY_QUESTION.fullmatch(text) if mode == "plain" else None
     if match and re.search(r"\w", match[1]):
         return search_expression(match[1], mode), True
+    match = _PERSISTENCE_QUESTION.fullmatch(text) if mode == "plain" else None
+    if match and re.search(r"\w", match[1]):
+        return search_expression(f"{match[1]} persistent", mode), True
     return search_expression(text, mode), False
 
 
@@ -130,9 +134,10 @@ def ranked_passages(db, text, mode, *, paper=None, limit, offset, editorial=True
         ids AS (SELECT unit_id FROM body UNION SELECT unit_id FROM labels)
         SELECT ids.unit_id, body.excerpt, labels.matched_label
         FROM ids LEFT JOIN body USING(unit_id) LEFT JOIN labels USING(unit_id)
-        ORDER BY coalesce(body.score, 0) - CASE WHEN labels.unit_id IS NULL THEN 0 ELSE 0.75 END,
+        ORDER BY CASE WHEN ? AND labels.unit_id IS NOT NULL THEN 0 ELSE 1 END,
+                 coalesce(body.score, 0) - CASE WHEN labels.unit_id IS NULL THEN 0 ELSE 0.75 END,
                  ids.unit_id LIMIT ? OFFSET ?
-        """, (*params, label_query, *params[1:], limit, offset)).fetchall()
+        """, (*params, label_query, *params[1:], frequency, limit, offset)).fetchall()
 
 
 def search(db: sqlite3.Connection, text: str, *, paper: str | None = None,

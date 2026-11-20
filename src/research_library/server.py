@@ -39,7 +39,7 @@ DESCRIPTIONS = {
     "search_evidence": "Bounded lexical source search. Plain text is safe by default, including LC-MGUS. "
                        "All search terms must match in source text or in a private editorial label. "
                        "Private plain search recognizes frequency questions like 'How common was ...?' "
-                       "and 'What proportion had ...?'. "
+                       "'What proportion had ...?', and 'How often did ... persist?'. "
                        "Use mode='fts5' for explicit advanced syntax without editorial ranking. "
                        "Private PDF hits can include passage_context with the paper title, section paths "
                        "and figure/table labels. An editorial_label is search metadata, not author text. "

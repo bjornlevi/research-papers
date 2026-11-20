@@ -116,7 +116,8 @@ def history(root, source_id):
 
 
 def correct(root, *, snapshot_id, source_id, unit_id, text, bibliography, source_url,
-            tables, reviewer, reason, checked, missing_locator=None, whole_document=False):
+            tables, reviewer, reason, checked, missing_locator=None, whole_document=False,
+            track_markdown=True):
     root = Path(root)
     reviewer, reason = reviewer.strip(), reason.strip()
     if not reviewer or len(reviewer) > 200 or not reason or len(reason) > 2000:
@@ -285,8 +286,9 @@ def correct(root, *, snapshot_id, source_id, unit_id, text, bibliography, source
             # Registry publication is the last operation: failed staging leaves active evidence unchanged.
             snapshot = registry.publish(document)
             activated = True
-            project_text.export_git_markdown(root, bundle, source_id=source_id,
-                                             kind="draft", release_id=release_id)
+            if track_markdown:
+                project_text.export_git_markdown(root, bundle, source_id=source_id,
+                                                 kind="draft", release_id=release_id)
             return {"snapshot": snapshot, "release": release_id, "audit": str(run / "correction.json")}
         finally:
             if not activated:

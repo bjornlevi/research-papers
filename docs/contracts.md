@@ -113,7 +113,9 @@ An optional `passage_context.editorial_label` is operator-supplied search
 metadata, not author text. Private plain-text search indexes labels separately
 and boosts matches on all search terms. For `How common was/is ...?` (also
 `were`/`are`) or `What proportion/percentage had ...?`, search removes the
-question prefix and prefers matching labels marked with the word `frequency`.
+question prefix and ranks matching labels marked with the word `frequency`
+ahead of unlabeled text matches.
+`How often did … persist?` searches for the topic plus `persistent`.
 Labels can include a plain-language synonym when it accurately describes the
 same evidence; search does not infer synonyms. Explicit table/figure lookups
 and advanced FTS5 search do not use this boost.

@@ -307,6 +307,11 @@ operator-reviewed, not independently scientifically validated; existing
 extraction/OCR caveats are retained. The immutable source
 checksum continues to identify the original PDF, not the corrected transcription.
 
+Clear text can display an embedded JPEG or PNG from the matching local PDF
+page. Its Markdown image link identifies the paper, page, PDF checksum, and
+embedded image object. External images are not loaded. Use Markdown source
+mode to edit drafts containing image markup.
+
 ### Track Markdown versions in Git
 
 Project PDFs, releases and extracted text remain ignored by default. To opt in,
@@ -613,8 +618,8 @@ for this paper. Retrieval defaults to whole PDF pages. Under **Review
 searchable passages**, open a passage to read it. Use **Split after this
 text** at a boundary or **Join with next passage** to keep related evidence
 together. These edits don't affect live search until applied. A passage can
-cross PDF pages and keeps every contributing page citation. Open **See what
-live search can return** to inspect the active passages.
+cross PDF pages. The passage editor omits page numbers; citations are still
+shown in search previews and under **See what live search can return**.
 
 Use **Advanced: edit numbered ranges** to type ranges or to overlap them
 (for example `1-3, 3-5`). A block is a numbered piece of the published text.
