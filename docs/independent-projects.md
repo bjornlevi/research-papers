@@ -547,7 +547,7 @@ Results and provider-response provenance persist under `PROJECT_ROOT/discovery/`
 including `citation-edges.csv`; reopening the app preserves completed searches.
 **Library** lists both core papers and saved discovered
 papers in a table, including searches completed before this feature was added.
-Columns show **Title**, **DOI**, **Library groups**, **PDF / text status**,
+Columns show **Title**, **DOI**, **Library groups**, **Retrieval status**,
 **First author**, **Publication year**, and **Journal**, plus PDF/text actions.
 Click a column heading to sort ascending, then click again for descending.
 Use the filters under each heading together with the global search and click

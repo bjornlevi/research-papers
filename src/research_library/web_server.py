@@ -125,6 +125,15 @@ def page(title, body, *, reader_script=False, settings_script=False, library_scr
 def status_tone(label):
     """Visual tone for a status label; the label text itself is always shown."""
     text = label.casefold()
+    if text == "published for retrieval":
+        return "ok"
+    if text in {"awaiting pdf", "metadata only — doi unresolved"}:
+        return "bad"
+    if text in {
+        "extracted", "clear-text draft", "draft revision (published text remains active)",
+        "needs visual review", "extracted with ocr (not human verified)",
+    }:
+        return "warn"
     if any(word in text for word in ("fail", "no licensed", "no native", "unsupported", "could not", "removed")):
         return "bad"
     if any(word in text for word in ("awaiting", "partial", "incomplete", "ocr", "review", "not extracted", "being added",
@@ -845,14 +854,14 @@ main.library-page{max-width:none}
 .library-table{table-layout:fixed;width:100%;min-width:0}
 .library-table thead{position:sticky;top:0;background:var(--paper);z-index:1}
 .library-table th,.library-table td{padding:.5rem;overflow-wrap:anywhere;white-space:normal}
-.library-table th:first-child{width:25%}
-.library-table th:nth-child(2){width:14%}
+.library-table th:first-child{width:23%}
+.library-table th:nth-child(2){width:13%}
 .library-table th:nth-child(3){width:10%}
 .library-table th:nth-child(4){width:11%}
 .library-table th:nth-child(5){width:10%}
-.library-table th:nth-child(6){width:7%}
+.library-table th:nth-child(6){width:11%}
 .library-table th:nth-child(7){width:12%}
-.library-table th:nth-child(8){width:11%}
+.library-table th:nth-child(8){width:10%}
 .library-table tbody th{color:var(--ink);font-size:inherit;font-weight:500;border-bottom:1px solid var(--line)}
 .library-table tbody tr:hover th{background:var(--raised)}
 .library-table .badge{white-space:normal}
@@ -2397,7 +2406,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 + '</dd>'
                 + "".join(f'<dt>{label}</dt><dd>{escape(paper[field]) if paper[field] else "Not recorded"}</dd>'
                           for field, label in (("year", "Publication year"), ("journal", "Journal"),
-                                               ("library_groups", "Library groups"), ("status", "PDF / text status")))
+                                               ("library_groups", "Library groups"), ("status", "Retrieval status")))
                 + '</dl><details><summary>Provider metadata and source links</summary>'
                 + (metadata_value(records) if records else '<p>No saved provider metadata for this paper.</p>')
                 + '</details></section>')
@@ -3671,7 +3680,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             'and filters</caption><thead><tr>'
             + "".join(sort_header(name, label) for name, label in (
                 ("title", "Title"), ("doi", "DOI"), ("relationship", "Library groups"),
-                ("status", "PDF / text status"), ("first_author", "First author"),
+                ("status", "Retrieval status"), ("first_author", "First author"),
                 ("year", "Publication year"), ("journal", "Journal")))
             + '<th scope="col">Actions</th></tr><tr class="column-filters">'
             + '<td>' + column_input("title", "title") + '</td>'
@@ -3679,7 +3688,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             + filter_select("relationship", "Filter library groups", [
                 ("", "All papers"), ("core", "Core papers"), ("background", "References"),
                 ("impact", "Citing papers")], view["relationship"])
-            + '</td><td>' + filter_select("status", "Filter PDF / text status", [
+            + '</td><td>' + filter_select("status", "Filter retrieval status", [
                 ("", "All statuses"), ("awaiting", "Awaiting PDF"), ("extracted", "Extracted"),
                 ("draft", "Clear-text drafts"), ("published", "Published for retrieval"),
                 ("review", "Needs review"), ("unresolved", "DOI unresolved")], view["status"])
