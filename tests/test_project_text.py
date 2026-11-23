@@ -19,6 +19,21 @@ from research_library.build import literature_text, project_chunks, project_edit
 
 
 class ProjectTextTests(unittest.TestCase):
+    def test_library_retrieval_status_uses_red_yellow_green_states(self):
+        cases = {
+            "Awaiting PDF": "bad",
+            "Metadata only — DOI unresolved": "bad",
+            "Extracted": "warn",
+            "Clear-text draft": "warn",
+            "Draft revision (published text remains active)": "warn",
+            "Needs visual review": "warn",
+            "Extracted with OCR (not human verified)": "warn",
+            "Published for retrieval": "ok",
+        }
+        for label, tone in cases.items():
+            with self.subTest(label=label):
+                self.assertEqual(web_server.status_tone(label), tone)
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
