@@ -1,6 +1,7 @@
 """Rebuild private project data before permanently removing a core paper."""
 
 from copy import deepcopy
+from contextlib import ExitStack
 import csv
 from pathlib import Path
 import os
@@ -9,6 +10,9 @@ import tempfile
 
 from research_library import collections, releases
 from . import citation_neighborhood, literature_update
+
+
+PRESERVED_AUXILIARY = ("figures", "chunk-drafts", "chunk-checks")
 
 
 def _doi(value):
@@ -55,6 +59,21 @@ def _file_version(path):
     return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
 
 
+def _auxiliary_versions(root):
+    versions = []
+    for name in PRESERVED_AUXILIARY:
+        folder = root / name
+        if not folder.exists():
+            continue
+        if not folder.is_dir():
+            raise ValueError(f"Expected {name} to be a directory; review it before purging")
+        for path in [folder, *sorted(folder.rglob("*"))]:
+            if not (path.is_dir() or path.is_file()):
+                raise ValueError(f"Unexpected item in {name}; review it before purging")
+            versions.append([str(path.relative_to(root)), _file_version(path)])
+    return versions
+
+
 def discovery_index(folder, graph=None):
     """Cache only target identities and core connections, not provider payloads."""
     path = releases.safe_file(folder, "neighborhood.json")
@@ -81,7 +100,80 @@ def discovery_index(folder, graph=None):
     return index
 
 
-def plan(root, doi, pdf_data_root, *, prepare=True):
+def plan_current(root, current_store, doi, pdf_data_root):
+    """Preview current-store paper removal without changing either store."""
+    from . import project_current_store, project_index, project_library
+
+    root, current_store, pdf_root = (Path(path).absolute() for path in (root, current_store, pdf_data_root))
+    if (root.resolve() != root or current_store.resolve() != current_store
+            or not root.is_dir() or not current_store.is_dir()
+            or root == current_store or root.is_relative_to(current_store)
+            or current_store.is_relative_to(root)):
+        raise ValueError("Project and current store must be separate real directories without symlinks")
+    if pdf_root.resolve() != pdf_root or (pdf_root.exists() and not pdf_root.is_dir()):
+        raise ValueError("PDF data folder must be a real directory without symlinked paths")
+    doi = citation_neighborhood.doi(doi)
+    with ExitStack() as locks:
+        for path in sorted((root, current_store)):
+            locks.enter_context(literature_update.reader_lock(path))
+        state = project_current_store.read(current_store)
+        project = state["project"]
+        if doi not in project["papers"]:
+            raise ValueError("Select an existing Core paper")
+        remaining = set(project["papers"]) - {doi}
+        runs, all_dois, keep_dois, all_keys, keep_keys = [], set(), set(remaining), set(), set()
+        for run, folder in project_index.discovery_runs(root, current_store).items():
+            job = releases.safe_file(folder, "job.json").read_bytes()
+            graph_path = folder / "neighborhood.json"
+            if not graph_path.exists() and not graph_path.is_symlink():
+                runs.append({"run": run, "job": releases.sha256(job), "graph": None})
+                continue
+            data = releases.safe_file(folder, "neighborhood.json").read_bytes()
+            graph = releases.read_json(data)
+            runs.append({"run": run, "job": releases.sha256(job), "graph": releases.sha256(data)})
+            for edge in graph["edges"]:
+                key = edge["target_provider_record"]
+                node = graph["nodes"][key]
+                identifier = _doi(node["record"]["identifiers"].get("doi", ""))
+                identity = (run, key)
+                all_keys.add(identity)
+                if identifier:
+                    all_dois.add(identifier)
+                if _doi(edge["seed_doi"]) in remaining and identifier != doi:
+                    keep_keys.add(identity)
+                    if identifier:
+                        keep_dois.add(identifier)
+        removed_dois = (all_dois - keep_dois) | {doi}
+        sources = state["editorial"]["bundle"]["sources"] if state["editorial"] else []
+        removed_sources = [source for source in sources if _doi(source["doi"]) in removed_dois]
+        kept_sources = [source for source in sources if _doi(source["doi"]) not in removed_dois]
+        downloads = project_library.downloaded_pdf_metadata(pdf_root)
+        digests = {source["sha256"] for source in removed_sources}
+        protected = {source["sha256"] for source in kept_sources}
+        for (identifier, digest) in downloads:
+            (digests if _doi(identifier) in removed_dois else protected).add(digest)
+        digests -= protected
+        shared = []
+        if pdf_root.exists():
+            for path in sorted(pdf_root.iterdir()):
+                if path.suffix.casefold() != ".pdf":
+                    continue
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError("PDF data folder contains a symlink or invalid PDF")
+                digest = releases.sha256(path.read_bytes())
+                if digest in digests:
+                    shared.append({"path": str(path), "sha256": digest})
+        return {
+            "doi": doi, "title": project["papers"][doi]["title"],
+            "state_sha256": releases.sha256(releases.encode(state)),
+            "runs": runs, "removed_dois": sorted(removed_dois),
+            "removed_source_ids": sorted(source["id"] for source in removed_sources),
+            "pdf_digests": sorted(digests), "shared_pdfs": shared,
+            "related_removed": len(all_keys - keep_keys),
+        }
+
+
+def plan(root, doi, pdf_data_root, *, prepare=True, progress=None):
     from . import project_library
     root = Path(root).absolute()
     _safe_tree(root)
@@ -89,8 +181,10 @@ def plan(root, doi, pdf_data_root, *, prepare=True):
         raise ValueError("An earlier purge has undeleted recovery data beside the project; review it before another purge")
     if any(path.name not in {"project.json", "runs", "registry", "papers", "discovery", "metadata-job.json",
                              "purge-job.json", "pdf-job.json", "batch-pdf.json", "retained-text",
-                             "library-index.sqlite", "corrections", "editorial"} for path in root.iterdir()):
+                             "library-index.sqlite", "corrections", "editorial",
+                             *PRESERVED_AUXILIARY} for path in root.iterdir()):
         raise ValueError("Unexpected project files; review them before rebuilding project data")
+    auxiliary_versions = _auxiliary_versions(root)
     project = project_library.load(root)
     doi = citation_neighborhood.doi(doi)
     if doi not in project["papers"]:
@@ -135,10 +229,14 @@ def plan(root, doi, pdf_data_root, *, prepare=True):
     protected_hashes = {digest for (identifier, digest) in downloads if identifier not in removed_dois}
     digests = {digest for (identifier, digest) in downloads if identifier in removed_dois}
     editorial_snapshot = None
+    removed_source_ids, retained_source_ids = set(), set()
     if (root / "editorial/active.json").exists():
         state = releases.read_json(releases.safe_file(root / "editorial", "active.json").read_bytes())
         editorial_snapshot = collections.digest(state["active"])
-        for path in (root / "editorial/releases").iterdir():
+        paths = list((root / "editorial/releases").iterdir())
+        for index, path in enumerate(paths, 1):
+            if progress:
+                progress(f"Checking editorial source inventories: {index} of {len(paths)}")
             if prepare:
                 sources = releases.validate(path, allowed_profiles=["private_context"])._bundle["sources"]
             else:
@@ -149,6 +247,7 @@ def plan(root, doi, pdf_data_root, *, prepare=True):
                 sources = releases.read_json(records)["sources"]
             for source in sources:
                 (digests if _doi(source["doi"]) in removed_dois else protected_hashes).add(source["sha256"])
+                (removed_source_ids if _doi(source["doi"]) in removed_dois else retained_source_ids).add(source["id"])
     registry = project_library.store(root)
     current, snapshot = None, None
     if (root / "registry/active.json").exists():
@@ -163,7 +262,10 @@ def plan(root, doi, pdf_data_root, *, prepare=True):
             raise ValueError("Purge supports one core collection plus metadata catalogs; review custom evidence collections first")
         if prepare:
             current = registry.current()
-        for path in (root / "registry/releases").iterdir():
+        paths = list((root / "registry/releases").iterdir())
+        for index, path in enumerate(paths, 1):
+            if progress:
+                progress(f"Checking evidence source inventories: {index} of {len(paths)}")
             if prepare:
                 sources = releases.validate(path, allowed_profiles=["private_context"])._bundle["sources"]
             else:
@@ -175,6 +277,7 @@ def plan(root, doi, pdf_data_root, *, prepare=True):
                 sources = releases.read_json(records)["sources"]
             for source in sources:
                 (digests if _doi(source["doi"]) in removed_dois else protected_hashes).add(source["sha256"])
+                (removed_source_ids if _doi(source["doi"]) in removed_dois else retained_source_ids).add(source["id"])
     digests -= protected_hashes
     shared = []
     pdf_root = Path(pdf_data_root).absolute()
@@ -192,6 +295,8 @@ def plan(root, doi, pdf_data_root, *, prepare=True):
         "removed_dois": removed_dois, "digests": digests, "shared": shared, "current": current,
         "snapshot": snapshot, "graph_versions": graph_versions,
         "editorial_snapshot": editorial_snapshot,
+        "removed_source_ids": removed_source_ids - retained_source_ids,
+        "auxiliary_versions": auxiliary_versions,
         "related_removed": len(all_keys - keep_keys),
     }
 
@@ -207,6 +312,7 @@ def fingerprint(plan):
         "removed_dois": sorted(plan["removed_dois"]), "digests": sorted(plan["digests"]),
         "shared": [str(path) for path in plan["shared"]],
         "graphs": plan["graph_versions"], "editorial": plan["editorial_snapshot"],
+        "auxiliary": plan["auxiliary_versions"],
     }))
 
 
@@ -214,12 +320,14 @@ def purge(root, doi, pdf_data_root, *, progress=None, expected_plan=None):
     from . import project_library
     root = Path(root).absolute()
     with literature_update.writer_lock(root):
-        data = plan(root, doi, pdf_data_root, prepare=False)
+        if progress:
+            progress("Checking the confirmed deletion preview")
+        data = plan(root, doi, pdf_data_root, prepare=False, progress=progress)
         if expected_plan is not None and fingerprint(data) != expected_plan:
             raise ValueError("Project data changed after confirmation; review a new purge preview")
         if progress:
-            progress("Rebuilding retained core evidence and discovery results")
-        data = plan(root, doi, pdf_data_root)
+            progress("Validating project data and preparing retained evidence")
+        data = plan(root, doi, pdf_data_root, progress=progress)
         if expected_plan is not None and fingerprint(data) != expected_plan:
             raise ValueError("Project data changed after confirmation; review a new purge preview")
         transaction = Path(tempfile.mkdtemp(prefix="." + root.name + "-purge-", dir=root.parent))
@@ -231,6 +339,8 @@ def purge(root, doi, pdf_data_root, *, progress=None, expected_plan=None):
             collections.atomic_json(stage, "project.json", project)
             if (root / "editorial/active.json").exists():
                 from . import project_text, project_edit
+                if progress:
+                    progress("Rebuilding current editorial draft")
                 draft = project_text.editorial_store(root).current().snapshots["core"]
                 edited = deepcopy(draft._bundle)
                 if any(edited[key] for key in ("claims", "issues", "relationships")):
@@ -242,10 +352,15 @@ def purge(root, doi, pdf_data_root, *, progress=None, expected_plan=None):
                 project_text.activate(stage, edited,
                     {key: value for key, value in draft._manifest["authorization"].items() if key in retained},
                     editorial=True)
-                for source in edited["sources"]:
+                for index, source in enumerate(edited["sources"], 1):
+                    if progress:
+                        progress(f"Preserving editorial correction history: {index} of {len(edited['sources'])}")
                     for event in project_edit.history(root, source["id"]):
                         collections.atomic_json(stage / "corrections", releases.sha256(releases.encode(event)) + ".json", event)
-                for path in (root / "editorial/releases").iterdir():
+                paths = list((root / "editorial/releases").iterdir())
+                for index, path in enumerate(paths, 1):
+                    if progress:
+                        progress(f"Validating and preserving editorial releases: {index} of {len(paths)}")
                     historical = releases.validate(path, allowed_profiles=["private_context"])
                     if all(_doi(s["doi"]) not in data["removed_dois"] for s in historical._bundle["sources"]):
                         project_text.editorial_store(stage).releases.install(path)
@@ -257,6 +372,8 @@ def purge(root, doi, pdf_data_root, *, progress=None, expected_plan=None):
             registry = project_library.store(stage)
             old = data["current"]
             if old:
+                if progress:
+                    progress("Rebuilding current published evidence")
                 # Imported projects have only source/page units; refuse unhandled curated dependencies.
                 original = old.snapshots["core"]
                 bundle = deepcopy(original._bundle)
@@ -286,7 +403,10 @@ def purge(root, doi, pdf_data_root, *, progress=None, expected_plan=None):
                     project_library.write_text_views(stage / "retained-text", bundle)
                 # Retain historical evidence releases only when they have no purged source.
                 safe_releases = set()
-                for path in (root / "registry/releases").iterdir():
+                paths = list((root / "registry/releases").iterdir())
+                for index, path in enumerate(paths, 1):
+                    if progress:
+                        progress(f"Validating and preserving evidence releases: {index} of {len(paths)}")
                     snapshot = releases.validate(path, allowed_profiles=["private_context"])
                     if all(_doi(source["doi"]) not in data["removed_dois"] for source in snapshot._bundle["sources"]):
                         registry.releases.install(path)
@@ -297,40 +417,73 @@ def purge(root, doi, pdf_data_root, *, progress=None, expected_plan=None):
                            for entry in document["collections"]):
                         collections.atomic_json(stage / "registry/registries", path.name, document)
             if (root / "runs").exists():
-                for path in (root / "runs").iterdir():
+                paths = list((root / "runs").iterdir())
+                for index, path in enumerate(paths, 1):
+                    if progress:
+                        progress(f"Validating and preserving import runs: {index} of {len(paths)}")
                     if not (path / "evidence/manifest.json").is_file():
+                        if path.name.startswith("correction-") and (path / "correction.json").is_file():
+                            event = releases.read_json(releases.safe_file(path, "correction.json").read_bytes())
+                            if set(path.iterdir()) != {path / "correction.json"}:
+                                raise ValueError("An incomplete correction run needs review before purge")
+                            if event["source_id"] not in data["removed_source_ids"]:
+                                shutil.copytree(path, stage / "runs" / path.name)
+                            continue
+                        if path.name.startswith("import-") and (path / "import.json").is_file():
+                            item = releases.read_json(releases.safe_file(path, "import.json").read_bytes())
+                            if (not isinstance(item, dict)
+                                    or set(item) != {"schema_version", "source_id", "doi", "source_sha256", "release"}
+                                    or item["schema_version"] != 1
+                                    or not isinstance(item["source_id"], str)
+                                    or not isinstance(item["doi"], str)
+                                    or not isinstance(item["source_sha256"], str)
+                                    or not isinstance(item["release"], str)):
+                                raise ValueError("An import run has invalid source metadata; review before purge")
+                            collections.digest(item["source_sha256"])
+                            collections.digest(item["release"])
+                            if item["source_id"] != "literature:" + item["source_sha256"]:
+                                raise ValueError("An import run has inconsistent source metadata; review before purge")
+                            if (_doi(item["doi"]) not in data["removed_dois"]
+                                    or item["source_id"] not in data["removed_source_ids"]):
+                                shutil.copytree(path, stage / "runs" / path.name)
+                            continue
                         raise ValueError("An incomplete PDF import needs review before purge")
                     snapshot = releases.validate(path / "evidence", allowed_profiles=["private_context"])
                     if all(_doi(source["doi"]) not in data["removed_dois"] for source in snapshot._bundle["sources"]):
                         shutil.copytree(path, stage / "runs" / path.name)
             if old:
                 from . import project_edit
-                for source in old.snapshots["core"]._bundle["sources"]:
+                sources = old.snapshots["core"]._bundle["sources"]
+                for index, source in enumerate(sources, 1):
+                    if progress:
+                        progress(f"Preserving published correction history: {index} of {len(sources)}")
                     if _doi(source["doi"]) not in data["removed_dois"]:
                         for event in project_edit.history(root, source["id"]):
                             collections.atomic_json(stage / "corrections",
                                 releases.sha256(releases.encode(event)) + ".json", event)
             from . import project_chunks
-            retained_snapshots = [old.snapshots["core"]] if old else []
-            if (root / "editorial/active.json").exists():
-                retained_snapshots.append(draft)
-            for snapshot in retained_snapshots:
-                for source in snapshot._bundle["sources"]:
-                    if _doi(source["doi"]) not in data["removed_dois"]:
-                        chunk_draft = project_chunks.load_draft(root, source["id"])
-                        if chunk_draft is not None:
-                            collections.atomic_json(stage / "chunk-drafts",
-                                                     project_chunks.draft_name(source["id"]), chunk_draft)
-                        checks = project_chunks.load_checks(root, source["id"])
-                        if checks:
-                            collections.atomic_json(stage / "chunk-checks",
-                                                     project_chunks.draft_name(source["id"]), checks)
+            if progress:
+                progress("Preserving retained RAG drafts, checks, figures and PDFs")
+            removed_names = {project_chunks.draft_name(source_id) for source_id in data["removed_source_ids"]}
+            for name in ("chunk-drafts", "chunk-checks"):
+                folder = root / name
+                if folder.exists():
+                    shutil.copytree(folder, stage / name,
+                                    ignore=lambda directory, names: {
+                                        item for item in names
+                                        if Path(directory) == folder and item in removed_names
+                                        and (folder / item).is_file()
+                                    })
+            if (root / "figures").exists():
+                shutil.copytree(root / "figures", stage / "figures")
             if (root / "papers").exists():
                 for path in (root / "papers").iterdir():
                     if path.is_file() and releases.sha256(path.read_bytes()) not in data["digests"]:
                         (stage / "papers").mkdir(exist_ok=True)
                         shutil.copy2(path, stage / "papers" / path.name)
             for name, job, graph in data["graphs"]:
+                if progress:
+                    progress("Rebuilding retained discovery results")
                 if not graph["seeds"]:
                     continue
                 output = stage / "discovery" / name
@@ -358,7 +511,11 @@ def purge(root, doi, pdf_data_root, *, progress=None, expected_plan=None):
                     progress("Rebuilding the metadata catalog without purged papers")
                 project_library.configure_metadata(stage)
             # Validate the replacement before changing the live project.
+            if progress:
+                progress("Validating rebuilt project before activation")
             project_library.status(stage)
+            if _auxiliary_versions(root) != data["auxiliary_versions"]:
+                raise ValueError("Project files changed during purge; review a new purge preview")
             if progress:
                 progress("Activating rebuilt data and deleting old copies")
             os.rename(root, backup)

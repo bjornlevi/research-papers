@@ -20,7 +20,24 @@ PROJECT_ROOT ?= releases/project
 COLLECTION_REGISTRY ?= $(PROJECT_ROOT)/registry
 COLLECTIONS ?= core
 DEFAULT_COLLECTIONS ?= core
+CURRENT_STATE ?=
+CURRENT_METADATA ?= 0
+ifneq ($(CURRENT_METADATA),0)
+ifneq ($(CURRENT_METADATA),1)
+$(error CURRENT_METADATA must be 0 or 1)
+endif
+endif
+ifeq ($(CURRENT_METADATA),1)
+ifeq ($(strip $(CURRENT_STATE)),)
+$(error CURRENT_METADATA=1 requires CURRENT_STATE)
+endif
+endif
+EXPERIMENTAL_MARKDOWN_REPOSITORY ?=
+CONFIRM_MARKDOWN_RIGHTS ?=
 COLLECTION_ARGS = --registry "$(COLLECTION_REGISTRY)" $(foreach c,$(COLLECTIONS),--allow-collection "$(c)") $(foreach c,$(DEFAULT_COLLECTIONS),--default-collection "$(c)")
+EVIDENCE_ARGS = $(if $(CURRENT_STATE),--current-state "$(CURRENT_STATE)" $(if $(filter 1,$(CURRENT_METADATA)),--allow-current-metadata),$(if $(COLLECTION_REGISTRY),$(COLLECTION_ARGS),--release "$(RELEASE)"))
+WEB_EVIDENCE_ARGS = $(if $(CURRENT_STATE),--current-state "$(CURRENT_STATE)" $(if $(filter 1,$(CURRENT_METADATA)),--allow-current-metadata),--registry "$(COLLECTION_REGISTRY)")
+WEB_MARKDOWN_ARGS = $(if $(EXPERIMENTAL_MARKDOWN_REPOSITORY),--experimental-markdown-repository "$(EXPERIMENTAL_MARKDOWN_REPOSITORY)") $(if $(filter 1,$(CONFIRM_MARKDOWN_RIGHTS)),--confirm-markdown-rights)
 PROJECT_NAME ?=
 PROJECT_AUTHORIZATION ?=
 PROJECT_PAPERS ?=
@@ -81,20 +98,20 @@ test:
 	"$(PY)" tests/run.py portable
 
 run:
-	@"$(VENV)/bin/research-mcp" $(if $(COLLECTION_REGISTRY),$(COLLECTION_ARGS),--release "$(RELEASE)") --allow-profile "$(PROFILE)"
+	@"$(VENV)/bin/research-mcp" $(EVIDENCE_ARGS) --allow-profile "$(PROFILE)"
 
 http-token:
 	@"$(VENV)/bin/research-http-token" issue --registry "$(TOKEN_REGISTRY)" --token-file "$(TOKEN_FILE)" --audience "$(HTTP_URL)" --profile "$(PROFILE)"
 
 web:
-	@"$(PY)" -m research_library.web_lifecycle start --registry "$(COLLECTION_REGISTRY)" --project-root "$(PROJECT_ROOT)" --pdf-data-root "$(PDF_DATA_ROOT)" --state-dir "$(WEB_STATE_DIR)" --allow-profile "$(PROFILE)" $(foreach c,$(COLLECTIONS),--allow-collection "$(c)") $(foreach c,$(DEFAULT_COLLECTIONS),--default-collection "$(c)") --port "$(WEB_PORT)" --mcp-url "$(HTTP_URL)"
+	@"$(PY)" -m research_library.web_lifecycle start $(WEB_EVIDENCE_ARGS) $(WEB_MARKDOWN_ARGS) --project-root "$(PROJECT_ROOT)" --pdf-data-root "$(PDF_DATA_ROOT)" --state-dir "$(WEB_STATE_DIR)" --allow-profile "$(PROFILE)" $(foreach c,$(COLLECTIONS),--allow-collection "$(c)") $(foreach c,$(DEFAULT_COLLECTIONS),--default-collection "$(c)") --port "$(WEB_PORT)" --mcp-url "$(HTTP_URL)"
 
 web-off:
-	@"$(PY)" -m research_library.web_lifecycle stop --registry "$(COLLECTION_REGISTRY)" --project-root "$(PROJECT_ROOT)" --state-dir "$(WEB_STATE_DIR)" --allow-profile "$(PROFILE)" $(foreach c,$(COLLECTIONS),--allow-collection "$(c)") $(foreach c,$(DEFAULT_COLLECTIONS),--default-collection "$(c)") --port "$(WEB_PORT)" --mcp-url "$(HTTP_URL)"
+	@"$(PY)" -m research_library.web_lifecycle stop $(WEB_EVIDENCE_ARGS) --project-root "$(PROJECT_ROOT)" --state-dir "$(WEB_STATE_DIR)" --allow-profile "$(PROFILE)" $(foreach c,$(COLLECTIONS),--allow-collection "$(c)") $(foreach c,$(DEFAULT_COLLECTIONS),--default-collection "$(c)") --port "$(WEB_PORT)" --mcp-url "$(HTTP_URL)"
 
 mcp:
 	@"$(PY)" -m research_library.local_client init --registry "$(TOKEN_REGISTRY)"
-	@"$(VENV)/bin/research-http" $(if $(COLLECTION_REGISTRY),$(COLLECTION_ARGS),--release "$(RELEASE)") $(foreach p,$(PROFILE),--allow-profile "$(p)") --token-registry "$(TOKEN_REGISTRY)" --port "$(HTTP_PORT)" --base-url "$(HTTP_URL)" $(HTTP_BIND)
+	@"$(VENV)/bin/research-http" $(EVIDENCE_ARGS) $(foreach p,$(PROFILE),--allow-profile "$(p)") --token-registry "$(TOKEN_REGISTRY)" --port "$(HTTP_PORT)" --base-url "$(HTTP_URL)" $(HTTP_BIND)
 
 lan-token:
 	@test -n "$(LAN_HOST)" || { echo 'Set LAN_HOST (in local.mk or on the command line), e.g. LAN_HOST=192.168.1.10'; exit 2; }

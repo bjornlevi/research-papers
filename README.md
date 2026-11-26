@@ -5,6 +5,24 @@ Publish admin-cleaned clear text for search in a browser, through a read-only JS
 through an MCP client. Papers, extracts and project data are not included in
 the repository and are not served as original files.
 
+## Paper workflow
+
+1. Attach an authorized PDF and extract its clear text.
+2. Edit and save the clear-text draft. Saving does not change published search evidence.
+3. Publish the checked text when it is ready.
+4. Review and test RAG settings, save a draft, and apply them to live search when ready.
+
+For later corrections, save and publish the updated text, then review and apply
+the RAG settings again. Republishing returns that paper to default page-based
+retrieval until its RAG settings are reviewed and applied.
+
+The intended storage model keeps only the current draft and published text,
+and the current draft and live RAG settings, with Git providing history. This
+storage refactor is not complete: the app currently retains snapshots and
+optionally exports release-stamped Markdown. Those exports are not a complete
+backup of RAG settings or project state. The app does not stage or commit the
+exports; use Git normally and only store paper text where authorized.
+
 ## Start a project
 
 Install Python 3, then create the local environment:
@@ -93,7 +111,7 @@ retrieval** separately requires your name, a reason and confirmation against the
 original PDF. It activates a new search/AI version while retaining old versions.
 See [correcting extracted data](docs/independent-projects.md#view-and-correct-extracted-data).
 New PDF extractions automatically format native text into column-aware
-paragraphs while retaining raw text in private extraction checkpoints.
+paragraphs. Check the draft against the retained original PDF.
 
 For continuous reading, select **Read whole document** from a PDF source or
 page-context view. All retained pages are shown together with page citations and

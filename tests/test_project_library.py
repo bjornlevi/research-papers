@@ -18,7 +18,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 import pymupdf
 
-from tools import project_library
+from tools import project_current_store, project_library, project_state, project_text
 from research_library import collections, literature, releases, web_server
 from project_text_helpers import publish_all
 
@@ -705,6 +705,17 @@ class ProjectLibraryTests(unittest.TestCase):
         self.assertIn(b"Repository manuscript", enriched.data)
         self.assertIn(b"<dt>Year</dt><dd>2025</dd>", enriched.data)
         self.assertIn(b"Year metadata source", enriched.data)
+        current_root = self.root.parent / "current-store"
+        project_current_store.initialize(project_state.current(self.root), current_root)
+        current_app = web_server.create_app(
+            current_store=current_root, project_root=self.root, pdf_data_root=pdf_root,
+            profiles={"private_context"})
+        current_sources = current_app.test_client().get("/sources", base_url=base)
+        self.assertEqual(current_sources.status_code, 200)
+        self.assertIn(b"SHA-256 and DOI matched", current_sources.data)
+        self.assertIn(b"Repository manuscript", current_sources.data)
+        self.assertIn(b"<dt>Year</dt><dd>2025</dd>", current_sources.data)
+        self.assertIn(b"Year metadata source", current_sources.data)
         collections.atomic_json(pdf_root, "fixture-downloads.json", [{
             "status": "downloaded", "doi": source["doi"], "sha256": "0" * 64,
             "source_url": "https://example.org/wrong.pdf", "final_url": "https://example.org/wrong.pdf",
@@ -799,6 +810,31 @@ class ProjectLibraryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already exists"):
             project_library.export_manifest(self.root, destination)
 
+    def test_failed_import_does_not_leave_an_incomplete_run(self):
+        from research_library.build import project_text
+        project_library.register(self.root, [{"doi": "10.0000/failure", "title": "Failed import"}])
+        project_text.ensure_editorial(self.root)
+        before = project_text.editorial_store(self.root).current().release_id
+        pdf = self.pdf("failure.pdf", "Fictional PDF used to test a failed import.")
+        with patch.object(collections.CollectionStore, "publish", side_effect=ValueError("Activation failed")):
+            with self.assertRaisesRegex(ValueError, "Activation failed"):
+                project_library.attach(self.root, "10.0000/failure", pdf, identity_confirmed=True)
+        self.assertEqual(project_text.editorial_store(self.root).current().release_id, before)
+        self.assertEqual(list((self.root / "runs").iterdir()), [])
+        self.assertTrue(list((self.root / "papers").glob("*.pdf")))
+
+    def test_failed_extraction_cleans_temporary_checkpoints(self):
+        project_library.register(self.root, [{"doi": "10.0000/failure", "title": "Failed import"}])
+        pdf = self.pdf("failure.pdf", "Fictional PDF used to test a failed import.")
+        def fail_in_workspace(workspace, *args):
+            (workspace / "checkpoint.json").write_text("temporary extraction")
+            raise ValueError("Extraction failed")
+        with patch.object(project_library.literature_update, "source_bundle", side_effect=fail_in_workspace):
+            with self.assertRaisesRegex(ValueError, "Extraction failed"):
+                project_library.attach(self.root, "10.0000/failure", pdf, identity_confirmed=True)
+        self.assertEqual(list((self.root / "runs").iterdir()), [])
+        self.assertTrue(list((self.root / "papers").glob("*.pdf")))
+
     def test_attach_search_and_retained_snapshot(self):
         project_library.register(self.root, [
             {"doi": "10.0000/one", "title": "First"},
@@ -811,6 +847,13 @@ class ProjectLibraryTests(unittest.TestCase):
         index = Path(first["text_views"])
         self.assertTrue(index.is_file())
         self.assertIn("marmalade", next(index.parent.glob("*/text.md")).read_text())
+        self.assertFalse((index.parent.parent / "evidence").exists())
+        self.assertTrue((index.parent.parent / "import.json").is_file())
+        self.assertEqual({path.name for path in index.parent.parent.iterdir()}, {"text", "import.json"})
+        draft = project_text.editorial_store(self.root).current().snapshots["core"]._bundle
+        self.assertTrue(any("marmalade" in unit["text"] for unit in draft["units"]))
+        for caveat in draft["caveats"] + [c for unit in draft["units"] for c in unit["caveats"]]:
+            self.assertNotIn("raw native text is retained in extraction checkpoints", caveat)
         store = project_library.store(self.root)
         self.assertEqual(store.call("search_evidence", {"query": "marmalade"})["result"]["items"], [])
         publish_all(self.root)
@@ -855,6 +898,10 @@ class ProjectLibraryTests(unittest.TestCase):
             project_library.attach(self.root, "10.0000/two", pdf, identity_confirmed=True)
         second_pdf = self.pdf("second.pdf", "Distinct fictional observation about oranges and screening.")
         second = project_library.attach(self.root, "10.0000/two", second_pdf, identity_confirmed=True)
+        second_views = list(Path(second["text_views"]).parent.glob("*/text.md"))
+        self.assertEqual(len(second_views), 1)
+        self.assertIn("oranges", second_views[0].read_text())
+        self.assertNotIn("marmalade", second_views[0].read_text())
         publish_all(self.root)
         self.assertNotEqual(first["snapshot"], second["snapshot"])
         self.assertEqual(len(store.load(first["snapshot"]).snapshots["core"]._bundle["sources"]), 1)
@@ -884,11 +931,15 @@ class ProjectLibraryTests(unittest.TestCase):
             document.save(scan)
         result = project_library.attach(self.root, "10.0000/scan", scan, identity_confirmed=True)
         self.assertIsNotNone(result["ocr"])
+        self.assertEqual({path.name for path in Path(result["text_views"]).parent.parent.iterdir()},
+                         {"text", "import.json"})
         self.assertEqual(project_library.status(self.root)["papers"][0]["status"], "draft")
         publish_all(self.root)
         hit = project_library.store(self.root).call("search_evidence", {"query": "tangerines"})
         self.assertEqual(len(hit["result"]["items"]), 1)
         self.assertTrue(any("not human verified" in caveat for caveat in hit["result"]["items"][0]["caveats"]))
+        self.assertFalse(any("Native extraction retained unchanged" in caveat
+                             for caveat in hit["result"]["items"][0]["caveats"]))
         self.assertIn(project_library.status(self.root)["papers"][0]["status"],
                       {"published"})
 

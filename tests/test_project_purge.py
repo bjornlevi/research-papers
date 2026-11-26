@@ -1,5 +1,6 @@
 import io
 import json
+from copy import deepcopy
 from pathlib import Path
 import re
 import tempfile
@@ -10,7 +11,7 @@ from unittest.mock import patch
 
 import pymupdf
 
-from research_library.build import project_library, project_purge
+from research_library.build import project_chunks, project_current_store, project_library, project_purge, project_state
 from research_library import collections, releases, web_server
 from project_text_helpers import publish_all
 
@@ -78,8 +79,78 @@ class ProjectPurgeTests(unittest.TestCase):
         return re.search(r'name="token" value="([^"]+)"',
             client.get("/settings", base_url="http://localhost:8080").get_data(as_text=True)).group(1)
 
+    def test_current_store_preview_preserves_shared_papers_across_discovery_roots(self):
+        folder = self.graph()
+        current = self.root.parent / "current"
+        project_current_store.initialize(project_state.current(self.root), current)
+        graph = releases.read_json((folder / "neighborhood.json").read_bytes())
+        graph2 = deepcopy(graph)
+        graph["edges"] = [edge for edge in graph["edges"] if edge["seed_doi"] == "10.0000/remove"]
+        collections.atomic_json(folder, "neighborhood.json", graph)
+        other = current / "discovery" / ("b" * 32)
+        graph2["edges"] = [edge for edge in graph2["edges"] if edge["seed_doi"] == "10.0000/keep"]
+        collections.atomic_json(other, "neighborhood.json", graph2)
+        collections.atomic_json(other, "job.json", {"status": "complete"})
+        unique = self.pdf_root / "unique.pdf"
+        shared = self.pdf_root / "shared.pdf"
+        unique.write_bytes(b"synthetic exclusive PDF")
+        shared.write_bytes(b"synthetic shared PDF")
+        collections.atomic_json(self.pdf_root, "fixture-downloads.json", [
+            {"doi": "10.0000/" + key, "sha256": releases.sha256(path.read_bytes()),
+             "status": "downloaded"} for key, path in (("unique", unique), ("shared", shared))])
+        before = project_current_store.read(current)
+        with patch.object(project_purge.collections, "atomic_json",
+                          side_effect=AssertionError("Preview wrote data")):
+            preview = project_purge.plan_current(self.root, current, "10.0000/remove", self.pdf_root)
+        self.assertEqual(preview["removed_dois"], ["10.0000/remove", "10.0000/unique"])
+        self.assertEqual(len(preview["removed_source_ids"]), 1)
+        self.assertEqual({Path(item["path"]).name for item in preview["shared_pdfs"]},
+                         {"remove.pdf", "unique.pdf"})
+        self.assertNotIn(releases.sha256(shared.read_bytes()), preview["pdf_digests"])
+        self.assertEqual(len(preview["runs"]), 2)
+        self.assertEqual(project_current_store.read(current), before)
+        self.assertFalse((folder / "purge-index.json").exists())
+        self.assertFalse((other / "purge-index.json").exists())
+        project, revision = project_current_store.project_view(current)
+        project["name"] = "Changed"
+        project_current_store.update_project(current, project=project, expected=revision)
+        self.assertNotEqual(project_purge.plan_current(
+            self.root, current, "10.0000/remove", self.pdf_root)["state_sha256"], preview["state_sha256"])
+        collections.atomic_json(other, "job.json", {"status": "changed"})
+        changed = project_purge.plan_current(self.root, current, "10.0000/remove", self.pdf_root)
+        self.assertNotEqual(changed["runs"], preview["runs"])
+
+    def test_current_store_preview_rejects_bad_inputs_without_changes(self):
+        current = self.root.parent / "current"
+        project_current_store.initialize(project_state.current(self.root), current)
+        before = project_current_store.read(current)
+        with self.assertRaisesRegex(ValueError, "existing Core paper"):
+            project_purge.plan_current(self.root, current, "10.0000/unknown", self.pdf_root)
+        alias = self.root.parent / "current-alias"
+        alias.symlink_to(current, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlinks"):
+            project_purge.plan_current(self.root, alias, "10.0000/remove", self.pdf_root)
+        link = self.pdf_root / "linked.pdf"
+        link.symlink_to(self.pdfs["remove"])
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            project_purge.plan_current(self.root, current, "10.0000/remove", self.pdf_root)
+        self.assertEqual(project_current_store.read(current), before)
+
+    def test_current_store_preview_protects_pdf_shared_with_remaining_paper(self):
+        current = self.root.parent / "current"
+        project_current_store.initialize(project_state.current(self.root), current)
+        digest = releases.sha256(self.pdfs["remove"].read_bytes())
+        collections.atomic_json(self.pdf_root, "fixture-downloads.json", [
+            {"doi": "10.0000/keep", "sha256": digest, "status": "downloaded"}])
+        preview = project_purge.plan_current(self.root, current, "10.0000/remove", self.pdf_root)
+        self.assertNotIn(digest, preview["pdf_digests"])
+        self.assertEqual(preview["shared_pdfs"], [])
+
     def test_purge_removes_exclusive_relationships_pdfs_caches_and_old_snapshots(self):
         folder = self.graph()
+        runs = list((self.root / "runs").glob("correction-publication-*"))
+        self.assertEqual(len(runs), 2)
+        self.assertTrue(all({item.name for item in run.iterdir()} == {"correction.json"} for run in runs))
         unique_pdf = self.pdf_root / "unique.pdf"
         unique_pdf.write_bytes(b"synthetic exclusive downloaded PDF")
         shared_pdf = self.pdf_root / "shared.pdf"
@@ -91,7 +162,13 @@ class ProjectPurgeTests(unittest.TestCase):
         original_units = project_library.store(self.root).current().snapshots["core"]._bundle["units"]
         retained_units = [unit for unit in original_units
                           if "keep" in unit["text"]]
-        report = project_purge.purge(self.root, "10.0000/remove", self.pdf_root)
+        messages = []
+        report = project_purge.purge(self.root, "10.0000/remove", self.pdf_root, progress=messages.append)
+        self.assertTrue(any(message.startswith("Checking editorial source inventories: ") for message in messages))
+        self.assertTrue(any(message.startswith("Validating and preserving editorial releases: ") for message in messages))
+        self.assertTrue(any(message.startswith("Validating and preserving import runs: ") for message in messages))
+        self.assertIn("Validating rebuilt project before activation", messages)
+        self.assertIn("Activating rebuilt data and deleting old copies", messages)
         self.assertEqual(report["doi"], "10.0000/remove")
         self.assertFalse(self.pdfs["remove"].exists())
         self.assertFalse(unique_pdf.exists())
@@ -101,6 +178,14 @@ class ProjectPurgeTests(unittest.TestCase):
         current = project_library.store(self.root).current()
         self.assertEqual([source["doi"] for source in current.snapshots["core"]._bundle["sources"]],
                          ["10.0000/keep"])
+        remaining_runs = list((self.root / "runs").glob("correction-publication-*"))
+        self.assertEqual(len(remaining_runs), 1)
+        event = json.loads((remaining_runs[0] / "correction.json").read_text())
+        self.assertEqual(event["source_id"], current.snapshots["core"]._bundle["sources"][0]["id"])
+        imports = list((self.root / "runs").glob("import-*"))
+        self.assertEqual(len(imports), 1)
+        self.assertEqual(json.loads((imports[0] / "import.json").read_text())["doi"], "10.0000/keep")
+        self.assertFalse((imports[0] / "evidence").exists())
         self.assertEqual(current.snapshots["core"]._bundle["units"], retained_units)
         self.assertFalse((self.root / "registry/registries" / (self.current_id + ".json")).exists())
         graph = json.loads((folder / "neighborhood.json").read_text())
@@ -229,6 +314,79 @@ class ProjectPurgeTests(unittest.TestCase):
         self.assertIn("10.0000/remove", project_library.load(self.root)["papers"])
         self.assertTrue(self.pdfs["remove"].exists())
 
+    def test_purge_preserves_figures_and_unassociated_rag_files(self):
+        sources = project_library.store(self.root).current().snapshots["core"]._bundle["sources"]
+        ids = {source["doi"]: source["id"] for source in sources}
+        keep_name = project_chunks.draft_name(ids["10.0000/keep"])
+        remove_name = project_chunks.draft_name(ids["10.0000/remove"])
+        for folder in ("chunk-drafts", "chunk-checks"):
+            for name, value in ((keep_name, {"owner": "keep"}), (remove_name, {"owner": "remove"}),
+                                ("unassociated.json", {"owner": "unknown"})):
+                collections.atomic_json(self.root / folder, name, value)
+        figures = self.root / "figures" / "manual"
+        figures.mkdir(parents=True)
+        (figures / "figure.jpg").write_bytes(b"synthetic figure")
+        (figures / "paper.md").write_text("Private notes", encoding="utf-8")
+        preview = project_purge.plan(self.root, "10.0000/remove", self.pdf_root, prepare=False)
+        project_purge.purge(self.root, "10.0000/remove", self.pdf_root,
+                            expected_plan=project_purge.fingerprint(preview))
+        for folder in ("chunk-drafts", "chunk-checks"):
+            self.assertEqual(json.loads((self.root / folder / keep_name).read_text()), {"owner": "keep"})
+            self.assertFalse((self.root / folder / remove_name).exists())
+            self.assertEqual(json.loads((self.root / folder / "unassociated.json").read_text()),
+                             {"owner": "unknown"})
+        self.assertEqual((self.root / "figures" / "manual" / "figure.jpg").read_bytes(),
+                         b"synthetic figure")
+        self.assertEqual((self.root / "figures" / "manual" / "paper.md").read_text(), "Private notes")
+
+    def test_auxiliary_changes_invalidate_preview(self):
+        folder = self.root / "figures"
+        folder.mkdir()
+        (folder / "figure.jpg").write_bytes(b"before")
+        expected = project_purge.fingerprint(project_purge.plan(
+            self.root, "10.0000/remove", self.pdf_root, prepare=False))
+        (folder / "figure.jpg").write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "changed after confirmation"):
+            project_purge.purge(self.root, "10.0000/remove", self.pdf_root, expected_plan=expected)
+        self.assertIn("10.0000/remove", project_library.load(self.root)["papers"])
+        self.assertEqual((folder / "figure.jpg").read_bytes(), b"changed")
+
+    def test_auxiliary_changes_during_rebuild_do_not_activate_stale_copy(self):
+        figures = self.root / "figures"
+        figures.mkdir()
+        figure = figures / "figure.jpg"
+        figure.write_bytes(b"before")
+        status = project_library.status
+
+        def mutate_after_validation(stage):
+            result = status(stage)
+            figure.write_bytes(b"changed")
+            return result
+
+        with patch.object(project_library, "status", side_effect=mutate_after_validation):
+            with self.assertRaisesRegex(ValueError, "changed during purge"):
+                project_purge.purge(self.root, "10.0000/remove", self.pdf_root)
+        self.assertIn("10.0000/remove", project_library.load(self.root)["papers"])
+        self.assertEqual(figure.read_bytes(), b"changed")
+        self.assertTrue(self.pdfs["remove"].exists())
+        self.assertFalse(list(self.root.parent.glob(".project-purge-*")))
+
+    def test_purge_still_rejects_unexpected_project_files(self):
+        (self.root / "unknown").mkdir()
+        with self.assertRaisesRegex(ValueError, "Unexpected project files"):
+            project_purge.plan(self.root, "10.0000/remove", self.pdf_root, prepare=False)
+
+    def test_purge_rejects_inconsistent_compact_import_identity(self):
+        run = next((self.root / "runs").glob("import-*"))
+        path = run / "import.json"
+        item = json.loads(path.read_text())
+        item["source_id"] = "literature:" + "a" * 64
+        collections.atomic_json(run, "import.json", item)
+        with self.assertRaisesRegex(ValueError, "inconsistent source metadata"):
+            project_purge.purge(self.root, "10.0000/remove", self.pdf_root)
+        self.assertIn("10.0000/remove", project_library.load(self.root)["papers"])
+        self.assertTrue(self.pdfs["remove"].exists())
+
     def test_preview_uses_cached_connections_not_graph_payloads_or_release_validation(self):
         folder = self.graph()
         preview = project_purge.plan(self.root, "10.0000/remove", self.pdf_root, prepare=False)
@@ -333,6 +491,7 @@ class ProjectPurgeTests(unittest.TestCase):
         script = client.get("/settings.js", base_url=base)
         self.assertEqual(script.status_code, 200)
         self.assertIn(b'purgeDialog.showModal()', script.data)
+        self.assertIn(b'preview.querySelector(\'[role="alert"]\')', script.data)
         self.assertEqual(client.post("/settings/add-papers", data={"doi": "10.0000/new", "title": "New"},
                                      base_url=base).status_code, 403)
         response = client.post("/settings/add-papers", data={
@@ -355,6 +514,7 @@ class ProjectPurgeTests(unittest.TestCase):
             "doi": "10.0000/remove"}, base_url=base).status_code, 403)
         self.assertEqual(preview.status_code, 200)
         self.assertIn(b"not reversible", preview.data)
+        self.assertIn(b"Figure files are preserved", preview.data)
         self.assertIn(str(self.pdfs["remove"]).encode(), preview.data)
         plan_id = re.search(r'name="plan_id" value="([^"]+)"', preview.get_data(as_text=True)).group(1)
         bad = client.post("/settings/purge-paper", data={
@@ -383,6 +543,8 @@ class ProjectPurgeTests(unittest.TestCase):
                 self.assertTrue(started.wait(timeout=5))
                 status = client.get(response.location, base_url=base)
                 self.assertIn(b"<progress", status.data)
+                self.assertEqual(client.get("/appearance.js", base_url=base).status_code, 200)
+                self.assertEqual(client.get("/help.js", base_url=base).status_code, 200)
                 self.assertEqual(client.post("/settings/add-papers", data={
                     "token": token, "doi": "10.0000/blocked", "title": "Blocked"}, base_url=base).status_code, 503)
             finally:

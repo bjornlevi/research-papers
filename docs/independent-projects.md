@@ -312,26 +312,38 @@ page. Its Markdown image link identifies the paper, page, PDF checksum, and
 embedded image object. External images are not loaded. Use Markdown source
 mode to edit drafts containing image markup.
 
-### Track Markdown versions in Git
+### Track current Markdown in Git
 
 Project PDFs, releases and extracted text remain ignored by default. To opt in,
 open **Project settings → Track Markdown in Git**, confirm that the repository
 and its remote are authorized for the paper text, and enable tracking. The
-current editorial drafts and published versions are exported under
-`project-markdown/`; new PDF attachments, saved drafts and publications add
-release-stamped Markdown files there. Structured tables are included as
-Markdown tables. Each version is retained rather than overwritten, and
-`project-markdown/index.md` links the versions. Generated files are staged
-automatically, but not committed; review and commit them through the normal Git
-workflow. Disabling tracking stops future exports but leaves existing Git files
+current editorial drafts and published versions are exported as `draft.md` and
+`published.md` per paper under `project-markdown/`. Attachments and draft saves
+replace the generated draft view; publication replaces the generated published
+view. Withdrawal marks the published view as no longer active. Structured tables
+are included as Markdown tables. The app overwrites these generated views, so
+edit clear text in the app rather than editing the views directly. Git supplies
+history when you choose to commit. Existing release-stamped exports are left
+untouched, and `project-markdown/index.md` links both current and older files.
+Tracking refuses to overwrite a current-file path without its generated marker.
+The app does not stage or commit generated files; review and manage them through
+the normal Git workflow.
+Disabling tracking stops future exports but leaves existing Git files
 intact. No PDFs or immutable release files are copied into the Git directory.
+Git exports are not automatically removed by a paper purge or reset; review
+and remove them yourself if appropriate, including any Git history.
 
 Existing evidence releases and snapshot-pinned links keep their original data.
-The editor shows a before/after correction history including reviewer, reason,
-time, source checksum, parent snapshot and new release. Saved corrections live
+The editor shows correction history including reviewer, reason, time, source
+checksum, parent snapshot and new release. New correction records store
+checksums of the before/after data instead of duplicating paper text and tables;
+older records retain their original details. Saved corrections live
 in private import runs; a purge retains surviving sources' audit records under
 `corrections/` when cumulative import runs must be deleted. Purging a source
 removes its correction history too. Factory reset removes all project history.
+New correction and publication runs retain their audit record but not an
+additional full-library evidence release or text-view copy. The active
+editorial and published releases remain separate.
 
 Saving rejects stale forms if the active snapshot changed in another tab or job.
 Invalid input is shown without discarding the form; no partial version is
@@ -470,9 +482,13 @@ the usual not-human-verified and confidence caveats. Missing OCR dependencies,
 and unreadable PDFs surface as errors. A PDF with no usable extracted text retains
 empty page anchors for manual transcription; it is not published as usable text.
 Each successful attachment validates and activates a new immutable editorial
-snapshot; old snapshots remain available. The command prints the location of
-regenerated, formatting-only `text.md` views for all attached project papers; the release
-units remain authoritative. Originals are not served.
+snapshot; old snapshots remain available. The import run retains a
+formatting-only `text.md` view of the attached paper, rather than duplicating
+all project papers and the complete evidence release. Temporary native-text
+and OCR checkpoints used during extraction are removed after the draft is
+built; the draft and retained PDF remain. The command prints the
+view's index location; the release units remain authoritative. Originals are
+not served.
 
 Once at least one PDF has been added, start the browser or MCP:
 
@@ -715,6 +731,345 @@ or extracted text.
 
 ### Manage core papers
 
+To inspect inactive editorial and published releases without changing them, run
+`.venv/bin/research-project retention-preview`. The preview identifies active
+snapshots and release IDs separately from inactive store entries and reports
+their file sizes. It does not prune data or inventory audit history, import
+runs, PDFs, or RAG settings. Git Markdown exports are not backups of these
+private project stores.
+
+For a separate private recovery copy, stop the website, MCP servers, batch
+workers and all other writers of the project and PDF directories, then run:
+
+```sh
+.venv/bin/research-project --root /path/to/project backup-project /path/to/new-backup \
+  --pdf-data-root /path/to/pdf-data --confirm-writers-stopped
+.venv/bin/research-project verify-project-backup /path/to/new-backup
+.venv/bin/research-project restore-project-backup /path/to/new-backup --destination /path/to/new-recovery
+```
+
+Add `--current-state /path/to/current-store` to the backup command when
+preserving a separate current store. The backup copies the entire specified
+directories, including snapshots, PDFs, discovery, catalogs, queues and quality
+records within them. It checks every copied file and validates active paper
+states; the restore command verifies a separate recovery copy. Both destinations
+must be new and outside the input directories. The writer-stop confirmation is
+an operator assertion, not an automatic process check. Recreate and retest a
+fresh backup after any data changes; the copy does not synchronize.
+
+These commands do not copy credentials, shared application settings, Git
+Markdown repositories or quality records located outside the specified directories.
+Back those up separately if needed. The checksum manifest detects accidental
+changes, not deliberate tampering. Keep backups private and confirm enough disk
+space for both backup and recovery before running them.
+
+For an isolated restart experiment, a verified backup that includes a current
+store can create a **new** project and current store containing selected
+preserved drafts:
+
+```sh
+.venv/bin/research-project start-from-preserved /path/to/backup \
+  --destination /path/to/new-project-set --name "New project" \
+  --authorization "Your private-use basis" --papers /path/to/core-papers.csv
+mkdir -m 700 /path/to/new-project-set/pdf-data
+make web PROJECT_ROOT=/path/to/new-project-set/project \
+  CURRENT_STATE=/path/to/new-project-set/current-state \
+  PDF_DATA_ROOT=/path/to/new-project-set/pdf-data \
+  WEB_STATE_DIR=/path/to/new-project-set/web-state WEB_PORT=8082
+```
+
+`--manifest /path/to/core-papers.json` can be used instead of `--papers`.
+Matching DOI drafts and their checksum-verified original PDFs are copied into
+the new project; missing matches remain awaiting PDF. Reused drafts are not
+published and their old RAG settings are not activated or copied. Original
+discovery results, catalog, quality records and RAG settings remain in the
+backup, not the new project. Later added or discovered papers are not yet
+automatically restored from the backup. The command does not change the active
+project or enable soft reset; stop and restart this separate website with the
+same project, current-store, website-state and port arguments. The separate
+PDF-data folder avoids mixing new PDF searches with the normal project's shared
+PDF directory.
+
+To remove inactive registry snapshots and release indexes, first make a full
+backup of the project and PDFs, then stop the website and all MCP servers and
+other readers. After reviewing the preview, run:
+
+```sh
+.venv/bin/research-project retention-prune \
+  --backup /path/outside/project/new-current-state-backup \
+  --confirm-readers-stopped
+```
+
+The retention command requires a new private backup directory, rebuilds a temporary
+project from that per-paper current-state backup and compares it with the
+active state before deleting anything. It retains the active editorial and
+published releases, current RAG settings, PDFs, import runs, correction history
+and discovery data. It removes inactive registry, evidence and catalog entries
+and clears registry rollback pointers. Old snapshot-pinned links and rollback
+to removed snapshots will no longer work. The reader confirmation is an
+operator assertion, not an automatic process check. If deletion is interrupted,
+some inactive entries may already have been removed; rerun the preview before
+retrying with a new backup destination. The current-state backup excludes
+PDFs, discovery and historical data and is not a substitute for a full backup.
+The command is manual; new snapshots still accumulate during normal operation.
+An experimental per-paper current-state store supports draft saves, explicit
+publication and withdrawal, saved RAG settings and search checks, and explicit
+RAG activation without creating full-library snapshots. To test it without
+changing the active project, create a new private directory outside the project:
+
+The per-paper store keeps the current editable clear text, published evidence
+and saved and active RAG settings in its paper records. Extracted text and
+subsequent edits share the current editable state; publication remains separate.
+If the store is kept in a Git repository, paper records may contain private
+full text and should only be tracked where that use is authorized. Git does not
+automatically commit edits; committing and server backups are separate from app
+operations.
+
+```sh
+.venv/bin/research-project --root /path/to/project prepare-current-store /path/to/new-current-store
+```
+
+Preparation copies current text and RAG settings and verifies recovery into a
+temporary project before completing. It requires an attached paper with
+editorial and published evidence initialized. It does not activate the store, copy PDFs
+or discovery data, or track later changes.
+
+It also copies existing quality inventories, reviews and reported problems
+from the normal website's default project `releases/data-quality` directory.
+Before preparing, stop the normal website and any other quality-record writers;
+if records exist, add `--confirm-quality-writers-stopped`. If the website used
+a different `--quality-root`, pass that directory to `prepare-current-store`
+with `--quality-root /path/to/quality`. The command validates the records and
+verifies the copy, refusing corrupt records or detected changes. The two
+directories do not synchronize after preparation; prepare a fresh store after
+further normal-project changes. An existing experimental store is not updated.
+
+To check whether a separate store still matches the normal project's current
+paper state, run:
+
+```sh
+.venv/bin/research-project --root /path/to/project compare-current-store /path/to/current-store
+```
+
+The report compares project settings, draft and published evidence, saved and
+live RAG state, and latest per-paper audit records. It also checks project PDF
+checksums and compares default quality records; use `--quality-root` if the
+normal website used a different location. It reports differences without
+changing the stores. For a stable comparison, stop non-cooperating writers
+first; the command locks both paper stores but cannot lock every external tool.
+This is **not** a cutover approval: discovery, metadata catalogs, shared PDFs,
+batch queues, Git Markdown, external settings, active readers and a verified
+full recovery still require separate checks.
+
+Add `--markdown-repository /path/to/git-repository` to compare current generated
+draft and published Markdown files without modifying or staging them. The
+report distinguishes matching, missing, different generated, unmanaged, and
+withdrawal-needed views. It does not check the Markdown index, older exports,
+Git staging, repository permissions or redistribution rights; inspect those
+separately. This read-only comparison does not enable tracking or authorize
+using the same destination while the normal app is active.
+
+If Git Markdown tracking is enabled in the original project, add
+`--without-git-markdown` to test without Git Markdown. This disables tracking
+**only in the copy**, and recovery preserves that disabled setting. The original
+project and its generated views are not changed.
+
+To recover the store into a **new** snapshot-backed project, use:
+
+```sh
+.venv/bin/research-project --root /path/to/new-project restore-current-store /path/to/new-current-store
+```
+
+This restores current paper state and the store's validated quality records to
+the new project's default quality directory. It does not restore PDFs, discovery
+data, metadata catalogs, batch queues or Git Markdown exports; back those up
+and recover them separately. Restore does not alter the current store.
+
+The experimental store can build a detached search view from its published
+state. RAG term review uses saved passage anchors rather than looking up old
+snapshots; a draft with missing or invalid anchors requires review instead of
+silently matching terms to new passages. An isolated experimental web editor
+can operate on that store:
+
+```sh
+.venv/bin/research-web --current-state /path/to/new-current-store \
+  --project-root /path/to/project --allow-profile private_context --port 8081
+```
+
+Open `http://127.0.0.1:8081/library`. The Library uses the same sortable,
+filterable and paginated table as the normal app, with current-store paper
+status and Core-paper selections. It edits only the separate current store;
+the project root supplies original PDFs and saved discovery data, and
+holds a separate rebuildable Library index. The editor supports clear-text
+drafts, publication and withdrawal, RAG previews, checks and explicit
+activation. Project settings can add or import Core papers into the copied
+store without attaching or publishing them. Existing attached evidence and
+retrieval remain unchanged. A paper page can find a local or explicitly licensed
+PDF, then attach it after operator confirmation as a draft without publishing it;
+the original is copied into the project PDF directory.
+Find references and Find citing papers use the copied Core-paper selections.
+New searches are saved in the current store's `discovery` directory; existing
+project searches are also visible. Back up new search results separately:
+paper-state export and recovery do not include discovery data.
+Batch PDF selection, location and operator-confirmed extraction use the current
+store and save their queue there, separate from the normal project's queue.
+Each confirmed attachment creates a draft without publishing it; previously
+published text is unchanged. Back up the queue separately if its progress and
+confirmations must be retained. An interrupted membership or Markdown update
+stops the worker and requires the recovery procedures below before retrying.
+Soft reset, factory reset and purge are not
+yet supported in current-store mode; those routes are blocked. Choose a
+free port. The normal project and the copy do not synchronize: do not edit
+both in parallel or use this test instance as the live project. Stop it and
+recover into a new project if you need to preserve its changes. Back up the
+original project independently before testing.
+
+Data quality reviews the current-store drafts, including unpublished papers.
+Inventories, comparison records and reported errors are stored separately under
+the current store's `quality` directory. Records copied during preparation retain
+their source and extraction checks, so reviews do not apply to changed text.
+Back up this directory separately: paper-state export does not include it.
+`restore-current-store` does restore it. Adding a missing page saves a draft only;
+publication remains a separate action. An old review is not applied to changed
+extraction, and stale quality forms must be reloaded.
+
+Search evidence, its paper-group filters, the source reader and the local
+read-only JSON API use the current store's published evidence. Sources available
+to AI lists only published sources and uses the selected metadata catalog
+read-only to fill missing publication years. Draft edits
+remain private until published. Reader and API snapshot IDs identify the
+current published state only: after it changes, old pinned requests return
+unavailable rather than silently switching versions.
+
+Publication metadata and Literature coverage initially read the normal project's
+existing catalog without changing it. Configure/update metadata catalog in Manage
+library builds a separate current-store catalog from completed searches in both
+directories. Provider gaps remain visible; the operation makes no network requests
+and does not publish paper text. These pages pin a combined view of current published
+evidence and the selected catalog; old links become unavailable when either changes.
+The catalog files and `metadata-current.json` are not included in paper-state export
+or recovery: back them up separately along with discovery data. Prior catalog
+files are retained for existing readers and are not automatically deleted.
+Project settings also manages the installation's
+shared OpenAlex API key; changes affect both project instances, and the key is
+never displayed.
+
+To test tracked Markdown edits, add `--experimental-markdown-repository
+/path/to/separate-git-repository --confirm-markdown-rights` to the web
+command. The destination must be the root of a different Git repository from
+the normal project. Confirm that both that repository and its remote are
+authorized for the paper text. If tracking was disabled when the store was
+prepared, enable it in Project settings and confirm rights; this backfills
+current draft and published views. The editor refreshes affected views after
+edits or attachment; it does not stage or commit. Disabling tracking retains
+existing files.
+Generated files from the normal project are never used as the destination.
+
+The paper record and its Markdown views cannot be replaced in one filesystem
+operation. If a refresh is interrupted, the editor reports that the paper may
+already have been saved and the store refuses further access until recovery.
+Stop the experimental editor and run:
+
+```sh
+.venv/bin/research-project recover-current-markdown /path/to/new-current-store \
+  --repository /path/to/separate-git-repository
+```
+
+Recovery checks the original destination and regenerates the affected paper's
+views from its current record. For an interrupted attachment it also completes
+or rolls back the paper-membership transaction before refreshing Markdown.
+For interrupted tracking enablement, recovery completes the backfill and enables
+tracking.
+It does not undo a completed attachment, save, publish or withdrawal.
+Resolve any filesystem or unmanaged-file error before retrying.
+Do not delete the transaction file to bypass recovery.
+
+Editor reads and RAG preview operations use paper revisions
+to reject stale requests; previews use a temporary index over a consistent
+published-state read and do not save or activate settings. The internal
+layout-repair operation likewise checks the paper revision and the separately
+stored original PDF checksum; it produces an unsaved draft. Its internal
+Library index can combine current-store paper status and Core-paper selections
+with saved discovery data from a separate project, using an isolated derived
+cache. It rejects a changed store or discovery data during a rebuild. Its internal
+paper-record removal is not yet connected to the app: changing Core-paper
+selections does not attach or delete evidence, and removing a paper record does not purge
+PDFs, discovery data, or project metadata. If an interrupted membership update
+prevents the store from opening, stop writers and recover it with:
+
+```sh
+.venv/bin/research-project recover-current-store /path/to/current-store
+```
+
+Recovery checks the transaction and paper bytes before completing or rolling
+back the interrupted update; it refuses inconsistent state.
+The experimental read-only stdio and
+authenticated HTTP MCP endpoints can serve a separately initialized
+current-state store using `--current-state /path/to/store --allow-profile
+private_context`; HTTP also requires its usual token registry and server
+configuration. The catalog is excluded by default. To authorize its private
+metadata for MCP, add `--allow-current-metadata` to both the MCP server and
+website commands, or set `CURRENT_METADATA=1` on `make run`, `make mcp`, and
+`make web`. Use the same setting for the website and MCP so their evidence
+snapshot IDs and reader links agree. The catalog appears as the `metadata`
+collection after it is configured; `core` remains the only default collection.
+Select `metadata` explicitly for bibliography and coverage calls. Only the
+current-store catalog is served to MCP, not the normal project's fallback
+catalog. Rebuilding the catalog changes the combined snapshot ID, so pinned
+requests must start again. As with all HTTP MCP data, authorize every bearer
+token holder to access the selected metadata before enabling it.
+The experimental editor's Connect your AI page provides a `make mcp
+CURRENT_STATE=/path/to/store` command for the same store. `make run`, `make web`
+and `make web-off` also accept `CURRENT_STATE`; it takes precedence over
+`COLLECTION_REGISTRY`. Use the same `CURRENT_STATE`, `PROJECT_ROOT`, `WEB_PORT`
+and `WEB_STATE_DIR` when stopping the website. A running website for another
+store is not replaced or stopped. To test alongside the normal website, select
+a free port and a separate `WEB_STATE_DIR`. For an authorized separate Markdown
+repository, `make web` accepts `EXPERIMENTAL_MARKDOWN_REPOSITORY=/path/to/repo
+CONFIRM_MARKDOWN_RIGHTS=1` in addition to the current-state selection.
+The experimental editor and MCP endpoints are for testing only and are **not**
+connected to normal project saves or the existing MCP endpoint. Changes to
+either project do not appear in the other. If published
+text or live RAG changes in the store, requests pinned to its previous
+snapshot fail as unavailable and must start a new search. The store and its
+contents remain private.
+
+For a private, machine-readable inventory of current state, use
+`.venv/bin/research-project export-current-state /path/to/new-state.json`.
+The export contains the current editorial and published bundles, applied
+retrieval plans, saved RAG drafts and search checks, project configuration,
+and the latest relevant audit events. It excludes PDFs, discovery data,
+catalogs and generated search indexes. It is created with private permissions
+and will not overwrite an existing file. The export can contain licensed paper
+text and private metadata: commit it only to an authorized private repository.
+To rebuild its editorial and published evidence, RAG drafts, active plans,
+search checks and saved audit events in a **new** project directory, run:
+
+```sh
+.venv/bin/research-project --root /path/to/new-project restore-current-state /path/to/new-state.json
+```
+
+For a per-paper layout instead of one large JSON file, use
+`.venv/bin/research-project export-paper-state /path/to/new-directory`.
+It creates a manifest and one current-state JSON file per source, with private
+permissions. Only the affected source file changes when its content or RAG
+settings change, apart from changes to the manifest when source membership or
+ordering changes. Restore this layout by passing the directory to
+`restore-current-state`. Both export commands require a new destination; they
+do not synchronize files automatically or stage or commit anything. Per-paper
+files contain licensed text and private metadata and require the same
+authorization safeguards as other exports.
+
+The destination must not exist. The restore validates and rebuilds the search
+indexes without automatically publishing a draft or applying a RAG draft. PDFs
+are not included: restore checksum-named PDF files from a separate backup to
+the new project's `papers/` directory. Discovery data, catalogs, figures,
+historical snapshots and older audit events are not restored. Old
+snapshot-pinned links may no longer work. Drafts with missing or invalid term
+anchors are rejected rather than silently losing their review information;
+review those drafts before restoration. This remains a manual export, not automatic Git
+tracking or a complete project backup. Do not prune project data on its basis.
+
 In **Project settings → Add core papers**, enter a DOI and title or import
 additional CSV/JSON papers using the initialization formats. Validation is
 atomic: duplicate DOIs or invalid rows reject the entire import. New core
@@ -734,7 +1089,9 @@ To permanently remove a core paper:
 4. Type the full DOI and confirm. If project data changes after the preview,
    review a fresh preview.
 5. Keep the web app running until the purge progress page reports completion.
-   Restart MCP servers afterward.
+   The page reports the current stage and, where possible, items processed
+   within that stage; counts are not an overall percentage or time estimate.
+   Large projects can take a long time. Restart MCP servers afterward.
 
 Previews use a compact, automatically maintained index of saved core-to-paper
 connections. Older searches build this index on first use; subsequent previews
@@ -758,6 +1115,12 @@ removed; unrelated evidence-only snapshots are retained. Historical links to
 removed snapshots stop working. Files outside application-managed project/PDF
 folders, external backups, and citations within the original text of retained
 papers are not erased or rewritten.
+
+Saved RAG drafts and checks associated with removed sources are deleted;
+unassociated files are preserved. Files in the project's `figures` directory
+are also preserved because their ownership is not tracked. Review these
+preserved files separately if they contain material intended for deletion.
+Changes to these folders after the preview require a fresh confirmation.
 
 The app blocks other operations during a purge. Add/import/purge actions also
 require discovery and metadata updates to finish. Symlinks and unexpected

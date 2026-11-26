@@ -86,7 +86,7 @@ class EvidenceServer(Server):
 
 
 def create_server(snapshot: releases.Snapshot | None,
-                  store: releases.ReleaseStore | collections.CollectionStore | None) -> Server:
+                  store: releases.ReleaseStore | collections.CollectionEndpoint | None) -> Server:
     server = EvidenceServer("research-library", version=__version__, instructions=(
         "Read-only published evidence, not participant data or clinical advice. Preserve citations, "
         "denominators, uncertainty and source issues. Shared cohorts are not independent replication. "
@@ -145,7 +145,7 @@ def create_server(snapshot: releases.Snapshot | None,
         except (ValidationError, ValueError, TypeError):
             return failure("invalid_input", "Arguments do not satisfy the advertised tool schema or bounds.")
         try:
-            if isinstance(store, collections.CollectionStore):
+            if isinstance(store, collections.CollectionEndpoint):
                 response = await anyio.to_thread.run_sync(
                     lambda: store.call(tool, arguments), abandon_on_cancel=True)
                 return types.CallToolResult(
@@ -214,6 +214,10 @@ def main():
     roots.add_argument("--release", type=Path, help="Pin one validated release for this process")
     roots.add_argument("--store", type=Path, help="Pin the active validated release separately per tool call")
     roots.add_argument("--registry", type=Path, help="Serve independent authorized evidence collections")
+    roots.add_argument("--current-state", type=Path,
+                       help="Experimental read-only per-paper store")
+    parser.add_argument("--allow-current-metadata", action="store_true",
+                        help="Authorize the current-store metadata catalog in addition to core evidence")
     parser.add_argument("--allow-collection", action="append")
     parser.add_argument("--default-collection", action="append")
     parser.add_argument("--allow-profile", action="append", required=True, choices=sorted(releases.PROFILES))
@@ -225,11 +229,18 @@ def main():
     try:
         if bool(args.registry) != bool(args.allow_collection) or (args.default_collection and not args.registry):
             raise ValueError("--registry requires --allow-collection; collection flags require a registry")
-        store = (collections.CollectionStore(args.registry, allowed_profiles=args.allow_profile,
-                                            allowed_collections=args.allow_collection,
-                                            defaults=args.default_collection) if args.registry else
-                 releases.ReleaseStore(args.store, allowed_profiles=set(args.allow_profile))
-                 if args.store else None)
+        if args.allow_current_metadata and not args.current_state:
+            raise ValueError("--allow-current-metadata requires --current-state")
+        if args.current_state:
+            from .build.project_current_store import CurrentCollectionStore
+            store = CurrentCollectionStore(args.current_state, allowed_profiles=args.allow_profile,
+                                           allow_metadata=args.allow_current_metadata)
+        else:
+            store = (collections.CollectionStore(args.registry, allowed_profiles=args.allow_profile,
+                                                allowed_collections=args.allow_collection,
+                                                defaults=args.default_collection) if args.registry else
+                     releases.ReleaseStore(args.store, allowed_profiles=set(args.allow_profile))
+                     if args.store else None)
         snapshot = (store.current() if store else
                     releases.validate(args.release, allowed_profiles=set(args.allow_profile)))
     except (OSError, ValueError, sqlite3.Error, ValidationError) as error:

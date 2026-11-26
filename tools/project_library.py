@@ -22,12 +22,34 @@ from . import citation_neighborhood, literature_ingest, literature_text, literat
 
 def load(root):
     document = literature_ingest.read(Path(root) / "project.json")
+    validate_project(document)
+    return document
+
+
+def validate_project(document):
     if (set(document) - {"schema_version", "name", "authorization", "papers", "git_markdown_tracking"}
             or not {"schema_version", "name", "authorization", "papers"} <= set(document)
             or document["schema_version"] != 1
             or type(document.get("git_markdown_tracking", False)) is not bool):
         raise ValueError("Invalid project configuration")
-    return document
+
+
+def validate_current_project(document):
+    if not isinstance(document, dict):
+        raise ValueError("Invalid project configuration")
+    validate_project(document)
+    if (not isinstance(document["name"], str) or not document["name"].strip()
+            or len(document["name"]) > 256 or not isinstance(document["authorization"], str)
+            or not document["authorization"].strip() or not isinstance(document["papers"], dict)):
+        raise ValueError("Invalid project configuration")
+    papers = document["papers"]
+    if papers:
+        if any(not isinstance(doi, str) or not isinstance(row, dict) or set(row) != {"title"}
+               or not isinstance(row["title"], str) for doi, row in papers.items()):
+            raise ValueError("Invalid Core papers in project configuration")
+        validated, _ = validated_papers([{"doi": doi, "title": row["title"]} for doi, row in papers.items()])
+        if validated != papers:
+            raise ValueError("Invalid Core papers in project configuration")
 
 
 def store(root):
@@ -178,15 +200,36 @@ def library_paper(root, doi, title=None):
     raise ValueError("Select a core paper or a DOI connected to the current core library in saved discovery")
 
 
-def find_pdf(root, doi, pdf_data_root, *, title=None):
+def current_library_paper(root, store, doi, title, revision):
+    from . import project_current_store, project_index
+    _, current_revision = project_current_store.project_view(store)
+    if current_revision != revision:
+        raise ValueError("Paper membership changed; reload and try again")
+    paper = project_index.paper_detail(root, "doi:" + doi, include_metadata=False, current_store=store)
+    if project_current_store.membership_revision(store) != revision:
+        raise ValueError("Paper membership changed; reload and try again")
+    if not paper["title"]:
+        raise ValueError("This paper needs a title before its PDF can be confirmed")
+    if title != paper["title"]:
+        raise ValueError("Paper title changed; reload and confirm the PDF again")
+    return paper
+
+
+def find_pdf(root, doi, pdf_data_root, *, title=None, current_store=None, membership_revision=None):
     import httpx
     root, pdf_data_root = Path(root).absolute(), Path(pdf_data_root).absolute()
     doi = citation_neighborhood.doi(doi)
-    paper = library_paper(root, doi, title)
+    def selected_paper():
+        return (current_library_paper(root, current_store, doi, title, membership_revision)
+                if current_store else library_paper(root, doi, title))
+
+    paper = selected_paper()
     if pdf_data_root.resolve() != pdf_data_root:
         raise ValueError("PDF data folder cannot contain a symlinked path")
     local, local_attempts = find_local_pdf(doi, paper["title"], pdf_data_root)
     if local is not None:
+        if current_store:
+            selected_paper()
         return local
     with closing(literature.MetadataClient(**metadata_client_options(root))) as client:
         work, source = client.get("https://api.openalex.org/works/https://doi.org/" + doi,
@@ -205,7 +248,10 @@ def find_pdf(root, doi, pdf_data_root, *, title=None):
                  metadata_source=citation_neighborhood.source_ref(source))
     entry["local_attempts"] = local_attempts
     with literature_update.writer_lock(root):
-        library_paper(root, doi, paper["title"])
+        if current_store:
+            selected_paper()
+        else:
+            library_paper(root, doi, paper["title"])
         pdf_data_root.mkdir(parents=True, exist_ok=True)
         if data is not None:
             entry["filename"] = save_named_pdf(pdf_data_root, data, entry["sha256"], record["title"])
@@ -264,21 +310,50 @@ def metadata_collections(root):
     return [entry["id"] for entry in current.document["collections"] if entry.get("kind") == "catalog"]
 
 
-def configure_metadata(root, *, progress=None):
+def current_metadata(root):
+    from research_library import catalog
+    root = Path(root).absolute()
+    with literature_update.reader_lock(root):
+        pointer = root / "metadata-current.json"
+        if not pointer.exists() and not pointer.is_symlink():
+            return None
+        entry = releases.read_json(releases.safe_file(root, pointer.name).read_bytes())
+        collections.CollectionStore.validate_document({"schema_version": 1, "collections": [entry]})
+        if entry["id"] != "metadata" or entry.get("kind") != "catalog" or entry["publications"]:
+            raise ValueError("Invalid current metadata catalog pointer")
+        if (root / "catalogs").is_symlink():
+            raise releases.ReleaseError("Symlinked current metadata catalog directory")
+        path = catalog.stored_path(root, entry["release_id"])
+        snapshot = catalog.open_snapshot(path)
+        if snapshot.release_id != entry["release_id"]:
+            raise releases.ReleaseError("Current metadata catalog checksum mismatch")
+        return entry, snapshot
+
+
+def configure_metadata(root, *, progress=None, current_store=None):
     root = Path(root)
     if progress:
         progress("Reading saved discovery searches")
     with literature_update.writer_lock(root):
-        project = load(root)
-        registry = store(root)
-        if not (root / "registry/active.json").exists():
-            raise ValueError("Attach at least one project PDF before configuring the metadata catalog")
-        current = registry.current()
-        discovery = root / "discovery"
-        if discovery.resolve() != discovery.absolute():
-            raise ValueError("Discovery directory cannot contain a symlinked path")
+        if current_store:
+            from . import project_current_store, project_index
+            project, revision = project_current_store.project_view(current_store)
+            discovery_signature = project_index._state(
+                root, current_state=project_current_store.read(current_store), current_store=current_store)
+            folders = project_index.discovery_runs(root, current_store)
+            registry = current = None
+        else:
+            project = load(root)
+            registry = store(root)
+            if not (root / "registry/active.json").exists():
+                raise ValueError("Attach at least one project PDF before configuring the metadata catalog")
+            current = registry.current()
+            discovery = root / "discovery"
+            if discovery.resolve() != discovery.absolute():
+                raise ValueError("Discovery directory cannot contain a symlinked path")
+            folders = {folder.name: folder for folder in sorted(discovery.iterdir())} if discovery.exists() else {}
         latest = {}
-        for folder in sorted(discovery.iterdir()) if discovery.exists() else []:
+        for folder in folders.values():
             if (not folder.is_dir() or folder.is_symlink() or len(folder.name) != 32
                     or any(c not in "0123456789abcdef" for c in folder.name)
                     or not (folder / "job.json").is_file()):
@@ -326,6 +401,26 @@ def configure_metadata(root, *, progress=None):
             if progress:
                 progress("Validating and installing the catalog")
             from research_library import catalog
+            if current_store:
+                with literature_update.writer_lock(current_store):
+                    if project_current_store.membership_revision(current_store) != revision:
+                        raise ValueError("Project changed while building the catalog; retry")
+                    if project_index._state(
+                            root, current_state=project_current_store.read(current_store),
+                            current_store=current_store) != discovery_signature:
+                        raise ValueError("Discovery data changed while building the catalog; retry")
+                    release_id = catalog.install(current_store, output / "catalog-001.sqlite")
+                    now = datetime.now(timezone.utc)
+                    entry = {
+                        "id": "metadata", "kind": "catalog", "title": project["name"] + " publication metadata",
+                        "version": release_id[:16], "updated_at": now.date().isoformat(),
+                        "coverage": "Saved provider-indexed references and citations; coverage may be incomplete.",
+                        "release_id": release_id, "publications": {},
+                    }
+                    if progress:
+                        progress("Activating the updated metadata catalog")
+                    collections.atomic_json(Path(current_store), "metadata-current.json", entry)
+                return {"searches": len(graphs), "catalog_id": report["catalog_id"]}
             release_id = catalog.install(root / "registry", output / "catalog-001.sqlite")
         document = deepcopy(current.document)
         document["collections"] = [entry for entry in document["collections"] if entry["id"] != "metadata"]
@@ -504,18 +599,34 @@ def set_git_markdown_tracking(root, enabled):
         return {"enabled": enabled, "files": count}
 
 
-def attach(root, doi, pdf, *, identity_confirmed, license=None, title=None, expected_sha256=None, extract=True):
+def attach(root, doi, pdf, *, identity_confirmed, license=None, title=None, expected_sha256=None, extract=True,
+           current_store=None, membership_revision=None, markdown_repository=None):
     if not identity_confirmed:
         raise ValueError("Confirm that the PDF matches the registered title and DOI")
     root = Path(root)
     doi = citation_neighborhood.doi(doi)
     with literature_update.writer_lock(root):
         from . import project_text
-        project = load(root)
-        paper = library_paper(root, doi, title)
-        registry = project_text.editorial_store(root)
-        current = registry.current() if (registry.root / "active.json").exists() else None
-        if current and any(s["doi"].lower() == doi for s in current.snapshots["core"]._bundle["sources"]):
+        if current_store:
+            from . import project_current_store
+            project, revision = project_current_store.project_view(current_store)
+            if revision != membership_revision:
+                raise ValueError("Paper membership changed; reload before attaching")
+            if project.get("git_markdown_tracking", False) and not markdown_repository:
+                raise ValueError("Git Markdown attachment requires the authorized Markdown repository")
+            if not project.get("git_markdown_tracking", False) and markdown_repository:
+                raise ValueError("Git Markdown tracking is not enabled for this current store")
+            paper = current_library_paper(root, current_store, doi, title, membership_revision)
+            state = project_current_store.read(current_store)
+            sources = state["editorial"]["bundle"]["sources"]
+            registry = current = None
+        else:
+            project = load(root)
+            paper = library_paper(root, doi, title)
+            registry = project_text.editorial_store(root)
+            current = registry.current() if (registry.root / "active.json").exists() else None
+            sources = current.snapshots["core"]._bundle["sources"] if current else []
+        if any(s["doi"].lower() == doi for s in sources):
             raise ValueError("This DOI already has an attached source; replacement requires a separate workflow")
         if Path(pdf).stat().st_size > provided_sources.MAX_BYTES:
             raise ValueError("The PDF exceeds the 64 MiB limit")
@@ -524,7 +635,7 @@ def attach(root, doi, pdf, *, identity_confirmed, license=None, title=None, expe
         digest = releases.sha256(data)
         if expected_sha256 is not None and digest != expected_sha256:
             raise ValueError("PDF changed after confirmation; inspect and confirm it again")
-        if current and any(s["sha256"] == digest for s in current.snapshots["core"]._bundle["sources"]):
+        if any(s["sha256"] == digest for s in sources):
             raise ValueError("This PDF is already associated with another paper")
         license = provided_sources.clean_license(license)
         papers = root / "papers"
@@ -564,58 +675,98 @@ def attach(root, doi, pdf, *, identity_confirmed, license=None, title=None, expe
         runs = root / "runs"
         runs.mkdir(exist_ok=True)
         run = Path(tempfile.mkdtemp(prefix="import-", dir=runs))
-        built = (literature_update.source_bundle(run / "source", papers, item["publication_id"], source, result)
-                 if extract else project_text.attached_bundle(source, result))
-        if built["bundle"] is None:
-            built = project_text.attached_bundle(source, result)
-        present = {unit["citation"]["locator"]["pdf_page"] for unit in built["bundle"]["units"]}
-        missing = project_text.attached_bundle(source, result)
-        for unit in missing["bundle"]["units"]:
-            unit["citation"]["provenance"] = built["bundle"]["sources"][0]["provenance"]
-        built["bundle"]["units"].extend(unit for unit in missing["bundle"]["units"]
-                                        if unit["citation"]["locator"]["pdf_page"] not in present)
-        project_text.ensure_editorial(root)
-        registry = project_text.editorial_store(root)
-        current = registry.current()
-        identity_note = " Operator confirmed the registered title and DOI; identity not independently verified."
-        for entry in built["bundle"]["sources"]:
-            entry["provenance"] += identity_note
-        for unit in built["bundle"]["units"]:
-            unit["citation"]["provenance"] += identity_note
-            if built["ocr"] and (built["ocr"]["unresolved_pages"] or built["ocr"]["low_confidence_pages"]):
-                unit["caveats"].append(
-                    "needs_visual_review: OCR contains unresolved or low-confidence pages; inspect the original PDF.")
-        if current:
-            parent = current.snapshots["core"]
-            bundle = deepcopy(parent._bundle)
-            grants = deepcopy(parent._manifest["authorization"])
-            for section in releases.SECTIONS:
-                bundle[section].extend(built["bundle"][section])
-            grants.update(built["grants"])
-        else:
-            bundle, grants = built["bundle"], built["grants"]
-        releases.validate_bundle(bundle)
-        write_text_views(run / "text", bundle)
-        destination = run / "evidence"
-        evidence_id = releases.export(bundle, destination, profile="private_context", authorization=grants,
-                                     chunk_plans=parent.chunk_plans if current else None)
-        installed = registry.releases.install(destination)
-        version = "core-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-        document = {"schema_version": 1, "collections": [
-            *([deepcopy(entry) for entry in current.document["collections"] if entry["id"] != "core"]
-              if current else []), {
-            "id": "core", "title": project["name"], "version": version,
-            "updated_at": now[:10], "coverage": "Privately attached project papers, including core and discovered papers; not exhaustively reviewed.",
-            "release_id": installed, "publications": {},
-        }]}
-        snapshot = registry.publish(document)
-        project_text.export_git_markdown(root, bundle, source_id=built["bundle"]["sources"][0]["id"],
-                                         kind="extracted", release_id=installed)
-        return {"doi": doi, "snapshot": snapshot, "release": evidence_id, "pages": len(result["pages"]),
-                "extraction": result["status"], "ocr": built["ocr"],
-                "text_status": "draft", "retrievable": False,
-                "text_views": str(run / "text" / "index.md"),
-                "identity": "operator-confirmed; not independently verified"}
+        activated = False
+        try:
+            if extract:
+                with tempfile.TemporaryDirectory(prefix="extraction-", dir=run) as workspace:
+                    built = literature_update.source_bundle(
+                        Path(workspace), papers, item["publication_id"], source, result)
+            else:
+                built = project_text.attached_bundle(source, result)
+            if built["bundle"] is None:
+                built = project_text.attached_bundle(source, result)
+            else:
+                caveat_updates = {
+                    literature_ingest.EXTRACTION_CHECKPOINT_CAVEAT:
+                        "Paragraph layout is machine-inferred from PDF text blocks; inspect the original PDF.",
+                    literature_ingest.OCR_CHECKPOINT_CAVEAT:
+                        "Separate local OCR; not human verified. Inspect the original PDF.",
+                }
+                for item_with_caveats in [built["bundle"], *built["bundle"]["units"], *built["bundle"]["tables"]]:
+                    item_with_caveats["caveats"] = [
+                        caveat_updates.get(caveat, caveat)
+                        for caveat in item_with_caveats["caveats"]]
+            present = {unit["citation"]["locator"]["pdf_page"] for unit in built["bundle"]["units"]}
+            missing = project_text.attached_bundle(source, result)
+            for unit in missing["bundle"]["units"]:
+                unit["citation"]["provenance"] = built["bundle"]["sources"][0]["provenance"]
+            built["bundle"]["units"].extend(unit for unit in missing["bundle"]["units"]
+                                            if unit["citation"]["locator"]["pdf_page"] not in present)
+            identity_note = " Operator confirmed the registered title and DOI; identity not independently verified."
+            for entry in built["bundle"]["sources"]:
+                entry["provenance"] += identity_note
+            for unit in built["bundle"]["units"]:
+                unit["citation"]["provenance"] += identity_note
+                if built["ocr"] and (built["ocr"]["unresolved_pages"] or built["ocr"]["low_confidence_pages"]):
+                    unit["caveats"].append(
+                        "needs_visual_review: OCR contains unresolved or low-confidence pages; inspect the original PDF.")
+            if current_store:
+                source_id = built["bundle"]["sources"][0]["id"]
+                editorial = project_current_store._paper_snapshot({
+                    "bundle": built["bundle"], "authorization": built["grants"], "chunk_plans": {},
+                }, source_id)
+                added = (project_current_store.add_paper_with_git_markdown(
+                    current_store, markdown_repository, editorial=editorial, expected=membership_revision)
+                    if markdown_repository else
+                    project_current_store.add_paper(current_store, editorial=editorial, expected=membership_revision))
+                return {"doi": doi, "source_id": source_id, "revision": added["revision"],
+                        "pages": len(result["pages"]), "extraction": result["status"], "ocr": built["ocr"],
+                        "text_status": "draft", "retrievable": False,
+                        "identity": "operator-confirmed; not independently verified"}
+            project_text.ensure_editorial(root)
+            registry = project_text.editorial_store(root)
+            current = registry.current()
+            if current:
+                parent = current.snapshots["core"]
+                bundle = deepcopy(parent._bundle)
+                grants = deepcopy(parent._manifest["authorization"])
+                for section in releases.SECTIONS:
+                    bundle[section].extend(built["bundle"][section])
+                grants.update(built["grants"])
+            else:
+                bundle, grants = built["bundle"], built["grants"]
+            releases.validate_bundle(bundle)
+            source_id = built["bundle"]["sources"][0]["id"]
+            write_text_views(run / "text", project_text.source_bundle(bundle, source_id))
+            destination = run / "evidence"
+            evidence_id = releases.export(bundle, destination, profile="private_context", authorization=grants,
+                                         chunk_plans=parent.chunk_plans if current else None)
+            installed = registry.releases.install(destination)
+            version = "core-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+            document = {"schema_version": 1, "collections": [
+                *([deepcopy(entry) for entry in current.document["collections"] if entry["id"] != "core"]
+                  if current else []), {
+                "id": "core", "title": project["name"], "version": version,
+                "updated_at": now[:10], "coverage": "Privately attached project papers, including core and discovered papers; not exhaustively reviewed.",
+                "release_id": installed, "publications": {},
+            }]}
+            collections.atomic_json(run, "import.json", {
+                "schema_version": 1, "source_id": source_id, "doi": doi,
+                "source_sha256": digest, "release": evidence_id,
+            })
+            snapshot = registry.publish(document)
+            activated = True
+            shutil.rmtree(destination)
+            project_text.export_git_markdown(root, bundle, source_id=source_id,
+                                             kind="extracted", release_id=installed)
+            return {"doi": doi, "snapshot": snapshot, "release": evidence_id, "pages": len(result["pages"]),
+                    "extraction": result["status"], "ocr": built["ocr"],
+                    "text_status": "draft", "retrievable": False,
+                    "text_views": str(run / "text" / "index.md"),
+                    "identity": "operator-confirmed; not independently verified"}
+        finally:
+            if not activated:
+                shutil.rmtree(run)
 
 
 def status(root):
@@ -678,9 +829,15 @@ def export_citations(output):
     return target
 
 
-def discover(root, output, *, directions=None):
+def discover(root, output, *, directions=None, current_store=None, membership_revision=None):
     with literature_update.writer_lock(root):
-        project = load(root)
+        if current_store:
+            from . import project_current_store
+            project, revision = project_current_store.project_view(current_store)
+            if revision != membership_revision:
+                raise ValueError("Core-paper selection changed; reload before starting discovery")
+        else:
+            project = load(root)
         rows = [{"number": str(index), "doi": doi, "title": paper["title"], "filename": ""}
                 for index, (doi, paper) in enumerate(sorted(project["papers"].items()), 1)]
     if not rows:
@@ -705,11 +862,12 @@ def discover(root, output, *, directions=None):
             output, manifest, citation_neighborhood.CachedAPI(output / "responses", client), project_scope=True,
             **({"directions": directions} if directions is not None else {}))
     from . import project_purge
-    from . import project_preservation
-    with literature_update.writer_lock(root):
-        project_preservation.restore(root, {
-            node["record"]["identifiers"]["doi"] for node in graph["nodes"].values()
-            if node["record"]["identifiers"].get("doi")})
+    if not current_store:
+        from . import project_preservation
+        with literature_update.writer_lock(root):
+            project_preservation.restore(root, {
+                node["record"]["identifiers"]["doi"] for node in graph["nodes"].values()
+                if node["record"]["identifiers"].get("doi")})
     project_purge.discovery_index(output, graph)
     csv_path = export_citations(output)
     failures = sum(any(provider["status"] not in {"complete_indexed_neighborhood", "complete_deposited_references"}
@@ -761,6 +919,71 @@ def main():
     publish.add_argument("--reason", required=True)
     publish.add_argument("--confirm-checked", action="store_true")
     commands.add_parser("status")
+    commands.add_parser("retention-preview", help="Inspect inactive project releases without deleting them")
+    retention = commands.add_parser("retention-prune",
+                                    help="Remove inactive releases after verifying a current-state backup")
+    retention.add_argument("--backup", required=True, type=Path,
+                           help="New private per-paper backup directory outside the project")
+    retention.add_argument("--confirm-readers-stopped", action="store_true",
+                           help="Confirm website and all MCP readers have been stopped")
+    full_backup = commands.add_parser("backup-project",
+                                      help="Create a verified private copy of project and PDF directories")
+    full_backup.add_argument("directory", type=Path, help="New backup directory")
+    full_backup.add_argument("--pdf-data-root", required=True, type=Path, help="Shared PDF directory to copy")
+    full_backup.add_argument("--current-state", type=Path, help="Optional separate current-state directory")
+    full_backup.add_argument("--confirm-writers-stopped", action="store_true",
+                             help="Confirm website, MCP and all project and PDF writers have stopped")
+    backup_verify = commands.add_parser("verify-project-backup", help="Verify a private project backup")
+    backup_verify.add_argument("directory", type=Path)
+    backup_restore = commands.add_parser("restore-project-backup",
+                                         help="Restore a verified backup into a new directory")
+    backup_restore.add_argument("directory", type=Path, help="Existing backup directory")
+    backup_restore.add_argument("--destination", required=True, type=Path, help="New parent directory")
+    preserved_start = commands.add_parser(
+        "start-from-preserved", help="Create a separate current-state project with drafts from a verified backup")
+    preserved_start.add_argument("backup", type=Path, help="Verified backup that includes a current-state store")
+    preserved_start.add_argument("--destination", required=True, type=Path, help="New parent directory")
+    preserved_start.add_argument("--name", required=True)
+    preserved_start.add_argument("--authorization", required=True)
+    preserved_inputs = preserved_start.add_mutually_exclusive_group(required=True)
+    preserved_inputs.add_argument("--papers", type=Path, help="Core papers CSV")
+    preserved_inputs.add_argument("--manifest", type=Path, help="Core papers JSON manifest")
+    current_export = commands.add_parser("export-current-state",
+                                         help="Export private current text and RAG state without PDFs")
+    current_export.add_argument("file", type=Path, help="New private JSON file; must not already exist")
+    paper_export = commands.add_parser("export-paper-state",
+                                       help="Export private current state as separate per-paper files")
+    paper_export.add_argument("directory", type=Path, help="New private directory; must not already exist")
+    current_restore = commands.add_parser("restore-current-state",
+                                          help="Restore current text and RAG state into a new project")
+    current_restore.add_argument("file", type=Path, help="Current-state JSON file or per-paper directory")
+    current_prepare = commands.add_parser("prepare-current-store",
+                                          help="Create and recovery-test an experimental per-paper store")
+    current_prepare.add_argument("directory", type=Path, help="New private directory outside the project")
+    current_prepare.add_argument("--without-git-markdown", action="store_true",
+                                 help="Disable Git Markdown tracking only in the separate experimental copy")
+    current_prepare.add_argument("--quality-root", type=Path,
+                                 help="Existing quality directory (default: project/releases/data-quality)")
+    current_prepare.add_argument("--confirm-quality-writers-stopped", action="store_true",
+                                 help="Confirm all writers of existing quality records are stopped")
+    current_compare = commands.add_parser(
+        "compare-current-store", help="Compare current project paper state with a separate current-state store")
+    current_compare.add_argument("directory", type=Path, help="Existing current-state store")
+    current_compare.add_argument("--quality-root", type=Path,
+                                 help="Normal-project quality directory, if not at the default path")
+    current_compare.add_argument("--markdown-repository", type=Path,
+                                 help="Compare current generated views against this existing Git repository")
+    store_restore = commands.add_parser("restore-current-store",
+                                        help="Restore an experimental per-paper store into a new project")
+    store_restore.add_argument("directory", type=Path, help="Experimental per-paper store directory")
+    store_recover = commands.add_parser("recover-current-store",
+                                        help="Recover an interrupted experimental paper membership update")
+    store_recover.add_argument("directory", type=Path, help="Experimental per-paper store directory")
+    markdown_recover = commands.add_parser("recover-current-markdown",
+                                          help="Recover an interrupted current-store Markdown refresh")
+    markdown_recover.add_argument("directory", type=Path, help="Experimental per-paper store directory")
+    markdown_recover.add_argument("--repository", required=True, type=Path,
+                                  help="Original authorized Git repository used for the refresh")
     soft = commands.add_parser("soft-reset", help="Preserve all material and return to Core papers setup")
     soft.add_argument("--confirm", action="store_true", help="Confirm restarting the active project without deletion")
     manifest = commands.add_parser("export-manifest", help="Export DOI/title metadata only")
@@ -784,6 +1007,57 @@ def main():
                             license=args.license, extract=not args.no_extract)
         elif args.command == "status":
             result = status(args.root)
+        elif args.command == "retention-preview":
+            from . import project_retention
+            result = project_retention.preview(args.root)
+        elif args.command == "retention-prune":
+            from . import project_retention
+            result = project_retention.prune(args.root, args.backup,
+                                             readers_stopped=args.confirm_readers_stopped)
+        elif args.command == "backup-project":
+            from . import project_backup
+            result = project_backup.create(args.root, args.pdf_data_root, args.directory,
+                                           current_state=args.current_state,
+                                           writers_stopped=args.confirm_writers_stopped)
+        elif args.command == "verify-project-backup":
+            from . import project_backup
+            result = project_backup.verify(args.directory)
+        elif args.command == "restore-project-backup":
+            from . import project_backup
+            result = project_backup.restore(args.directory, args.destination)
+        elif args.command == "start-from-preserved":
+            from . import project_backup
+            rows = read_csv(args.papers) if args.papers else read_manifest(args.manifest)
+            result = project_backup.start_from_preserved(
+                args.backup, args.destination, name=args.name, authorization=args.authorization, rows=rows)
+        elif args.command == "export-current-state":
+            from . import project_state
+            result = project_state.export(args.root, args.file)
+        elif args.command == "export-paper-state":
+            from . import project_state
+            result = project_state.export_papers(args.root, args.directory)
+        elif args.command == "restore-current-state":
+            from . import project_state
+            result = project_state.restore(args.file, args.root)
+        elif args.command == "prepare-current-store":
+            from . import project_current_store
+            result = project_current_store.prepare(
+                args.root, args.directory, without_git_markdown=args.without_git_markdown,
+                quality_root=args.quality_root, confirm_quality_writers_stopped=args.confirm_quality_writers_stopped)
+        elif args.command == "compare-current-store":
+            from . import project_cutover
+            result = project_cutover.compare(args.root, args.directory, quality_root=args.quality_root,
+                                             markdown_repository=args.markdown_repository)
+        elif args.command == "restore-current-store":
+            from . import project_current_store
+            result = project_current_store.restore_project(args.directory, args.root)
+        elif args.command == "recover-current-store":
+            from . import project_current_store
+            result = {"directory": str(args.directory), "recovered": project_current_store.recover_membership(
+                args.directory)}
+        elif args.command == "recover-current-markdown":
+            from . import project_current_store
+            result = project_current_store.recover_git_markdown(args.directory, args.repository)
         elif args.command == "soft-reset":
             from . import project_preservation
             if not args.confirm:

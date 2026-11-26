@@ -54,14 +54,17 @@ def document_pages(text, units):
 
 
 def paragraph_draft(root, *, snapshot_id, source_id, unit_id):
-    import pymupdf
-    from . import literature_ingest
-
     root = Path(root)
     current = project_text.editorial_store(root).current()
     if current.release_id != snapshot_id:
         raise ValueError("Evidence changed while editing; reload the editor before repairing layout")
-    bundle = current.snapshots["core"]._bundle
+    return _paragraph_draft(root, current.snapshots["core"]._bundle, source_id=source_id, unit_id=unit_id)
+
+
+def _paragraph_draft(root, bundle, *, source_id, unit_id):
+    import pymupdf
+    from . import literature_ingest
+
     source = next((item for item in bundle["sources"] if item["id"] == source_id), None)
     unit = next((item for item in bundle["units"] if item["id"] == unit_id
                  and item["citation"]["source_id"] == source_id), None)
@@ -115,10 +118,7 @@ def history(root, source_id):
     return sorted(events.values(), key=lambda event: event["at"], reverse=True)
 
 
-def correct(root, *, snapshot_id, source_id, unit_id, text, bibliography, source_url,
-            tables, reviewer, reason, checked, missing_locator=None, whole_document=False,
-            track_markdown=True):
-    root = Path(root)
+def _validate_correction(*, text, bibliography, source_url, tables, reviewer, reason, missing_locator, whole_document):
     reviewer, reason = reviewer.strip(), reason.strip()
     if not reviewer or len(reviewer) > 200 or not reason or len(reason) > 2000:
         raise ValueError("Provide a reviewer name (up to 200 characters) and correction reason (up to 2000)")
@@ -145,6 +145,127 @@ def correct(root, *, snapshot_id, source_id, unit_id, text, bibliography, source
             raise ValueError("Acquisition time must be an ISO date/time or empty") from error
     if not isinstance(tables, list) or len(tables) > 100:
         raise ValueError("Tables must be a list of at most 100 tables for this correction")
+    return bibliography, source_url, reviewer, reason
+
+
+def _apply_correction(original_bundle, *, source_id, unit_id, text, bibliography, source_url, tables,
+                      missing_locator, whole_document):
+    bundle = deepcopy(original_bundle)
+    source = next((item for item in bundle["sources"] if item["id"] == source_id), None)
+    unit = next((item for item in bundle["units"] if item["id"] == unit_id
+                 and item["citation"]["source_id"] == source_id), None)
+    adding = missing_locator is not None
+    if adding:
+        from research_library import quality
+        quality.locator_key(missing_locator)
+        if (source is None or source["format"] != "pdf" or missing_locator["kind"] != "pdf"
+                or unit_id or not text.strip()
+                or any(item["citation"]["source_id"] == source_id
+                       and item["citation"]["locator"] == missing_locator for item in bundle["units"])):
+            raise ValueError("Select a missing PDF page and provide its complete transcription")
+        unit_id = source_id + ":quality-" + quality.locator_key(missing_locator)[:16]
+        unit = {
+            "id": unit_id, "text": "", "truncated": False,
+            "citation": {"source_id": source_id, "doi": source["doi"], "source_sha256": source["sha256"],
+                         "source_url": source["url"], "provenance": source["provenance"],
+                         "availability": "metadata_only", "locator": deepcopy(missing_locator)},
+            "verification_status": "machine_extracted", "human_verification": "not_reviewed",
+            "caveats": [], "source_issue_ids": [],
+        }
+        bundle["units"].append(unit)
+    if source is None or unit is None:
+        raise ValueError("Select an extracted page belonging to this source")
+    if source["format"] != "pdf":
+        raise ValueError("This editor supports project PDF evidence only")
+    locator = unit["citation"]["locator"]
+    selected_units = document_units(bundle, source_id) if whole_document else [unit]
+    page_texts = document_pages(text, selected_units) if whole_document else {unit_id: text}
+    old_tables = {table["id"]: table for table in bundle["tables"]
+                  if table["citation"]["source_id"] == source_id
+                  and (whole_document or table["citation"]["locator"] == locator)}
+    before = {"text": (document_draft(selected_units) if whole_document else None if adding else unit["text"]),
+              "bibliography": deepcopy(source.get("bibliography")),
+              "source_url": source["url"], "tables": list(deepcopy(old_tables).values())}
+    new_tables = []
+    seen = set()
+    for value in tables:
+        if not isinstance(value, dict) or set(value) != {"id", *TABLE_FIELDS, *(("unit_id",) if whole_document else ())}:
+            raise ValueError("Each table needs id, title, headers, units, rows and footnotes"
+                             + (", plus unit_id for document corrections" if whole_document else ""))
+        table_unit = unit
+        if whole_document:
+            table_unit = next((item for item in selected_units if item["id"] == value["unit_id"]), None)
+            if table_unit is None:
+                raise ValueError("Choose a retained page unit_id for every structured table")
+        identifier = value["id"]
+        if not isinstance(identifier, str):
+            raise ValueError("Table ID must be a string; use an empty string for a new table")
+        if identifier:
+            if identifier not in old_tables or identifier in seen:
+                raise ValueError("Table ID is duplicated or belongs to a different source/page")
+            table = deepcopy(old_tables[identifier])
+            if whole_document and table["citation"]["locator"] != table_unit["citation"]["locator"]:
+                raise ValueError("Keep existing tables on their original page")
+            seen.add(identifier)
+        else:
+            identifier = table_unit["id"] + ":table:" + releases.sha256(releases.encode(value))[:16]
+            table = {key: deepcopy(table_unit[key]) for key in
+                     ("citation", "verification_status", "human_verification", "caveats")}
+            table.update(id=identifier, truncated=False, next_offset=None)
+        changed = not value["id"] or any(table[key] != value[key] for key in TABLE_FIELDS)
+        table.update({key: value[key] for key in TABLE_FIELDS})
+        if changed:
+            if CORRECTION_CAVEAT not in table["caveats"]:
+                table["caveats"].append(CORRECTION_CAVEAT)
+            table.update(verification_status="machine_extracted", human_verification="not_reviewed")
+        new_tables.append(table)
+    source.update(bibliography=bibliography, url=source_url)
+    for page_unit in selected_units:
+        page_text = page_texts[page_unit["id"]]
+        if page_text != page_unit["text"] or page_unit["truncated"]:
+            page_unit.update(text=page_text, truncated=False,
+                             verification_status="machine_extracted", human_verification="not_reviewed")
+            if CORRECTION_CAVEAT not in page_unit["caveats"]:
+                page_unit["caveats"].append(CORRECTION_CAVEAT)
+    bundle["tables"] = [table for table in bundle["tables"] if table["id"] not in old_tables] + new_tables
+    # Source URLs describe the current corrected metadata; source IDs, hashes and locators stay immutable.
+    def update_citations(value):
+        if isinstance(value, dict):
+            if "source_id" in value and value["source_id"] == source_id:
+                value["source_url"] = source_url
+            for child in value.values():
+                update_citations(child)
+        elif isinstance(value, list):
+            for child in value:
+                update_citations(child)
+    update_citations(bundle)
+    if bundle == original_bundle:
+        raise ValueError("No data changed")
+    audit_note = " Admin-edited draft; not published for retrieval."
+    if audit_note not in source["provenance"]:
+        source["provenance"] += audit_note
+    def annotate(value):
+        if isinstance(value, dict):
+            if value.get("source_id") == source_id and "provenance" in value:
+                if audit_note not in value["provenance"]:
+                    value["provenance"] += audit_note
+            for child in value.values():
+                annotate(child)
+        elif isinstance(value, list):
+            for child in value:
+                annotate(child)
+    annotate(bundle)
+    releases.validate_bundle(bundle)
+    return bundle, source, unit, unit_id, selected_units, before, new_tables
+
+
+def correct(root, *, snapshot_id, source_id, unit_id, text, bibliography, source_url,
+            tables, reviewer, reason, checked, missing_locator=None, whole_document=False,
+            track_markdown=True):
+    root = Path(root)
+    bibliography, source_url, reviewer, reason = _validate_correction(
+        text=text, bibliography=bibliography, source_url=source_url, tables=tables, reviewer=reviewer,
+        reason=reason, missing_locator=missing_locator, whole_document=whole_document)
     with literature_update.writer_lock(root):
         project_text.ensure_editorial(root)
         registry = project_text.editorial_store(root)
@@ -152,121 +273,18 @@ def correct(root, *, snapshot_id, source_id, unit_id, text, bibliography, source
         if current.release_id != snapshot_id:
             raise ValueError("Evidence changed while editing; reload the editor before saving")
         original = current.snapshots["core"]
-        bundle = deepcopy(original._bundle)
-        source = next((item for item in bundle["sources"] if item["id"] == source_id), None)
-        unit = next((item for item in bundle["units"] if item["id"] == unit_id
-                     and item["citation"]["source_id"] == source_id), None)
-        adding = missing_locator is not None
-        if adding:
-            from research_library import quality
-            quality.locator_key(missing_locator)
-            if (source is None or source["format"] != "pdf" or missing_locator["kind"] != "pdf"
-                    or unit_id or not text.strip()
-                    or any(item["citation"]["source_id"] == source_id
-                           and item["citation"]["locator"] == missing_locator for item in bundle["units"])):
-                raise ValueError("Select a missing PDF page and provide its complete transcription")
-            unit_id = source_id + ":quality-" + quality.locator_key(missing_locator)[:16]
-            unit = {
-                "id": unit_id, "text": "", "truncated": False,
-                "citation": {"source_id": source_id, "doi": source["doi"], "source_sha256": source["sha256"],
-                             "source_url": source["url"], "provenance": source["provenance"],
-                             "availability": "metadata_only", "locator": deepcopy(missing_locator)},
-                "verification_status": "machine_extracted", "human_verification": "not_reviewed",
-                "caveats": [], "source_issue_ids": [],
-            }
-            bundle["units"].append(unit)
-        if source is None or unit is None:
-            raise ValueError("Select an extracted page belonging to this source")
-        if source["format"] != "pdf":
-            raise ValueError("This editor supports project PDF evidence only")
-        locator = unit["citation"]["locator"]
-        selected_units = document_units(bundle, source_id) if whole_document else [unit]
-        page_texts = document_pages(text, selected_units) if whole_document else {unit_id: text}
-        old_tables = {table["id"]: table for table in bundle["tables"]
-                      if table["citation"]["source_id"] == source_id
-                      and (whole_document or table["citation"]["locator"] == locator)}
-        before = {"text": (document_draft(selected_units) if whole_document else None if adding else unit["text"]),
-                  "bibliography": deepcopy(source.get("bibliography")),
-                  "source_url": source["url"], "tables": list(deepcopy(old_tables).values())}
-        new_tables = []
-        seen = set()
-        for value in tables:
-            if not isinstance(value, dict) or set(value) != {"id", *TABLE_FIELDS, *(("unit_id",) if whole_document else ())}:
-                raise ValueError("Each table needs id, title, headers, units, rows and footnotes"
-                                 + (", plus unit_id for document corrections" if whole_document else ""))
-            table_unit = unit
-            if whole_document:
-                table_unit = next((item for item in selected_units if item["id"] == value["unit_id"]), None)
-                if table_unit is None:
-                    raise ValueError("Choose a retained page unit_id for every structured table")
-            identifier = value["id"]
-            if not isinstance(identifier, str):
-                raise ValueError("Table ID must be a string; use an empty string for a new table")
-            if identifier:
-                if identifier not in old_tables or identifier in seen:
-                    raise ValueError("Table ID is duplicated or belongs to a different source/page")
-                table = deepcopy(old_tables[identifier])
-                if whole_document and table["citation"]["locator"] != table_unit["citation"]["locator"]:
-                    raise ValueError("Keep existing tables on their original page")
-                seen.add(identifier)
-            else:
-                identifier = table_unit["id"] + ":table:" + releases.sha256(releases.encode(value))[:16]
-                table = {key: deepcopy(table_unit[key]) for key in
-                         ("citation", "verification_status", "human_verification", "caveats")}
-                table.update(id=identifier, truncated=False, next_offset=None)
-            changed = not value["id"] or any(table[key] != value[key] for key in TABLE_FIELDS)
-            table.update({key: value[key] for key in TABLE_FIELDS})
-            if changed:
-                if CORRECTION_CAVEAT not in table["caveats"]:
-                    table["caveats"].append(CORRECTION_CAVEAT)
-                table.update(verification_status="machine_extracted", human_verification="not_reviewed")
-            new_tables.append(table)
-        source.update(bibliography=bibliography, url=source_url)
-        for page_unit in selected_units:
-            page_text = page_texts[page_unit["id"]]
-            if page_text != page_unit["text"] or page_unit["truncated"]:
-                page_unit.update(text=page_text, truncated=False,
-                                 verification_status="machine_extracted", human_verification="not_reviewed")
-                if CORRECTION_CAVEAT not in page_unit["caveats"]:
-                    page_unit["caveats"].append(CORRECTION_CAVEAT)
-        bundle["tables"] = [table for table in bundle["tables"] if table["id"] not in old_tables] + new_tables
-        # Source URLs describe the current corrected metadata; source IDs, hashes and locators stay immutable.
-        def update_citations(value):
-            if isinstance(value, dict):
-                if "source_id" in value and value["source_id"] == source_id:
-                    value["source_url"] = source_url
-                for child in value.values():
-                    update_citations(child)
-            elif isinstance(value, list):
-                for child in value:
-                    update_citations(child)
-        update_citations(bundle)
-        if bundle == original._bundle:
-            raise ValueError("No data changed")
-        audit_note = " Admin-edited draft; original extraction retained in prior snapshots; not published for retrieval."
-        if audit_note not in source["provenance"]:
-            source["provenance"] += audit_note
-        def annotate(value):
-            if isinstance(value, dict):
-                if value.get("source_id") == source_id and "provenance" in value:
-                    if audit_note not in value["provenance"]:
-                        value["provenance"] += audit_note
-                for child in value.values():
-                    annotate(child)
-            elif isinstance(value, list):
-                for child in value:
-                    annotate(child)
-        annotate(bundle)
-        releases.validate_bundle(bundle)
+        bundle, source, unit, unit_id, selected_units, before, new_tables = _apply_correction(
+            original._bundle, source_id=source_id, unit_id=unit_id, text=text, bibliography=bibliography,
+            source_url=source_url, tables=tables, missing_locator=missing_locator, whole_document=whole_document)
         now = datetime.now(timezone.utc).isoformat()
         event = {"schema_version": 1, "at": now, "reviewer": reviewer, "reason": reason,
                  "status": "draft",
                  "source_id": source_id, "source_sha256": source["sha256"], "unit_id": unit_id,
                  "parent_snapshot": current.release_id, "parent_release": original.release_id,
-                 "before": before,
-                 "after": {"text": document_draft(selected_units) if whole_document else unit["text"],
-                           "bibliography": bibliography, "source_url": source_url,
-                           "tables": new_tables}}
+                 "before": {"sha256": releases.sha256(releases.encode(before))},
+                 "after": {"sha256": releases.sha256(releases.encode({
+                     "text": document_draft(selected_units) if whole_document else unit["text"],
+                     "bibliography": bibliography, "source_url": source_url, "tables": new_tables}))}}
         if whole_document:
             event.update(scope="document", unit_ids=[item["id"] for item in selected_units])
         runs = root / "runs"
@@ -277,7 +295,7 @@ def correct(root, *, snapshot_id, source_id, unit_id, text, bibliography, source
             release_id = releases.export(bundle, run / "evidence", profile="private_context",
                                          authorization=original._manifest["authorization"])
             registry.releases.install(run / "evidence")
-            project_library.write_text_views(run / "text", bundle)
+            shutil.rmtree(run / "evidence")
             event["release"] = release_id
             collections.atomic_json(run, "correction.json", event)
             document = deepcopy(current.document)

@@ -16,7 +16,7 @@ classifiers = [
 
 [project.optional-dependencies]
 build = ["PyMuPDF==1.26.7"]
-dev = ["build>=1.2,<2", "pip>=23"]
+dev = ["build>=1.2,<2", "pip>=23", "httpx2>=2,<3; python_version >= '3.11'"]
 
 [project.scripts]
 research-mcp-check = "research_library.connection_check:main"

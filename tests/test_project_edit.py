@@ -189,8 +189,9 @@ class ProjectEditTests(unittest.TestCase):
         self.assertTrue(updated.call("search_evidence", {"query": "Missingpageword"})["result"]["items"])
         self.assertEqual(registry.load(current.release_id).snapshots["core"]._bundle, bundle)
         event = project_edit.history(self.root, self.source["id"])[0]
-        self.assertIsNone(event["before"]["text"])
-        self.assertEqual(event["after"]["text"], form["text"])
+        self.assertEqual(set(event["before"]), {"sha256"})
+        self.assertEqual(set(event["after"]), {"sha256"})
+        self.assertNotEqual(event["before"]["sha256"], event["after"]["sha256"])
         self.assertEqual(event["reviewer"], "Page tester")
         self.assertEqual(client.post(url, data=form | {"checked": "yes"}, base_url=base).status_code, 400)
 
@@ -222,13 +223,31 @@ class ProjectEditTests(unittest.TestCase):
         self.assertEqual(table["citation"]["locator"], self.unit["citation"]["locator"])
         events = project_edit.history(self.root, self.source["id"])
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["before"]["text"], self.unit["text"])
-        self.assertEqual(events[0]["after"]["text"], self.args["text"])
+        self.assertEqual(set(events[0]["before"]), {"sha256"})
+        self.assertEqual(set(events[0]["after"]), {"sha256"})
+        self.assertNotEqual(events[0]["before"]["sha256"], events[0]["after"]["sha256"])
         self.assertEqual(events[0]["reviewer"], "Synthetic reviewer")
         self.assertEqual(events[0]["release"], result["release"])
         indexed = project_index.library_page(self.root, "Corrected title")
         self.assertEqual(indexed["matching"], 1)
         self.assertEqual(project_library.load(self.root)["papers"]["10.0000/example"]["title"], "Original title")
+
+    def test_large_draft_keeps_text_out_of_correction_audit(self):
+        long_text = "Synthetic content " * 12000
+        result = project_edit.correct(self.root, **(self.args | {"text": long_text}))
+        audit_path = Path(result["audit"])
+        audit = json.loads(audit_path.read_text())
+        self.assertLess(audit_path.stat().st_size, 4096)
+        self.assertNotIn("Synthetic content", audit_path.read_text())
+        current = project_text.editorial_store(self.root).current()
+        unit = next(item for item in current.snapshots["core"]._bundle["units"]
+                    if item["id"] == self.unit["id"])
+        self.assertEqual(unit["text"], long_text)
+        self.assertEqual(audit["after"]["sha256"], releases.sha256(releases.encode({
+            "text": long_text,
+            "bibliography": {key: value.strip() or None for key, value in self.args["bibliography"].items()},
+            "source_url": self.args["source_url"], "tables": current.snapshots["core"]._bundle["tables"],
+        })))
 
     def test_invalid_stale_unconfirmed_and_failed_publication_preserve_active_evidence(self):
         cases = [
@@ -321,7 +340,7 @@ class ProjectEditTests(unittest.TestCase):
         self.assertIn("Source and extraction", technical)
         self.assertIn("<th>Measure</th>", html)
         self.assertIn("participants", html)
-        self.assertIn("Operator transcription", technical)
+        self.assertIn("Operator transcription", html)
         self.assertIn("Extraction warnings and provenance", technical)
         edit_link = unescape(re.search(r'<a class="button" href="([^"]+)">Edit</a>', html).group(1))
         edit_html = client.get(edit_link, base_url=base).get_data(as_text=True)
@@ -385,10 +404,17 @@ class ProjectEditTests(unittest.TestCase):
         self.assertEqual(table["citation"]["locator"], units[-1]["citation"]["locator"])
         history = project_edit.history(self.root, self.source["id"])
         self.assertEqual(len(history), 1)
+        runs = list((self.root / "runs").glob("correction-*"))
+        self.assertEqual(len(runs), 1)
+        self.assertEqual({path.name for path in runs[0].iterdir()}, {"correction.json"})
         self.assertEqual(history[0]["scope"], "document")
         self.assertEqual(history[0]["unit_ids"], [unit["id"] for unit in units])
-        self.assertEqual(history[0]["before"]["text"], draft)
-        self.assertEqual(history[0]["after"]["text"], edited)
+        self.assertEqual(set(history[0]["before"]), {"sha256"})
+        self.assertEqual(set(history[0]["after"]), {"sha256"})
+        self.assertNotEqual(history[0]["before"]["sha256"], history[0]["after"]["sha256"])
+        audit_text = (runs[0] / "correction.json").read_text()
+        self.assertNotIn(draft, audit_text)
+        self.assertNotIn(edited, audit_text)
         self.assertEqual(project_text.editorial_store(self.root).load(self.current.release_id).snapshots["core"]._bundle,
                          self.original._bundle)
         self.assertTrue(current.call("search_evidence", {"query": "Updatedsecond"})["result"]["items"])

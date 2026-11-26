@@ -18,10 +18,11 @@ class WebLifecycleTests(unittest.TestCase):
                 port = listener.getsockname()[1]
             args = Namespace(
                 state_dir=root / "state", project_root=root / "project",
-                registry=root / "project/registry", pdf_data_root=root / "pdfs",
+                registry=root / "project/registry", current_state=None, pdf_data_root=root / "pdfs",
                 port=port, mcp_url="http://127.0.0.1:8000/mcp",
                 allow_profile=["synthetic"], allow_collection=["core"],
-                default_collection=["core"])
+                default_collection=["core"], experimental_markdown_repository=None,
+                confirm_markdown_rights=False, allow_current_metadata=False)
             children = []
             spawn = web_lifecycle.subprocess.Popen
 

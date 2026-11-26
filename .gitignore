@@ -28,3 +28,12 @@ __pycache__/
 # Machine-local make settings (e.g. LAN_HOST).
 /local.mk
 /node_modules/
+
+# Only current per-paper state belongs in Git; runtime data remains local.
+/.paper-state.writer.lock
+/paper-state/*
+!/paper-state/manifest.json
+!/paper-state/papers/
+/paper-state/papers/*
+!/paper-state/papers/*.json
+/paper-state/papers/.*

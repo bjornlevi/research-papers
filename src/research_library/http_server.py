@@ -193,27 +193,34 @@ class Boundary:
             self.active -= 1
 
 
-def create_app(*, release=None, store=None, collection_registry=None, allowed_collections=None,
+def create_app(*, release=None, store=None, collection_registry=None, current_state=None, allowed_collections=None,
                default_collections=None, profiles, registry, base_url,
                max_body=65536, max_inflight=8, timeout=30.0, rate=600, max_sessions=32,
-               session_idle_timeout=300, extra_origins=(), link_tokens=False):
+               session_idle_timeout=300, extra_origins=(), link_tokens=False, allow_current_metadata=False):
     resource_url(base_url)
     for value in extra_origins:
         parts = urlsplit(value)
         if parts.scheme != "https" or not parts.hostname or value != f"https://{parts.netloc}":
             raise ValueError("Extra origins must be bare https origins")
-    if sum(bool(root) for root in (release, store, collection_registry)) != 1 or not profiles:
+    if sum(bool(root) for root in (release, store, collection_registry, current_state)) != 1 or not profiles:
         raise ValueError("Select one release or store and explicit allowed profiles")
     if not (1 <= max_body <= 1048576 and 1 <= max_inflight <= 64 and 0 < timeout <= 120
             and 1 <= rate <= 10000 and 1 <= max_sessions <= 1000 and session_idle_timeout > 0):
         raise ValueError("HTTP limits outside supported bounds")
     if bool(collection_registry) != bool(allowed_collections) or (default_collections and not collection_registry):
         raise ValueError("Collection registry requires explicit allowed collections")
+    if allow_current_metadata and not current_state:
+        raise ValueError("Current metadata authorization requires a current-state store")
     from .collections import CollectionStore
-    selected_store = (CollectionStore(collection_registry, allowed_profiles=profiles,
-                                      allowed_collections=allowed_collections, defaults=default_collections)
-                      if collection_registry else
-                      releases.ReleaseStore(store, allowed_profiles=set(profiles)) if store else None)
+    if current_state:
+        from .build.project_current_store import CurrentCollectionStore
+        selected_store = CurrentCollectionStore(current_state, allowed_profiles=profiles,
+                                                allow_metadata=allow_current_metadata)
+    else:
+        selected_store = (CollectionStore(collection_registry, allowed_profiles=profiles,
+                                          allowed_collections=allowed_collections, defaults=default_collections)
+                          if collection_registry else
+                          releases.ReleaseStore(store, allowed_profiles=set(profiles)) if store else None)
     snapshot = (selected_store.current() if selected_store else
                 releases.validate(release, allowed_profiles=set(profiles)))
     verifier = FileTokenVerifier(registry, base_url)
@@ -284,6 +291,10 @@ def main():
     roots.add_argument("--release", type=Path)
     roots.add_argument("--store", type=Path)
     roots.add_argument("--registry", type=Path, help="Collection registry, separate from token registry")
+    roots.add_argument("--current-state", type=Path,
+                       help="Experimental read-only per-paper store")
+    parser.add_argument("--allow-current-metadata", action="store_true",
+                        help="Authorize the current-store metadata catalog in addition to core evidence")
     parser.add_argument("--allow-collection", action="append")
     parser.add_argument("--default-collection", action="append")
     parser.add_argument("--allow-profile", required=True, action="append", choices=sorted(releases.PROFILES))
@@ -341,7 +352,8 @@ def main():
     logger.propagate = False
     try:
         app = create_app(
-            release=args.release, store=args.store, collection_registry=args.registry,
+            release=args.release, store=args.store, collection_registry=args.registry, current_state=args.current_state,
+            allow_current_metadata=args.allow_current_metadata,
             allowed_collections=args.allow_collection, default_collections=args.default_collection,
             profiles=set(args.allow_profile),
             registry=args.token_registry, base_url=args.base_url, max_body=args.max_body,

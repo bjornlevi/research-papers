@@ -6,7 +6,7 @@ import re
 import tempfile
 
 from research_library import chunks, collections, passage_context, releases, retrieval
-from . import literature_update, project_edit, project_library, project_text
+from . import literature_update, project_library, project_text
 
 CHECK_LIMIT = 40
 CHECK_DEPTH = 5
@@ -115,39 +115,52 @@ def passage_anchors(blocks, ranges):
     return anchors
 
 
-def term_review(root, source_id, draft, identity):
-    if not draft:
-        return []
-    pending = list(draft.get("unassigned_terms", []))
-    if draft["content_identity"] == identity:
-        return pending
-    plan = next((p for p in draft["plans"].values() if isinstance(p, dict) and p.get("labels")), None)
-    if plan is None:
-        return pending
-    anchors = draft.get("term_anchors")
-    if anchors is None:
-        # Older drafts did not store anchors. Resolve their content version, not their old numbers.
-        event = next((event for event in project_edit.history(root, source_id)
-                      if (event.get("before") or {}).get("content_identity") == draft["content_identity"]
-                      and event.get("scope") in {"publication", "unpublication"}
-                      and event.get("parent_snapshot")), None)
-        anchors = {}
-        if event:
-            registry = project_library.store(root)
-            try:
-                old = registry.load(event["parent_snapshot"]).snapshots["core"]
-            except collections.SnapshotUnavailable:
-                pass
-            else:
-                source = old._lookup("sources", source_id)
-                blocks = passage_context.document_blocks(old.document_units(source_id),
-                                                         title=source["bibliography"]["title"])
-                anchors = passage_anchors(blocks, plan["ranges"])
+def _pending_terms(pending, plan, anchors):
+    pending = list(pending)
     for first, terms in plan["labels"].items():
         entry = {"terms": terms, **anchors.get(first, {})}
         if entry not in pending:
             pending.append(entry)
     return pending
+
+
+def review_current_terms(draft, identity):
+    if not draft:
+        return []
+    pending = list(draft.get("unassigned_terms", []))
+    plans = [plan for plan in draft["plans"].values() if isinstance(plan, dict) and plan.get("labels")]
+    if not plans:
+        return pending
+    anchors = draft.get("term_anchors")
+    if not isinstance(anchors, dict):
+        raise ValueError("Saved RAG terms have missing or invalid passage anchors; review the draft")
+    for plan in plans:
+        if not isinstance(plan["labels"], dict):
+            raise ValueError("Saved RAG terms have missing or invalid passage anchors; review the draft")
+        for key in plan["labels"]:
+            anchor = anchors.get(key)
+            if (not isinstance(anchor, dict) or set(anchor) != {"digest", "excerpt", "page"}
+                    or not isinstance(anchor["excerpt"], str)
+                    or type(anchor["page"]) is not int or anchor["page"] < 1):
+                raise ValueError("Saved RAG terms have missing or invalid passage anchors; review the draft")
+            collections.digest(anchor["digest"])
+    if draft["content_identity"] == identity:
+        return pending
+    for plan in plans:
+        pending = _pending_terms(pending, plan, anchors)
+    return pending
+
+
+def build_draft(bundle, source_id, units, plans, pending):
+    identity = project_text.content_identity(bundle, source_id)
+    plan = plans.get(units[0]["id"], {})
+    labels = plan.get("labels", {})
+    source = next(item for item in bundle["sources"] if item["id"] == source_id)
+    blocks = passage_context.document_blocks(units, title=source["bibliography"]["title"])
+    anchors = passage_anchors(blocks, [pair for pair in plan.get("ranges", []) if str(pair[0]) in labels])
+    assigned = set(labels.values())
+    return {"content_identity": identity, "plans": plans, "term_anchors": anchors,
+            "unassigned_terms": [entry for entry in pending if entry["terms"] not in assigned]}
 
 
 def suggest_terms(blocks, ranges, pending):
@@ -228,6 +241,30 @@ def run_checks(live, source, units, plans, checks):
     return results
 
 
+def edited_checks(units, checks, form, *, remove=False):
+    if remove:
+        check_id = form.get("check_id", "")
+        if not any(check["id"] == check_id for check in checks):
+            raise ValueError("That search check no longer exists")
+        return [check for check in checks if check["id"] != check_id]
+    query = form.get("query", "").strip()
+    retrieval.search_expression(query, "plain")
+    excerpt = normalized(form.get("expected_excerpt", ""))
+    page_number = form.get("expected_page", "").strip()
+    if not re.fullmatch(r"[1-9][0-9]{0,6}", page_number) or not 8 <= len(excerpt) <= 500:
+        raise ValueError("Enter a PDF page and an excerpt of 8 to 500 characters")
+    page_number = int(page_number)
+    if not expected_present(units, page_number, excerpt):
+        raise ValueError("The expected excerpt must appear on the selected published PDF page")
+    check = {"query": query, "page": page_number, "excerpt": excerpt}
+    check["id"] = releases.sha256(releases.encode(check))
+    if any(item["id"] == check["id"] for item in checks):
+        raise ValueError("This search check is already saved")
+    if len(checks) >= CHECK_LIMIT:
+        raise ValueError(f"Save up to {CHECK_LIMIT} checks per paper")
+    return [*checks, check]
+
+
 def update_check(root, *, source_id, snapshot_id, form, remove=False):
     root = Path(root)
     with literature_update.writer_lock(root):
@@ -237,28 +274,7 @@ def update_check(root, *, source_id, snapshot_id, form, remove=False):
         snapshot = current.snapshots["core"]
         units = snapshot.document_units(source_id)
         checks = load_checks(root, source_id)
-        if remove:
-            check_id = form.get("check_id", "")
-            if not any(check["id"] == check_id for check in checks):
-                raise ValueError("That search check no longer exists")
-            checks = [check for check in checks if check["id"] != check_id]
-        else:
-            query = form.get("query", "").strip()
-            retrieval.search_expression(query, "plain")
-            excerpt = normalized(form.get("expected_excerpt", ""))
-            page_number = form.get("expected_page", "").strip()
-            if not re.fullmatch(r"[1-9][0-9]{0,6}", page_number) or not 8 <= len(excerpt) <= 500:
-                raise ValueError("Enter a PDF page and an excerpt of 8 to 500 characters")
-            page_number = int(page_number)
-            if not expected_present(units, page_number, excerpt):
-                raise ValueError("The expected excerpt must appear on the selected published PDF page")
-            check = {"query": query, "page": page_number, "excerpt": excerpt}
-            check["id"] = releases.sha256(releases.encode(check))
-            if any(item["id"] == check["id"] for item in checks):
-                raise ValueError("This search check is already saved")
-            if len(checks) >= CHECK_LIMIT:
-                raise ValueError(f"Save up to {CHECK_LIMIT} checks per paper")
-            checks = [*checks, check]
+        checks = edited_checks(units, checks, form, remove=remove)
         collections.atomic_json(root / "chunk-checks", draft_name(source_id), checks)
 
 
@@ -278,19 +294,9 @@ def update(root, *, source_id, snapshot_id, form, activate):
         releases.chunk_records(snapshot._bundle, all_plans)
         identity = project_text.content_identity(snapshot._bundle, source_id)
         draft = load_draft(root, source_id)
-        pending = term_review(root, source_id, draft, identity)
-        plan = plans.get(units[0]["id"], {})
-        labels = plan.get("labels", {})
-        source = snapshot._lookup("sources", source_id)
-        blocks = passage_context.document_blocks(units, title=source["bibliography"]["title"])
-        anchors = passage_anchors(blocks, [pair for pair in plan.get("ranges", []) if str(pair[0]) in labels])
-        assigned = set(labels.values())
-        collections.atomic_json(root / "chunk-drafts", draft_name(source_id), {
-            "content_identity": identity,
-            "plans": plans,
-            "term_anchors": anchors,
-            "unassigned_terms": [entry for entry in pending if entry["terms"] not in assigned],
-        })
+        pending = review_current_terms(draft, identity)
+        collections.atomic_json(root / "chunk-drafts", draft_name(source_id),
+                                build_draft(snapshot._bundle, source_id, units, plans, pending))
         if activate and all_plans != snapshot.chunk_plans:
             with tempfile.TemporaryDirectory() as temporary:
                 output = Path(temporary) / "release"

@@ -69,6 +69,24 @@ def writer_lock(root):
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
+@contextmanager
+def reader_lock(root):
+    root = Path(root).resolve()
+    if root in getattr(_LOCKS, "held", set()):
+        yield
+        return
+    root.parent.mkdir(parents=True, exist_ok=True)
+    with (root.parent / ("." + root.name + ".writer.lock")).open("a") as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError("An update writer holds: " + str(root)) from error
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+
+
 def single_writer(function):
     @wraps(function)
     def call(root, *args, **kwargs):

@@ -17,7 +17,8 @@ from . import releases
 MODULE = "research_library.web_server"
 
 
-def managed_process(pid, *, port, registry):
+def managed_process(pid, *, port, registry=None, current_state=None, project_root=None,
+                    markdown_repository=None, confirm_markdown_rights=None, allow_current_metadata=None):
     try:
         command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
     except (FileNotFoundError, PermissionError, ProcessLookupError):
@@ -26,8 +27,27 @@ def managed_process(pid, *, port, registry):
     def option(name):
         return (arguments[arguments.index(name) + 1]
                 if name in arguments and arguments.index(name) + 1 < len(arguments) else None)
-    return (option("-m") == MODULE and option("--port") == str(port)
-            and option("--registry") is not None and Path(option("--registry")).absolute() == registry)
+    if (registry is None) == (current_state is None):
+        raise ValueError("Select exactly one registry or current-state store")
+    name = "--current-state" if current_state is not None else "--registry"
+    other = "--registry" if current_state is not None else "--current-state"
+    selected = current_state if current_state is not None else registry
+    if not (option("-m") == MODULE and option("--port") == str(port)
+            and option(other) is None and option(name) is not None
+            and Path(option(name)).absolute() == selected):
+        return False
+    if project_root is not None and (option("--project-root") is None
+                                     or Path(option("--project-root")).absolute() != project_root):
+        return False
+    if confirm_markdown_rights is not None:
+        configured = option("--experimental-markdown-repository")
+        if ((Path(configured).absolute() if configured else None) != markdown_repository
+                or ("--confirm-markdown-rights" in arguments) != confirm_markdown_rights):
+            return False
+    if allow_current_metadata is not None and (
+            ("--allow-current-metadata" in arguments) != allow_current_metadata):
+        return False
+    return True
 
 
 def process_running(pid):
@@ -89,12 +109,20 @@ def start(args):
     reject_symlink(log_file)
     lock_file = state_dir / "web.lock"
     reject_symlink(lock_file)
-    registry = args.registry.absolute()
+    registry = args.registry.absolute() if args.registry else None
+    current_state = args.current_state.absolute() if args.current_state else None
+    start_config = {
+        "port": args.port, "registry": registry, "current_state": current_state,
+        "project_root": args.project_root.absolute(),
+        "markdown_repository": (args.experimental_markdown_repository.absolute()
+                                if args.experimental_markdown_repository else None),
+        "confirm_markdown_rights": args.confirm_markdown_rights,
+        "allow_current_metadata": args.allow_current_metadata,
+    }
     with lock_file.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         old_pid = read_pid(pid_file)
-        if old_pid is not None and process_running(old_pid) and managed_process(
-                old_pid, port=args.port, registry=registry):
+        if old_pid is not None and process_running(old_pid) and managed_process(old_pid, **start_config):
             print(f"Web app is already running at http://127.0.0.1:{args.port} (PID {old_pid}).")
             return 0
         if old_pid is not None:
@@ -103,7 +131,8 @@ def start(args):
             pid_file.unlink(missing_ok=True)
 
         child_args = [
-            sys.executable, "-m", MODULE, "--registry", str(registry),
+            sys.executable, "-m", MODULE,
+            "--current-state" if current_state else "--registry", str(current_state or registry),
             "--project-root", str(args.project_root.absolute()),
             "--pdf-data-root", str(args.pdf_data_root.absolute()),
             "--port", str(args.port), "--mcp-url", args.mcp_url,
@@ -114,6 +143,13 @@ def start(args):
             child_args.extend(("--allow-collection", collection))
         for collection in args.default_collection:
             child_args.extend(("--default-collection", collection))
+        if args.experimental_markdown_repository:
+            child_args.extend(("--experimental-markdown-repository",
+                               str(args.experimental_markdown_repository.absolute())))
+        if args.confirm_markdown_rights:
+            child_args.append("--confirm-markdown-rights")
+        if args.allow_current_metadata:
+            child_args.append("--allow-current-metadata")
         with log_file.open("ab") as log:
             os.chmod(log_file, 0o600)
             process = subprocess.Popen(
@@ -125,7 +161,7 @@ def start(args):
             if process.poll() is not None:
                 pid_file.unlink(missing_ok=True)
                 raise RuntimeError(f"Website exited during startup. Log output:\n{tail(log_file)}")
-            if managed_process(process.pid, port=args.port, registry=registry):
+            if managed_process(process.pid, **start_config):
                 try:
                     with urlopen(url, timeout=0.25) as response:
                         if response.status == 200:
@@ -135,7 +171,7 @@ def start(args):
                 except (OSError, URLError):
                     pass
             time.sleep(0.2)
-        if process.poll() is None and managed_process(process.pid, port=args.port, registry=registry):
+        if process.poll() is None and managed_process(process.pid, **start_config):
             process.terminate()
             try:
                 process.wait(timeout=5)
@@ -153,7 +189,8 @@ def stop(args):
     if not pid_file.is_file():
         print("Web app is not running.")
         return 0
-    registry = args.registry.absolute()
+    registry = args.registry.absolute() if args.registry else None
+    current_state = args.current_state.absolute() if args.current_state else None
     lock_file = state_dir / "web.lock"
     reject_symlink(lock_file)
     with lock_file.open("a") as lock:
@@ -166,7 +203,7 @@ def stop(args):
             pid_file.unlink(missing_ok=True)
             print("Web app was already stopped.")
             return 0
-        if not managed_process(pid, port=args.port, registry=registry):
+        if not managed_process(pid, port=args.port, registry=registry, current_state=current_state):
             raise ValueError(f"PID {pid} is not the configured website; refusing to stop it")
         os.kill(pid, signal.SIGTERM)
         deadline = time.monotonic() + 10
@@ -184,7 +221,9 @@ def main():
     commands = parser.add_subparsers(dest="action", required=True)
     for action in ("start", "stop"):
         command = commands.add_parser(action)
-        command.add_argument("--registry", type=Path, required=True)
+        roots = command.add_mutually_exclusive_group(required=True)
+        roots.add_argument("--registry", type=Path)
+        roots.add_argument("--current-state", type=Path)
         command.add_argument("--project-root", type=Path, required=True)
         command.add_argument("--pdf-data-root", type=Path, default=Path("releases/pdf-data"))
         command.add_argument("--state-dir", type=Path, default=Path("releases"))
@@ -194,6 +233,9 @@ def main():
                              choices=sorted(releases.PROFILES))
         command.add_argument("--allow-collection", action="append", required=True)
         command.add_argument("--default-collection", action="append", required=True)
+        command.add_argument("--experimental-markdown-repository", type=Path)
+        command.add_argument("--confirm-markdown-rights", action="store_true")
+        command.add_argument("--allow-current-metadata", action="store_true")
     args = parser.parse_args()
     try:
         return start(args) if args.action == "start" else stop(args)

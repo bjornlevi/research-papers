@@ -197,15 +197,17 @@ def record_worker_error(root, error, phase, doi):
                    phase=phase, worker_exception_type=fields["exception_type"])
 
 
-def run(root, pdf_root, job, pause, *, on_error=None, worker_id=None):
+def run(root, pdf_root, job, pause, *, on_error=None, worker_id=None,
+        current_store=None, markdown_repository=None):
     """Finish the current paper before pausing; persist every item independently."""
+    queue_root = Path(current_store) if current_store else root
     phase, doi, finished = "starting", None, False
 
     def checkpoint(stage, paper=None):
         nonlocal phase
         phase = "saving_checkpoint"
         job["activity"] = activity(stage, worker_id=worker_id, doi=paper)
-        save(root, job)
+        save(queue_root, job)
         phase = stage
 
     try:
@@ -213,7 +215,11 @@ def run(root, pdf_root, job, pause, *, on_error=None, worker_id=None):
         pdf_root = Path(pdf_root)
         pace = citation_neighborhood.RequestPacer()
         # A previous process may have activated an extraction before saving its job status.
-        status = project_library.status(root)
+        if current_store:
+            from . import project_current_store, project_index
+            status = project_index._current_status(project_current_store.read(current_store))
+        else:
+            status = project_library.status(root)
         extracted = {paper["doi"] for paper in [*status["papers"], *status["discovered"]]
                      if paper["status"] != "awaiting_pdf"}
         for doi in job["tasks"][job.get("processed", 0):]:
@@ -234,9 +240,12 @@ def run(root, pdf_root, job, pause, *, on_error=None, worker_id=None):
             item.pop("error", None)
             checkpoint(item["status"], doi)
             try:
+                options = ({"current_store": current_store,
+                            "membership_revision": project_current_store.membership_revision(current_store)}
+                           if current_store else {})
                 if job["operation"] == "locate":
                     pace()
-                    result = project_library.find_pdf(root, doi, pdf_root, title=item["title"])
+                    result = project_library.find_pdf(root, doi, pdf_root, title=item["title"], **options)
                     item["result"] = result
                     if result["status"] in {"downloaded", "local_found"}:
                         item.update(status=result["status"], filename=result["filename"])
@@ -244,11 +253,17 @@ def run(root, pdf_root, job, pause, *, on_error=None, worker_id=None):
                         item.update(status="not_found", error=result["status"])
                 else:
                     path = releases.safe_file(pdf_root, item["filename"])
+                    if current_store and project_current_store.project_view(current_store)[0].get(
+                            "git_markdown_tracking", False):
+                        options["markdown_repository"] = markdown_repository
                     result = project_library.attach(root, doi, path, title=item["title"],
-                        identity_confirmed=True, expected_sha256=item["confirmed_sha256"])
+                        identity_confirmed=True, expected_sha256=item["confirmed_sha256"], **options)
                     item.update(status="extracted", extraction=result, selected=False)
             except (OSError, ValueError, KeyError, TypeError, sqlite3.Error,
                     httpx.HTTPError, literature.DiscoveryError, releases.ReleaseError) as error:
+                if current_store and any((Path(current_store) / name).exists() for name in (
+                        "membership-transaction.json", "markdown-transaction.json")):
+                    raise
                 if on_error:
                     on_error(error)
                 item.update(status="failed" if job["operation"] == "locate" else "extraction_failed",
@@ -271,10 +286,10 @@ def run(root, pdf_root, job, pause, *, on_error=None, worker_id=None):
         finished = True
     except CHECKPOINT_ERRORS as error:
         finished = True
-        record_worker_error(root, error, phase, doi)
+        record_worker_error(queue_root, error, phase, doi)
         if on_error:
             on_error(error)
     finally:
         # Record unexpected exceptions without swallowing them or advancing an unsaved cursor.
         if not finished and isinstance(error := sys.exc_info()[1], Exception):
-            record_worker_error(root, error, phase, doi)
+            record_worker_error(queue_root, error, phase, doi)
