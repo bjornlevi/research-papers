@@ -2,7 +2,7 @@
 
 import argparse
 from collections import Counter
-from contextlib import closing
+from contextlib import closing, nullcontext
 import csv
 from datetime import date
 from functools import lru_cache
@@ -16,13 +16,15 @@ import secrets
 import shlex
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from urllib.parse import quote, urlencode, urlsplit
 
 from jsonschema import ValidationError
-from flask import Flask, Response, g, has_request_context, jsonify, redirect, request, send_file
+from flask import Flask, Response, current_app, g, has_request_context, jsonify, redirect, request, send_file
 from markdown_it import MarkdownIt
 
 from . import __version__, catalog, collections, contracts, library_api, literature, quality, releases, retrieval
@@ -76,11 +78,17 @@ def clear_text_html(text, *, figure_prefix=None):
 
 def page(title, body, *, reader_script=False, settings_script=False, library_script=False, editor_script=False):
     current = request.path if has_request_context() else ""
+    experimental = has_request_context() and current_app.config.get("CURRENT_STATE_EDITOR", False)
+    navigation = (("Library", (("/library", "All papers"), ("/search", "Search evidence"),
+                               ("/sources", "Sources available to AI"),
+                               ("/publications", "Publication metadata"), ("/coverage", "Literature coverage"))),
+                  ("Manage", (("/discovery", "Manage library"), ("/settings", "Project settings"),
+                              ("/connect", "Connect your AI")))) if experimental else NAVIGATION
     groups = "".join(
         f'<p class="nav-group">{group}</p>' + "".join(
             f'<a href="{href}"' + (' aria-current="page"' if href == current else "") + f">{label}</a>"
             for href, label in links)
-        for group, links in NAVIGATION)
+        for group, links in navigation)
     quick_search = ("" if current == "/search" else
                     '<form class="quick-search" method="get" action="/search" role="search">'
                     '<label class="visually-hidden" for="quick-query">Search evidence</label>'
@@ -115,7 +123,11 @@ def page(title, body, *, reader_script=False, settings_script=False, library_scr
         '</details></header>'
         f'<div class="content"><main id="main"'
         + (' class="library-page"' if library_script else ' class="paper-editor-page"' if editor_script else "")
-        + f'><h2>{escape(title)}</h2>{body}</main>'
+        + f'><h2>{escape(title)}</h2>'
+        + ('<p role="status">Experimental separate current-state store. Changes do not update the normal project. '
+           'PDFs and saved discovery data are read from the selected project; do not edit both stores in parallel.</p>'
+           if experimental else "")
+        + f'{body}</main>'
         '<footer class="site-footer">Private research library '
         + help_note("About this library", "<p>Original files remain private; "
                     "machine extraction is not scientific validation.</p>")
@@ -1163,7 +1175,8 @@ if (purgeDialog && typeof purgeDialog.showModal === 'function') {
         });
         const preview = new DOMParser().parseFromString(await response.text(), 'text/html');
         if (!response.ok) {
-          throw new Error(preview.querySelector('#main')?.textContent || preview.body.textContent);
+          throw new Error(preview.querySelector('[role="alert"]')?.textContent ||
+            preview.body.textContent || 'Deletion preview unavailable.');
         }
         const main = preview.querySelector('#main');
         if (!main || !main.querySelector('form[action="/settings/purge-paper"]')) {
@@ -1225,23 +1238,62 @@ for (const button of document.querySelectorAll("[data-copy]")) {
 
 def create_app(*, release=None, registry=None, profiles, allowed_collections=None,
                default_collections=None, port=8080, mcp_url="http://127.0.0.1:8000/mcp",
-               data_root=None, quality_root=None, project_root=None, pdf_data_root=None):
+               data_root=None, quality_root=None, project_root=None, pdf_data_root=None, current_store=None,
+               experimental_markdown_repository=None, confirm_markdown_rights=False, allow_current_metadata=False):
     if not 1 <= port <= 65535:
         raise ValueError("Invalid website port")
     mcp_url = resource_url(mcp_url)
-    if bool(release) == bool(registry):
+    if sum(bool(value) for value in (release, registry, current_store)) != 1:
         raise ValueError("Select exactly one release or collection registry")
-    if project_root and not registry:
+    if project_root and not (registry or current_store):
         raise ValueError("Project settings require a collection registry")
-    if not registry and (allowed_collections or default_collections):
+    if not (registry or current_store) and (allowed_collections or default_collections):
         raise ValueError("Collection selection requires a registry")
     project_root = Path(project_root).absolute() if project_root else None
+    current_store = Path(current_store).absolute() if current_store else None
+    if allow_current_metadata and not current_store:
+        raise ValueError("Current metadata authorization requires a current-state store")
+    if current_store and not project_root:
+        raise ValueError("Experimental current-state editor requires a separate project root for PDFs and discovery")
+    if current_store and (current_store.resolve() != current_store or project_root.resolve() != project_root
+                          or current_store.is_relative_to(project_root) or project_root.is_relative_to(current_store)):
+        raise ValueError("Current store and project must be separate directories without symlinked paths")
+    if current_store and (set(profiles) != {"private_context"}
+                          or set(allowed_collections or ["core"]) != {"core"}
+                          or set(default_collections or ["core"]) != {"core"}):
+        raise ValueError("Experimental current-state editor requires only the private core collection")
     pdf_data_root = Path(pdf_data_root or "releases/pdf-data").absolute()
     if project_root and project_root.resolve() != project_root:
         raise ValueError("Project root cannot contain a symlinked path")
-    if project_root and Path(registry).absolute() != project_root / "registry":
+    if project_root and registry and Path(registry).absolute() != project_root / "registry":
         raise ValueError("Project settings must use that project's registry")
-    store = (collections.CollectionStore(registry, allowed_profiles=profiles,
+    if current_store:
+        from .build import project_current_store
+        initial = project_current_store.read(current_store)
+        if initial["editorial"] is None or initial["published"] is None:
+            raise ValueError("Experimental current-state editor requires initialized editorial and published evidence")
+        if initial["project"].get("git_markdown_tracking", False) or experimental_markdown_repository or confirm_markdown_rights:
+            if not experimental_markdown_repository or not confirm_markdown_rights:
+                raise ValueError("Git Markdown requires a separate authorized experimental repository and rights confirmation")
+            candidate = Path(experimental_markdown_repository).absolute()
+            if not candidate.is_dir() or candidate.resolve() != candidate:
+                raise ValueError("Experimental Markdown repository must be a real directory without symlinked paths")
+            def git_root(path):
+                result = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                                        capture_output=True, text=True, check=False)
+                return Path(result.stdout.strip()).resolve() if result.returncode == 0 else None
+            markdown_root = git_root(candidate)
+            if (markdown_root != candidate or markdown_root == git_root(project_root)
+                    or project_root.is_relative_to(markdown_root) or current_store.is_relative_to(markdown_root)
+                    or markdown_root.is_relative_to(project_root) or markdown_root.is_relative_to(current_store)):
+                raise ValueError("Experimental Markdown requires a separate Git repository root")
+            experimental_markdown_repository = markdown_root
+        store = project_current_store.CurrentCollectionStore(
+            current_store, allowed_profiles=profiles, allow_metadata=allow_current_metadata)
+    else:
+        if experimental_markdown_repository or confirm_markdown_rights:
+            raise ValueError("Experimental Markdown requires a current-state editor")
+        store = (collections.CollectionStore(registry, allowed_profiles=profiles,
                                         allowed_collections=allowed_collections or [],
                                         defaults=default_collections) if registry else None)
     pinned = None if store else releases.validate(release, allowed_profiles=profiles)
@@ -1249,7 +1301,12 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         store.current()
     data_root = (Path(data_root) if data_root else
                  project_root or (Path(registry).absolute().parent.parent if registry else None))
-    quality_root = Path(quality_root) if quality_root else (data_root or Path.cwd()) / "releases/data-quality"
+    if current_store:
+        if quality_root:
+            raise ValueError("Current-state quality records must use the isolated current-store directory")
+        quality_root = current_store / "quality"
+    else:
+        quality_root = Path(quality_root) if quality_root else (data_root or Path.cwd()) / "releases/data-quality"
 
     provide_token = secrets.token_urlsafe(32)
     provider_state = {"thread": None, "again": False}
@@ -1280,7 +1337,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         return metadata_state["thread"] is not None and metadata_state["thread"].is_alive()
 
     def discovery_root():
-        root = project_root / "discovery"
+        root = (current_store or project_root) / "discovery"
         if root.resolve() != root:
             raise ValueError("Discovery directory cannot contain a symlinked path")
         return root
@@ -1297,13 +1354,23 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             raise ValueError("Unknown discovery parameter")
         body = (f'<p role="alert" class="alert"><strong>Could not complete the request:</strong> {escape(error)}</p>'
                 if error else "")
+        revision_field = ""
+        if current_store:
+            project, revision = project_current_store.project_view(current_store)
+            revision_field = f'<input type="hidden" name="project_revision" value="{revision}">'
         body += (
-            '<p>Manage discovery, Core papers, PDFs and publication metadata. '
+            ('<p>Manage discovery. ' if current_store else
+             '<p>Manage discovery, Core papers, PDFs and publication metadata. ')
+            +
             '<a href="/library">Browse all papers in Library</a> or '
             '<a href="/settings#add-core-papers">add/import Core papers in Project settings</a>.</p>'
-            '<nav class="management-links" aria-label="Library management tools">'
+            + ('<nav class="management-links" aria-label="Library management tools">'
+               '<a href="#discovery">Find related papers</a> · <a href="#batch-pdfs">Batch PDFs</a> · '
+               '<a href="#metadata-catalog">Metadata catalog</a></nav>'
+               if current_store else '<nav class="management-links" aria-label="Library management tools">'
             '<a href="#discovery">Find related papers</a> · <a href="#core-papers">Core papers and PDFs</a> · '
-            '<a href="#batch-pdfs">Batch PDFs</a> · <a href="#metadata-catalog">Metadata catalog</a></nav>'
+            '<a href="#batch-pdfs">Batch PDFs</a> · <a href="#metadata-catalog">Metadata catalog</a></nav>')
+            +
             '<section class="panel" id="discovery"><h3>Find related papers</h3>'
             + help_note("Finding related papers", "<p>Find References (papers cited by Core papers) or Citing papers "
             "(papers that cite Core papers). "
@@ -1312,14 +1379,13 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             "No PDFs are downloaded and your Core papers are not changed.</p>")
             + '<form method="post" action="/discovery">'
             f'<input type="hidden" name="token" value="{provide_token}">'
+            + revision_field +
             '<button name="direction" value="background">Find references</button>'
             '<button name="direction" value="impact">Find citing papers</button>'
             '</form>')
-        root = discovery_root()
+        folders = project_index.discovery_runs(project_root, current_store)
         jobs = {p.name: releases.read_json(releases.safe_file(p, "job.json").read_bytes())
-                for p in root.iterdir()
-                if p.is_dir() and not p.is_symlink() and len(p.name) == 32
-                and all(c in "0123456789abcdef" for c in p.name) and (p / "job.json").is_file()} if root.exists() else {}
+                for p in folders.values()}
         runs = sorted(jobs, key=lambda name: (jobs[name]["started_at"], name), reverse=True)
         direction = request.args.get("direction")
         if direction and direction not in {"background", "impact"}:
@@ -1330,7 +1396,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if run:
             if len(run) != 32 or any(c not in "0123456789abcdef" for c in run):
                 raise ValueError("Invalid discovery run")
-            folder = root / run
+            if run not in folders:
+                raise ValueError("Discovery run not found")
+            folder = folders[run]
             job = releases.read_json(releases.safe_file(folder, "job.json").read_bytes())
             body += (f"<h3>{escape(discovery_label(job))}</h3>"
                      f"<p>Started: {escape(job['started_at'])}. Status: <strong>{escape(job['status'])}</strong>.</p>")
@@ -1365,7 +1433,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 body += '<section class="panel" id="coverage-issues"><h4>What needs attention</h4>'
                 if unresolved:
                     from .build import project_library
-                    core = project_library.load(project_root)["papers"]
+                    core = project["papers"] if current_store else project_library.load(project_root)["papers"]
                     core_openalex = {
                         seed["seed_doi"]: seed["providers"].get("openalex", {}).get("work_id")
                         for seed in graph["seeds"]}
@@ -1385,8 +1453,10 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                         '<li>Optionally, try the retry button below later in case OpenAlex restores the records. '
                         'It reruns the whole search in this direction. When it finishes, check the newest search&#39;s '
                         'What needs attention section.</li>'
-                        '<li>If the new search resolves the records, open <a href="#metadata-catalog">the metadata tools below</a> '
-                        'and click <strong>Configure/update metadata catalog</strong> to include the new results.</li></ol>'
+                        + ('' if current_store else
+                           '<li>If the new search resolves the records, open <a href="#metadata-catalog">the metadata tools below</a> '
+                           'and click <strong>Configure/update metadata catalog</strong> to include the new results.</li>') +
+                        '</ol>'
                         '<p><strong>If the records remain missing:</strong> you can continue using the available results. '
                         'The coverage gap remains reported. There is no manual reference-matching or '
                         '&#34;mark resolved&#34; action in the app; checking a bibliography or attaching a PDF does not '
@@ -1431,11 +1501,14 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     body += (
                         '<form method="post" action="/discovery">'
                         f'<input type="hidden" name="token" value="{provide_token}">'
+                        + revision_field +
                         f'<button name="direction" value="{escape(job["direction"], quote=True)}">'
                         f'Retry {escape(discovery_label(job).lower())}</button></form>'
                         + help_note("Retrying discovery", '<p>This starts a fresh search in this direction, not just the missing records. '
-                        'After it finishes, <a href="#metadata-catalog">update the metadata catalog</a>. '
-                        'This saved search is historical and will not change; review the new search for updated status. '
+                        + ('' if current_store else 'After it finishes, <a href="#metadata-catalog">update the metadata catalog</a>. ')
+                        + ('This saved search will not change; ' if current_store
+                           else 'This saved search is historical and will not change; ')
+                        + 'review the new search for updated status. '
                         'Retrying does not guarantee providers can resolve these records.</p>'))
                 else:
                     body += "<p>No reference issues requiring attention or provider failures in this search.</p>"
@@ -1461,7 +1534,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 if offset + 50 < len(edges):
                     body += f'<a href="/discovery?run={run}&amp;offset={offset + 50}">Next</a>'
             body += help_note("Saved search", f"<p>Saved locally: <code>{escape(str(folder))}</code>. "
-                              "Resetting the project deletes these results.</p>")
+                              + ("Back up this directory separately from paper-state exports.</p>" if current_store
+                                 else "Resetting the project deletes these results.</p>"))
         if runs:
             body += "<h3>Saved searches</h3><ul>"
             for name in runs[:20]:
@@ -1469,11 +1543,15 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 body += (f'<li><a href="/discovery?run={name}">{escape(job["started_at"])}: '
                          f'{escape(discovery_label(job))}</a> ({escape(job["status"])})</li>')
             body += "</ul>"
-        body += '</section>' + library_management_tools() + batch_management_tools() + metadata_management_tools()
-        body += ('<dialog id="purge-dialog" aria-label="Confirm permanent core-paper removal">'
-                 '<button type="button" class="secondary" data-close-dialog>Cancel</button>'
-                 '<div data-dialog-content></div></dialog>')
-        response = page("Manage library", body, settings_script=True)
+        body += '</section>'
+        if current_store:
+            body += batch_management_tools() + metadata_management_tools()
+        else:
+            body += library_management_tools() + batch_management_tools() + metadata_management_tools()
+            body += ('<dialog id="purge-dialog" aria-label="Confirm permanent core-paper removal">'
+                     '<button type="button" class="secondary" data-close-dialog>Cancel</button>'
+                     '<div data-dialog-content></div></dialog>')
+        response = page("Manage library", body, settings_script=not current_store)
         response.status_code = status_code
         response.headers["Cache-Control"] = "no-store"
         if running:
@@ -1489,18 +1567,27 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         labels = DISCOVERY_LABELS
         if direction not in labels:
             raise ValueError("Invalid discovery direction")
-        from .build import project_library
+        from .build import project_index, project_library
         with discovery_lock:
             if pdf_running():
                 return Response("Wait for PDF processing to finish before starting discovery.",
                                 status=409, mimetype="text/plain")
             if metadata_running():
                 return Response("Wait for the metadata catalog update to finish.", status=409, mimetype="text/plain")
-            if not project_library.load(project_root)["papers"]:
+            if current_store:
+                project, revision = project_current_store.project_view(current_store)
+                if request.form.get("project_revision") != revision:
+                    return Response("Core-paper selection changed; reload before starting discovery.",
+                                    status=400, mimetype="text/plain")
+            else:
+                project = project_library.load(project_root)
+            if not project["papers"]:
                 raise ValueError("Register at least one core paper before discovery")
             if discovery_state["thread"] and discovery_state["thread"].is_alive():
                 return Response("Discovery is already running; wait for it to finish.", status=409, mimetype="text/plain")
             run = secrets.token_hex(16)
+            if run in project_index.discovery_runs(project_root, current_store):
+                raise ValueError("Discovery run ID already exists; retry the search")
             output = discovery_root() / run
             job = {"direction": direction, "label": labels[direction], "status": "running",
                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
@@ -1508,7 +1595,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
 
             def work():
                 try:
-                    report = project_library.discover(project_root, output, directions=[direction])
+                    options = ({"current_store": current_store, "membership_revision": revision}
+                               if current_store else {})
+                    report = project_library.discover(project_root, output, directions=[direction], **options)
                     job.update(status="complete", report=report)
                 except (OSError, ValueError, KeyError, TypeError, sqlite3.Error,
                         releases.ReleaseError, ValidationError, literature.DiscoveryError) as error:
@@ -1619,7 +1708,10 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if not pdf_data_root.exists():
             return {}
         associated_hashes = set()
-        if project_root and (project_root / "registry/active.json").is_file():
+        if current_store:
+            associated_hashes = {source["sha256"] for source in
+                                 project_current_store.read(current_store)["editorial"]["bundle"]["sources"]}
+        elif project_root and (project_root / "registry/active.json").is_file():
             from .build import project_text
             current = project_text.editorial_store(project_root).current()
             associated_hashes = {
@@ -1633,6 +1725,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                   f'<input type="hidden" name="doi" value="{escape(doi, quote=True)}">'
                   f'<input type="hidden" name="title" value="{escape(title, quote=True)}">'
                   f'<input type="hidden" name="return_to" value="{return_to}">')
+        if current_store:
+            hidden += (f'<input type="hidden" name="project_revision" value="'
+                       f'{project_current_store.membership_revision(current_store)}">')
         body = ""
         if pdfs:
             body += ('<details><summary>' + (summary or 'Select PDF and attach/extract') + '</summary>'
@@ -1744,8 +1839,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         offset = int(request.args.get("library_offset", "0"))
         if not 0 <= offset <= 1000000:
             raise ValueError("Invalid library offset")
-        result = project_index.library_page(project_root, offset=offset, **view)
-        job = project_batch.load(project_root)
+        result = project_index.library_page(project_root, offset=offset, current_store=current_store, **view)
+        job = project_batch.load(current_store or project_root)
         selected_count = sum(item["selected"] for item in job["items"].values())
         hidden = (f'<input type="hidden" name="token" value="{provide_token}">'
                   '<input type="hidden" name="return_to" value="/discovery">'
@@ -1772,6 +1867,18 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             '<p><a href="/library/batch">Review batch results and confirm extraction</a></p></section>')
 
     def metadata_management_tools():
+        if current_store:
+            return (
+                '<section class="panel" id="metadata-catalog"><h3>Configure publication metadata</h3>'
+                '<p>Build a current-store catalog from completed searches in both the current store and '
+                'the normal project. It uses saved provider metadata, makes no network requests and '
+                'does not attach or publish paper text. Provider gaps remain visible.</p>'
+                '<form method="post" action="/settings/configure-metadata">'
+                f'<input type="hidden" name="token" value="{provide_token}">'
+                '<button>Configure/update metadata catalog</button></form>'
+                '<p><a href="/publications">Publication metadata</a> · '
+                '<a href="/coverage">Literature coverage</a> · '
+                '<a href="/settings/metadata-progress">Latest catalog update/progress</a></p></section>')
         return (
             '<section class="panel" id="metadata-catalog"><h3>Configure publication metadata</h3>'
             + help_note("Updating the catalog", '<ol><li>Use Find references or Find citing papers above. '
@@ -1792,12 +1899,85 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             '<code>COLLECTIONS="core metadata"</code> and keep <code>DEFAULT_COLLECTIONS=core</code>. '
             'The catalog contains bibliography, not full-text evidence.</p>') + '</section>')
 
+    def openalex_settings():
+        from .build import project_library
+        key_configured = project_library.openalex_key_path(project_root).is_file()
+        return (
+            '<section class="panel"><h3>OpenAlex API key</h3>'
+            f'<p>Status: <strong>{"Configured" if key_configured else "Not configured"}</strong>. '
+            '</p>'
+            + ('<p>This key is shared with the normal project for this installation; '
+               'saving or removing it affects both instances.</p>' if current_store else '')
+            + help_note("OpenAlex API key", '<p>A key enables cursor pagination beyond 10,000 incoming citations.</p>'
+            '<p><a href="https://openalex.org/signup">Create a free OpenAlex account</a>, then '
+            '<a href="https://openalex.org/settings/api-key">copy your API key from OpenAlex settings</a>. '
+            '<a href="https://help.openalex.org/api/authentication/">API key instructions</a>.</p>')
+            + '<form method="post" action="/settings/openalex-key">'
+            f'<input type="hidden" name="token" value="{provide_token}">'
+            '<label for="openalex-key">New OpenAlex API key</label>'
+            '<input id="openalex-key" name="api_key" type="password" maxlength="512" autocomplete="new-password" required>'
+            '<button>Save API key</button></form>'
+            + help_note("Key storage and use", '<p>The saved key is never displayed. It is stored privately for this installation, '
+            'survives project reset, and is sent only to OpenAlex. New searches use it automatically; '
+            'existing incomplete results are unchanged. Start a new Find citing papers search'
+            ' and then update the metadata catalog.</p>')
+            + (f'<form method="post" action="/settings/openalex-key">'
+               f'<input type="hidden" name="token" value="{provide_token}">'
+               '<button name="action" value="remove">Remove saved API key</button></form>'
+               if key_configured else "") + '</section>')
+
     def project_settings(error=None, status_code=200):
         if not project_root:
             response = page("Project settings", "<p>Project settings are not enabled for this website.</p>")
             response.status_code = 404
             return response
         from .build import project_library
+        if current_store:
+            project, revision = project_current_store.project_view(current_store)
+            body = (f'<p>Project: <strong>{escape(project["name"])}</strong>. '
+                    f'{len(project["papers"])} Core papers registered.</p>'
+                    + (f'<p role="alert" class="alert">{escape(error)}</p>' if error else "")
+                    + '<section class="panel" id="add-core-papers"><h3>Add Core papers</h3>'
+                    '<p>Adding a Core paper selects it for discovery; it does not attach a PDF or publish text. '
+                    'If this paper is already attached, its existing evidence remains unchanged.</p>')
+            fields = (f'<input type="hidden" name="token" value="{provide_token}">'
+                      f'<input type="hidden" name="project_revision" value="{revision}">')
+            body += ('<form method="post" action="/settings/add-papers">' + fields
+                     + '<label for="add-doi">DOI</label><input id="add-doi" name="doi" required>'
+                     '<label for="add-title">Title</label><input id="add-title" name="title" maxlength="1024" required>'
+                     '<button>Add Core paper</button></form><h4>Import additional Core papers</h4>'
+                     '<p>CSV needs doi,title columns; JSON uses the project manifest format. '
+                     'Duplicate DOIs are rejected and an invalid import adds nothing.</p>'
+                     '<form method="post" action="/settings/import-papers" enctype="multipart/form-data">' + fields
+                     + '<label for="import-papers">CSV or JSON file</label>'
+                     '<input id="import-papers" name="papers" type="file" accept=".csv,.json" required>'
+                     '<button>Import Core papers</button></form></section>')
+            tracking_enabled = project.get("git_markdown_tracking", False)
+            body += ('<section class="panel"><h3>Current paper records</h3>'
+                     '<p>The current editable clear text, published text and RAG settings are saved '
+                     'in per-paper records. Publishing and RAG activation remain separate actions.</p>'
+                     f'<p>Paper records: <code>{escape(str(current_store / "papers"))}</code>. '
+                     'When this directory is tracked by Git, changes can be reviewed and committed '
+                     'with Git; the app does not stage or commit them.</p></section>'
+                     '<section class="panel"><h3>Optional Markdown views</h3>'
+                     '<p>These are generated views, not the paper records. They contain private article text. '
+                     'The app does not stage or commit them; disabling their export retains existing files.</p>')
+            if experimental_markdown_repository:
+                body += (f'<p>Authorized destination: <code>{escape(str(experimental_markdown_repository))}</code>.</p>'
+                         '<form method="post" action="/settings/git-markdown">' + fields
+                         + f'<input type="hidden" name="enabled" value="{"false" if tracking_enabled else "true"}">'
+                         + ('' if tracking_enabled else
+                            '<label><input type="checkbox" name="confirm_rights" value="yes" required> '
+                            'I am authorized to store these texts in this Git repository and its remote.</label>')
+                         + f'<button>{"Disable" if tracking_enabled else "Enable"} Git Markdown tracking</button></form>')
+            else:
+                body += '<p>Optional Markdown export is not configured.</p>'
+            body += ('</section><p>Some project settings and permanent removal are not yet available '
+                     'in this experimental mode.</p>')
+            body += openalex_settings()
+            response = page("Project settings", body)
+            response.status_code = status_code
+            return response
         initialized = (project_root / "project.json").is_file()
         body = help_note("Project storage", "<p>Manage the independent private project configured for this website. "
                          f"Project root: <code>{escape(str(project_root))}</code>.</p>")
@@ -1811,9 +1991,11 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                      'find related papers, run batch PDF tools and update the metadata catalog.</p>')
             tracking_enabled = project.get("git_markdown_tracking", False)
             body += ('<section class="panel"><h3>Track Markdown in Git</h3>'
-                     '<p>Store extracted, draft and published Markdown versions in '
+                     '<p>Store current draft and published Markdown views in '
                      '<code>project-markdown/</code> at the Git repository root. This includes article text; '
-                     'commit and push only if your repository is authorized for that content. Existing Git files '
+                     'generated views are overwritten when the corresponding state changes. '
+                     'stage, commit and push only if your repository is authorized for that content. '
+                     'The app does not stage or commit these files. Existing Git files '
                      'are left in place when tracking is disabled.</p>'
                      '<form method="post" action="/settings/git-markdown">'
                      f'<input type="hidden" name="token" value="{provide_token}">'
@@ -1884,28 +2066,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                      '<button type="submit">Initialize project</button></form>'
                      "<p>The authorization note records your stated basis; it does not verify rights. "
                      "Registered papers start as awaiting PDF unless preserved material is restored.</p></section>")
-        key_configured = project_library.openalex_key_path(project_root).is_file()
-        body += (
-            '<section class="panel"><h3>OpenAlex API key</h3>'
-            f'<p>Status: <strong>{"Configured" if key_configured else "Not configured"}</strong>. '
-            '</p>'
-            + help_note("OpenAlex API key", '<p>A key enables cursor pagination beyond 10,000 incoming citations.</p>'
-            '<p><a href="https://openalex.org/signup">Create a free OpenAlex account</a>, then '
-            '<a href="https://openalex.org/settings/api-key">copy your API key from OpenAlex settings</a>. '
-            '<a href="https://help.openalex.org/api/authentication/">API key instructions</a>.</p>')
-            + '<form method="post" action="/settings/openalex-key">'
-            f'<input type="hidden" name="token" value="{provide_token}">'
-            '<label for="openalex-key">New OpenAlex API key</label>'
-            '<input id="openalex-key" name="api_key" type="password" maxlength="512" autocomplete="new-password" required>'
-            '<button>Save API key</button></form>'
-            + help_note("Key storage and use", '<p>The saved key is never displayed. It is stored privately for this installation, '
-            'survives project reset, and is sent only to OpenAlex. New searches use it automatically; '
-            'existing incomplete results are unchanged. Start a new incoming-citation search and then '
-            'update the metadata catalog.</p>')
-            + (f'<form method="post" action="/settings/openalex-key">'
-               f'<input type="hidden" name="token" value="{provide_token}">'
-               '<button name="action" value="remove">Remove saved API key</button></form>'
-               if key_configured else "") + '</section>')
+        body += openalex_settings()
         response = page("Project settings", body)
         response.status_code = status_code
         return response
@@ -1933,7 +2094,11 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                             else project_library.read_manifest_bytes(data))
                 else:
                     rows = [{"doi": request.form.get("doi", ""), "title": request.form.get("title", "")}]
-                project_library.register(project_root, rows)
+                if current_store:
+                    project_current_store.register_core_papers(
+                        current_store, rows, expected=request.form.get("project_revision", ""))
+                else:
+                    project_library.register(project_root, rows)
         except ValueError as error:
             return project_settings(str(error), 400)
         return redirect("/settings", code=303)
@@ -1963,6 +2128,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     '<p>Stop any MCP servers before purging and restart them afterward to discard cached old evidence. '
                     'This removes application-managed copies, not external backups or copies elsewhere on your computer. '
                     'Text in retained core PDFs is not rewritten if it cites the removed paper.</p>'
+                    '<p>Figure files are preserved because their ownership is not tracked. Saved RAG drafts and '
+                    'checks for identified removed sources are deleted; unassociated files are preserved. '
+                    'Review preserved files separately if they contain material you intend to delete.</p>'
                     '<h4>Matching shared PDFs to delete</h4><ul>'
                     + "".join(f'<li>{escape(path)}</li>' for path in report["pdf_copies"])
                     + ('<li>No matching shared PDF copies.</li>' if not report["pdf_copies"] else "")
@@ -2062,6 +2230,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             raise ValueError("Project settings are not enabled")
         if not hmac.compare_digest(request.form.get("token", ""), provide_token):
             return Response("Settings form expired; reload the page.", status=403, mimetype="text/plain")
+        if current_store and request.form.get("enabled") not in {"true", "false"}:
+            return project_settings("Select whether to enable or disable Git Markdown tracking.", 400)
         enabled = request.form.get("enabled") == "true"
         if enabled and request.form.get("confirm_rights") != "yes":
             return project_settings("Confirm authorization before tracking article text in Git.", 400)
@@ -2069,8 +2239,18 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         try:
             with discovery_lock:
                 require_idle_project()
-                result = project_library.set_git_markdown_tracking(project_root, enabled)
+                if current_store:
+                    result = project_current_store.set_git_markdown_tracking(
+                        current_store, experimental_markdown_repository, enabled=enabled,
+                        expected=request.form.get("project_revision", ""),
+                        rights_confirmed=request.form.get("confirm_rights") == "yes")
+                else:
+                    result = project_library.set_git_markdown_tracking(project_root, enabled)
         except ValueError as error:
+            if current_store and (current_store / "markdown-transaction.json").exists():
+                return error_response("Git Markdown setup was interrupted. Stop this editor and run "
+                                      "recover-current-markdown with the original repository; tracking may "
+                                      "already be enabled.", "markdown_recovery_required", 503)
             return project_settings(str(error), 400)
         message = ("Git Markdown tracking enabled; "
                    f"{result['files']} current versions exported." if enabled
@@ -2147,29 +2327,48 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if not project_root:
             raise ValueError("Project settings are not enabled")
         if not hmac.compare_digest(request.form.get("token", ""), provide_token):
+            if current_store:
+                return Response("This form expired. Reload the paper and try again.", status=403)
             return discovery_page("This form expired. Reload Manage library and try again.", 403)
         from .build import project_library
         import httpx
         with discovery_lock:
             require_idle_project()
             doi = request.form.get("doi", "")
-            paper = project_library.library_paper(project_root, doi, request.form.get("title"))
+            revision = request.form.get("project_revision", "")
+            if current_store:
+                try:
+                    identity = collections.publication(doi)
+                    if not identity.startswith("doi:"):
+                        raise ValueError("Select a paper with a DOI")
+                    doi = identity.removeprefix("doi:")
+                    paper = project_library.current_library_paper(
+                        project_root, current_store, doi, request.form.get("title"), revision)
+                except ValueError as error:
+                    diagnostic("web_find_pdf_rejected", exception_type=type(error).__name__)
+                    return Response(str(error), status=400, mimetype="text/plain")
+            else:
+                paper = project_library.library_paper(project_root, doi, request.form.get("title"))
             return_to = request.form.get("return_to")
             if return_to not in {"/library", "/library/paper"}:
                 return_to = "/discovery"
             job = {"status": "running", "title": paper["title"], "doi": doi, "return_to": return_to,
                    "message": "Checking local PDFs before looking for an explicitly licensed open-access copy"}
-            collections.atomic_json(project_root, "pdf-job.json", job)
+            job_root = current_store or project_root
+            collections.atomic_json(job_root, "pdf-job.json", job)
 
             def work():
                 try:
-                    result = project_library.find_pdf(project_root, doi, pdf_data_root, title=paper["title"])
+                    options = ({"current_store": current_store, "membership_revision": revision}
+                               if current_store else {})
+                    result = project_library.find_pdf(project_root, doi, pdf_data_root,
+                                                      title=paper["title"], **options)
                     job.update(status="complete", result=result)
                 except (OSError, ValueError, KeyError, TypeError, httpx.HTTPError,
                         releases.ReleaseError, literature.DiscoveryError) as error:
                     diagnostic("web_find_pdf_failed", exception_type=type(error).__name__)
                     job.update(status="failed", message=str(error))
-                collections.atomic_json(project_root, "pdf-job.json", job)
+                collections.atomic_json(job_root, "pdf-job.json", job)
 
             thread = threading.Thread(target=work, daemon=True)
             pdf_state["thread"] = thread
@@ -2179,10 +2378,11 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
     def pdf_progress():
         if not project_root:
             raise ValueError("Project settings are not enabled")
-        path = project_root / "pdf-job.json"
+        job_root = current_store or project_root
+        path = job_root / "pdf-job.json"
         if not path.exists():
-            return redirect("/discovery")
-        job = releases.read_json(releases.safe_file(project_root, path.name).read_bytes())
+            return redirect("/library" if current_store else "/discovery")
+        job = releases.read_json(releases.safe_file(job_root, path.name).read_bytes())
         body = f'<h3>{escape(job["title"])}</h3>'
         running = job["status"] == "running" and pdf_running()
         if running:
@@ -2199,7 +2399,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     body += (f'<p>Downloaded <code>{escape(result["filename"])}</code> to the PDF data folder.</p>'
                          f'<p>Acquired from: {metadata_value(result["final_url"])}. '
                          f'License: {escape(result["acquisition"]["license"])}.</p>')
-                body += ('<p>Not attached or extracted. Inspect the PDF locally, then select it in Manage library '
+                body += ('<p>Not attached or extracted. Inspect the PDF locally, then select it '
                          'and confirm its identity and private-use permission.</p>')
                 body += pdf_controls(result["doi"], job["title"], prefix="found",
                                      pdfs=available_project_pdfs(), return_to=job.get("return_to", "/discovery"),
@@ -2212,9 +2412,12 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             for attempt in result.get("local_attempts", result.get("attempts", []) if result["status"] == "local_found" else []):
                 body += f'<p role="alert">Local PDF {escape(attempt["filename"])}: {escape(attempt["error"])}</p>'
         else:
-            message = job["message"] if job["status"] == "failed" else "PDF search was interrupted; retry from Manage library."
+            message = (job["message"] if job["status"] == "failed"
+                       else "PDF search was interrupted; retry from "
+                            + ("the paper page." if current_store else "Manage library."))
             body += f'<p role="alert">{escape(message)}</p>'
-        body += '<p><a href="/discovery#core-papers">Return to Manage library</a></p>'
+        if not current_store:
+            body += '<p><a href="/discovery#core-papers">Return to Manage library</a></p>'
         body += '<p><a href="/library">Return to Library</a></p>'
         if job.get("return_to") == "/library/paper":
             body += f'<p><a href="{escape(paper_url(collections.publication(job["doi"])), quote=True)}">Return to paper</a></p>'
@@ -2228,6 +2431,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if not project_root:
             return project_settings("Project settings are not enabled for this website.", 404)
         if not hmac.compare_digest(request.form.get("token", ""), provide_token):
+            if current_store:
+                return Response("This form expired. Reload the paper and try again.", status=403)
             return discovery_page("This form expired. Reload Manage library and try again.", 403)
         from .build import project_library
         try:
@@ -2240,10 +2445,22 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 require_idle_project()
                 project_library.attach(project_root, request.form.get("doi", ""), selected,
                                        identity_confirmed=True, license=request.form.get("license"),
-                                       title=request.form.get("title"), extract=request.form.get("skip_extraction") != "yes")
+                                       title=request.form.get("title"), extract=request.form.get("skip_extraction") != "yes",
+                                       current_store=current_store,
+                                       membership_revision=request.form.get("project_revision"),
+                                       markdown_repository=(experimental_markdown_repository
+                                           if current_store and project_current_store.project_view(current_store)[0]
+                                           .get("git_markdown_tracking", False) else None))
         except ValueError as error:
+            if current_store:
+                if (current_store / "markdown-transaction.json").exists():
+                    return error_response("Git Markdown refresh was interrupted. Stop this editor and run "
+                                          "recover-current-markdown with the original repository; the paper may "
+                                          "already have been attached.", "markdown_recovery_required", 503)
+                return Response(str(error), status=400, mimetype="text/plain")
             return discovery_page(str(error), 400)
-        store.clear_cache()
+        if not current_store:
+            store.clear_cache()
         if request.form.get("return_to") == "/library/paper":
             return redirect(paper_url(collections.publication(request.form["doi"])), code=303)
         return redirect("/library" if request.form.get("return_to") == "/library" else "/discovery", code=303)
@@ -2260,11 +2477,15 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if store:
             args["snapshot_id"] = current.release_id
             if cid:
+                if current_store and cid in current.snapshots and collections.is_catalog(current.snapshots[cid]):
+                    raise releases.AccessDeniedError("Choose an evidence collection, not a metadata catalog")
                 args["collections"] = [cid]
         elif cid:
             raise ValueError("Collection selection requires a registry")
         result = current.call("list_sources", args)
         visible = current.call("list_collections", {})["result"]["items"]
+        if current_store:
+            visible = [item for item in visible if item["kind"] != "catalog"]
         options = '<option value="">Default collections</option>' + "".join(
             f'<option value="{escape(item["id"], quote=True)}"'
             f'{" selected" if item["id"] == cid else ""}>{escape(item["title"])}</option>'
@@ -2282,10 +2503,14 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         metadata_snapshots = []
         if project_root:
             from .build import project_library
-            ids = project_library.metadata_collections(project_root)
-            if ids:
+            local_metadata = project_library.current_metadata(current_store) if current_store else None
+            ids = project_library.metadata_collections(project_root) if not local_metadata else []
+            if local_metadata:
+                metadata_snapshots = [local_metadata[1]]
+            elif ids:
                 metadata_store = collections.CollectionStore(
-                    registry, allowed_profiles=profiles, allowed_collections=["core", *ids], defaults=["core"])
+                    project_root / "registry" if current_store else registry,
+                    allowed_profiles=profiles, allowed_collections=["core", *ids], defaults=["core"])
                 metadata_current = metadata_store.current()
                 metadata_snapshots = [metadata_current.snapshots[key] for key in ids]
         refs = result.get("collection_context", {}).get("evidence_refs", [])
@@ -2308,7 +2533,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 details["Acquired from"] = download["final_url"] or download["source_url"]
                 details["Acquisition method"] = "Downloaded PDF, then attached locally (SHA-256 and DOI matched)"
                 details["Acquired at"] = download["retrieved_at"]
-                details["Download provenance"] = "Saved local download record; retained evidence snapshot unchanged"
+                details["Download provenance"] = ("Saved local download record; published evidence unchanged"
+                                                  if current_store else
+                                                  "Saved local download record; retained evidence snapshot unchanged")
                 if download.get("version_note"):
                     details["PDF version note"] = download["version_note"]
                 if download.get("license"):
@@ -2375,7 +2602,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         continuation = result["result"]["next_offset"]
         if continuation is not None:
             navigation.append(link(continuation, "Next"))
-        return page("Sources available to AI", help_note("Sources available to AI", "<p>Exact source versions in the selected active MCP evidence "
+        return page("Sources available to AI", help_note("Sources available to AI", "<p>Exact source versions in the selected published evidence "
                     'collections, not the full discovered bibliography. <a href="/search">Search evidence</a> '
                     "or use Read retained text on a document below. This page is an inventory, not a chat. "
                     "Availability does not mean scientific review.</p><p>Citation links are not necessarily download origins. "
@@ -2392,6 +2619,27 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
 
     def paper_url(identity):
         return "/library/paper?" + urlencode({"id": identity})
+
+    def indexed_paper(identity, *, include_metadata=False):
+        from .build import project_index
+        return project_index.paper_detail(project_root, identity, include_metadata=include_metadata,
+                                          current_store=current_store)
+
+    def editor_state():
+        if not hasattr(g, "current_editor_state"):
+            g.current_editor_state = project_current_store.read_editor_state(current_store)
+        return g.current_editor_state
+
+    def paper_revision(source_id):
+        return editor_state()[1][source_id]
+
+    def current_paper_edit(action, **arguments):
+        if project_current_store.project_view(current_store)[0].get("git_markdown_tracking", False):
+            return project_current_store.edit_with_git_markdown(
+                current_store, experimental_markdown_repository, action=action, **arguments)
+        operation = {"save": project_current_store.save_draft, "publish": project_current_store.publish,
+                     "unpublish": project_current_store.unpublish}[action]
+        return operation(current_store, **arguments)
 
     def paper_information(paper):
         records = paper["records"]
@@ -2433,6 +2681,15 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                                            allowed_collections=["core"], defaults=["core"])
 
     def paper_snapshot(*, editorial):
+        if current_store:
+            key = "paper_editorial_snapshot" if editorial else "paper_published_snapshot"
+            if not hasattr(g, key):
+                state = editor_state()[0]
+                selected = state["editorial" if editorial else "published"]
+                result = (SimpleNamespace(snapshots={"core": SimpleNamespace(_bundle=selected["bundle"])})
+                          if selected is not None else None)
+                setattr(g, key, result)
+            return getattr(g, key)
         path = project_root / ("editorial" if editorial and (project_root / "editorial/active.json").is_file()
                                else "registry")
         key = "paper_editorial_snapshot" if editorial else "paper_published_snapshot"
@@ -2451,6 +2708,16 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
     def paper_publication(paper):
         from .build import project_text
         _, source = paper_source(paper)
+        if current_store and source:
+            state = editor_state()[0]
+            published = state["published"]["bundle"]
+            if not any(item["id"] == source["id"] for item in published["sources"]):
+                return None
+            identity = project_text.content_identity(published, source["id"])
+            event = (state["audit"].get(source["id"]) or {}).get("publication")
+            if event and (event.get("after") or {}).get("content_identity") != identity:
+                event = None
+            return {"snapshot": paper_revision(source["id"]), "content_identity": identity, "event": event}
         return project_text.publication(project_root, source["id"],
                                         current=paper_snapshot(editorial=False)) if source else None
 
@@ -2482,10 +2749,10 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             body += ('<h3>Publish clear text</h3>'
                      '<p>Check the clear text, tables and omissions against the original PDF before publishing. '
                      'Publication activates the checked version for RAG/MCP; it is not scientific validation.</p>'
-                     '<form method="post" action="/library/paper/publication">'
+                     + '<form method="post" action="/library/paper/publication">'
                      f'<input type="hidden" name="token" value="{provide_token}">'
                      f'<input type="hidden" name="id" value="{escape(paper["id"], quote=True)}">'
-                     f'<input type="hidden" name="snapshot_id" value="{current.release_id}">'
+                     f'<input type="hidden" name="snapshot_id" value="{paper_revision(source["id"]) if current_store else current.release_id}">'
                      '<input type="hidden" name="action" value="publish">'
                      '<label>Your name<input name="reviewer" required maxlength="200"></label>'
                      '<label>Publication reason<input name="reason" required maxlength="2000"></label>'
@@ -2494,11 +2761,14 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                      '<button>Publish clear text for retrieval</button></form>')
         if publication:
             body += ('<h3>Unpublish</h3>'
-                     '<p>Remove this paper from the active AI retrieval snapshot, keeping its PDF, clear-text draft '
-                     'and history. Other papers are unchanged. Retained old snapshot links and content already '
-                     'retrieved by AI clients remain available; restart MCP clients/servers using cached snapshots '
-                     'and start a new retrieval session to use the updated snapshot.</p>'
-                     '<form method="post" action="/library/paper/publication">'
+                     '<p>Remove this paper from active AI retrieval, keeping its PDF and clear-text draft. '
+                     + ('Old pinned current-state requests will be unavailable; start a new retrieval session.</p>'
+                        if current_store else
+                        'History is retained. '
+                        'Retained old snapshot links and content already '
+                        'retrieved by AI clients remain available; restart MCP clients/servers using cached snapshots '
+                        'and start a new retrieval session to use the updated snapshot.</p>')
+                     + '<form method="post" action="/library/paper/publication">'
                      f'<input type="hidden" name="token" value="{provide_token}">'
                      f'<input type="hidden" name="id" value="{escape(paper["id"], quote=True)}">'
                      f'<input type="hidden" name="snapshot_id" value="{publication["snapshot"]}">'
@@ -2516,7 +2786,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if not hmac.compare_digest(request.form.get("token", ""), provide_token):
             return Response("Publication form expired; reload the page.", status=403, mimetype="text/plain")
         from .build import project_index, project_text
-        paper = project_index.paper_detail(project_root, request.form.get("id", ""), include_metadata=False)
+        paper = indexed_paper(request.form.get("id", ""))
         try:
             with discovery_lock:
                 require_idle_project()
@@ -2526,17 +2796,25 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 action = request.form.get("action")
                 if action not in {"publish", "unpublish"}:
                     raise ValueError("Unknown publication action")
-                operation = project_text.publish if action == "publish" else project_text.unpublish
-                operation(project_root, snapshot_id=request.form.get("snapshot_id", ""), source_id=source["id"],
-                          reviewer=request.form.get("reviewer", ""), reason=request.form.get("reason", ""),
-                          checked=request.form.get("checked") == "yes")
+                if current_store:
+                    current_paper_edit(action, revision=request.form.get("snapshot_id", ""), source_id=source["id"],
+                                       reviewer=request.form.get("reviewer", ""), reason=request.form.get("reason", ""),
+                                       checked=request.form.get("checked") == "yes")
+                else:
+                    operation = project_text.publish if action == "publish" else project_text.unpublish
+                    operation(project_root, snapshot_id=request.form.get("snapshot_id", ""), source_id=source["id"],
+                              reviewer=request.form.get("reviewer", ""), reason=request.form.get("reason", ""),
+                              checked=request.form.get("checked") == "yes")
         except (ValueError, ValidationError) as error:
             diagnostic("web_publication_rejected", exception_type=type(error).__name__)
+            if current_store and (current_store / "markdown-transaction.json").exists():
+                raise ValueError("Interrupted Git Markdown update") from error
             body = paper_publication_tools(paper, error=str(error))
             response = page(paper["title"] or "Paper", paper_tabs(paper, body, selected="publication"))
             response.status_code = 400
             return response
-        store.clear_cache()
+        if not current_store:
+            store.clear_cache()
         return redirect(paper_url(paper["id"]) + "&tab=publication", code=303)
 
     def paper_rag(paper, *, form=None, hits=None, check_results=None, notice=None, error=None):
@@ -2549,11 +2827,19 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if not publication:
             return body + '<p>Publish the clear text before configuring RAG/MCP retrieval.</p>'
         _, source = paper_source(paper)
-        snapshot = paper_snapshot(editorial=False).snapshots["core"]
+        if current_store:
+            snapshot = project_current_store._published_snapshot({"published": editor_state()[0]["published"]})
+        else:
+            snapshot = paper_snapshot(editorial=False).snapshots["core"]
         units = snapshot.document_units(source["id"])
-        draft = project_chunks.load_draft(project_root, source["id"])
-        checks = project_chunks.load_checks(project_root, source["id"])
-        pending = project_chunks.term_review(project_root, source["id"], draft, publication["content_identity"])
+        if current_store:
+            rag = editor_state()[0]["rag"].get(source["id"]) or {"draft": None, "checks": []}
+            draft, checks = rag["draft"], rag["checks"]
+            pending = project_chunks.review_current_terms(draft, publication["content_identity"])
+        else:
+            draft = project_chunks.load_draft(project_root, source["id"])
+            checks = project_chunks.load_checks(project_root, source["id"])
+            pending = project_chunks.review_current_terms(draft, publication["content_identity"])
         stale = draft is not None and draft["content_identity"] != publication["content_identity"]
         active = {unit["id"]: snapshot.chunk_plans[unit["id"]]
                   for unit in units if unit["id"] in snapshot.chunk_plans}
@@ -2790,7 +3076,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if not hmac.compare_digest(request.form.get("token", ""), provide_token):
             return Response("Retrieval form expired; reload the page.", status=403, mimetype="text/plain")
         from .build import project_chunks, project_index
-        paper = project_index.paper_detail(project_root, request.form.get("id", ""), include_metadata=False)
+        paper = indexed_paper(request.form.get("id", ""))
         publication = paper_publication(paper)
         status, error, hits, check_results, notice = 200, None, None, None, None
         matches = publication and publication["snapshot"] == request.form.get("snapshot_id")
@@ -2799,7 +3085,14 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 raise ValueError("Published retrieval changed; reload before working on chunks")
             _, source = paper_source(paper)
             action = request.form.get("action")
-            if action == "preview":
+            if current_store and action in {"preview", "run-checks"}:
+                options = {"source_id": source["id"], "revision": publication["snapshot"], "form": request.form}
+                if action == "preview":
+                    hits = project_current_store.preview_rag(
+                        current_store, query=request.form.get("query", ""), **options)
+                else:
+                    check_results = project_current_store.check_rag(current_store, **options)
+            elif action == "preview":
                 query = request.form.get("query", "").strip()
                 if not query:
                     raise ValueError("Enter a test query before previewing draft search.")
@@ -2816,17 +3109,29 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             elif action == "add-check" or (action or "").startswith("remove-check:"):
                 with discovery_lock:
                     require_idle_project()
-                    project_chunks.update_check(project_root, source_id=source["id"],
-                        snapshot_id=publication["snapshot"],
-                        form={**request.form, "check_id": action.removeprefix("remove-check:")},
-                        remove=action != "add-check")
+                    form = {**request.form, "check_id": action.removeprefix("remove-check:")}
+                    if current_store:
+                        project_current_store.update_check(
+                            current_store, source_id=source["id"], revision=publication["snapshot"],
+                            form=form, remove=action != "add-check")
+                    else:
+                        project_chunks.update_check(project_root, source_id=source["id"],
+                            snapshot_id=publication["snapshot"], form=form, remove=action != "add-check")
+                if current_store:
+                    for key in ("current_editor_state", "paper_editorial_snapshot", "paper_published_snapshot"):
+                        g.pop(key, None)
                 notice = "Search check saved." if action == "add-check" else "Search check removed."
             elif action in {"save", "activate"}:
                 with discovery_lock:
                     require_idle_project()
-                    project_chunks.update(project_root, source_id=source["id"], snapshot_id=publication["snapshot"],
-                                          form=request.form, activate=action == "activate")
-                if action == "activate":
+                    if current_store:
+                        project_current_store.update_rag(
+                            current_store, source_id=source["id"], revision=publication["snapshot"],
+                            form=request.form, activate=action == "activate")
+                    else:
+                        project_chunks.update(project_root, source_id=source["id"], snapshot_id=publication["snapshot"],
+                                              form=request.form, activate=action == "activate")
+                if action == "activate" and not current_store:
                     store.clear_cache()
                 return redirect(paper_url(paper["id"]) + "&tab=rag", code=303)
             else:
@@ -2856,7 +3161,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if not project_root or set(request.args) != {"id"}:
             raise ValueError("Select one private project paper")
         from .build import project_index
-        paper = project_index.paper_detail(project_root, request.args["id"], include_metadata=False)
+        paper = indexed_paper(request.args["id"])
         _, source = paper_source(paper)
         path = local_paper_pdf(source)
         if path is None:
@@ -2870,7 +3175,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             raise ValueError("Select one private project PDF page")
         from .build import project_index
         import pymupdf
-        paper = project_index.paper_detail(project_root, request.args["id"], include_metadata=False)
+        paper = indexed_paper(request.args["id"])
         _, source = paper_source(paper)
         path = local_paper_pdf(source)
         if path is None:
@@ -2905,7 +3210,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             f'<li><a href="/discovery?run={run}">{escape(discovery_label(job))}</a> — '
             f'{escape(job["status"])}. Review provider coverage and gaps.</li>' for run, job in paper["searches"])
         body += '</ul><p><a href="/discovery#discovery">Manage discovery searches</a></p></section>'
-        if paper["core"]:
+        if paper["core"] and not current_store:
             body += ('<details><summary>Remove this Core paper</summary>'
                      '<p>Permanent deletion requires a preview and DOI confirmation.</p>'
                      + remove_core_form(paper) + '</details>')
@@ -2923,7 +3228,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if tab != "content" and set(request.args) & content_parameters:
             raise ValueError("Editor parameters require the Clear text tab")
         from .build import project_edit, project_index
-        paper = project_index.paper_detail(project_root, request.args["id"], include_metadata=tab == "technical")
+        paper = indexed_paper(request.args["id"], include_metadata=tab == "technical")
         current, source = paper_source(paper)
         if source:
             bibliography = source.get("bibliography") or {}
@@ -2972,8 +3277,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                         "unit_id": unit["id"], "mode": "edit", "scope": "page"}), quote=True)
                     + '#page-editor">Edit this page</a></p>' + source_warnings(unit) + '</section>'
                     for unit in units) + '</details>'
-                body += '<details><summary>Correction history</summary>' + metadata_value(
-                    project_edit.history(project_root, source["id"])[:20]) + '</details>'
+                history = (list((editor_state()[0]["audit"].get(source["id"]) or {}).values()) if current_store
+                           else project_edit.history(project_root, source["id"])[:20])
+                body += '<details><summary>Correction history</summary>' + metadata_value(history) + '</details>'
         else:
             body = ('<section id="extracted-content"><h3>Clear text</h3>'
                 '<p>No extracted content is attached to this entry. This paper is not available as full-text '
@@ -3018,8 +3324,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         whole_document = scope == "document"
         from .build import project_edit, project_index, project_text
         if paper_record is None:
-            paper_record = project_index.paper_detail(
-                project_root, collections.publication(request.form.get("doi", "")), include_metadata=False)
+            paper_record = indexed_paper(collections.publication(request.form.get("doi", "")))
         doi = paper_record["doi"]
         current = paper_snapshot(editorial=True)
         if current is None:
@@ -3121,8 +3426,10 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 'Return to read-only view (discard unsaved changes)</a></p>'
                 + help_note("Editing extracted data", '<p>Edit retained page text/OCR, paper metadata and structured tables. '
                 'Compare against the original PDF using the paper&#39;s PDF tab or your local copy. '
-                'Saving retains a private editorial version. Publish separately to enable search and AI. Original versions, '
-                'source checksums, page locators and old snapshot links are preserved. '
+                'Saving retains a private editorial version. Publish separately to enable search and AI. '
+                + ('Source checksums and page locators are preserved; use backups and Git for history. '
+                   if current_store else 'Original versions, source checksums, page locators and old snapshot links are preserved. ')
+                +
                 'Corrections are operator assertions, not independent scientific validation.</p>')
                 + f'<p>DOI: <code>{escape(source["doi"])}</code>.</p>')
         if whole_document:
@@ -3149,7 +3456,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                  + f'<input type="hidden" name="doi" value="{escape(doi, quote=True)}">'
                  f'<input type="hidden" name="unit_id" value="{escape(unit_id, quote=True)}">'
                  f'<input type="hidden" name="scope" value="{scope}">'
-                 f'<input type="hidden" name="snapshot_id" value="{value("snapshot_id", current.release_id)}">'
+                 f'<input type="hidden" name="snapshot_id" value="{value("snapshot_id", paper_revision(source["id"]) if current_store else current.release_id)}">'
                  f'<input type="hidden" name="source_id" value="{value("source_id", source["id"])}">')
         body += (('<h4 id="page-editor">Whole document text / OCR</h4>' if whole_document else
                   f'<h4 id="page-editor">{escape(quality_location(unit["citation"]["locator"]))} — Page text / OCR</h4>')
@@ -3239,21 +3546,33 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         try:
             with discovery_lock:
                 require_idle_project()
+                if current_store:
+                    paper = indexed_paper(collections.publication(request.form.get("doi", "")))
+                    _, source = paper_source(paper)
+                    if not source or source["id"] != request.form.get("source_id", ""):
+                        raise ValueError("Select the source belonging to this paper")
                 if request.form.get("scope", "page") not in {"page", "document"}:
                     raise ValueError("Unknown correction scope")
                 if request.form.get("action") == "publish":
-                    project_text.publish(project_root, snapshot_id=request.form.get("snapshot_id", ""),
-                        source_id=request.form.get("source_id", ""), reviewer=request.form.get("reviewer", ""),
-                        reason=request.form.get("reason", ""), checked=request.form.get("checked") == "yes")
-                    store.clear_cache()
+                    options = {"source_id": request.form.get("source_id", ""),
+                               "reviewer": request.form.get("reviewer", ""), "reason": request.form.get("reason", ""),
+                               "checked": request.form.get("checked") == "yes"}
+                    if current_store:
+                        current_paper_edit("publish", revision=request.form.get("snapshot_id", ""), **options)
+                    else:
+                        project_text.publish(project_root, snapshot_id=request.form.get("snapshot_id", ""), **options)
+                        store.clear_cache()
                     return redirect(paper_url(collections.publication(request.form.get("doi", "")))
                                     + "&tab=publication", code=303)
                 if request.form.get("action") == "repair-layout":
                     if request.form.get("scope", "page") != "page":
                         raise ValueError("Paragraph-layout repair is available in the individual page editor")
-                    draft = project_edit.paragraph_draft(project_root,
-                        snapshot_id=request.form.get("snapshot_id", ""), source_id=request.form.get("source_id", ""),
-                        unit_id=request.form.get("unit_id", ""))
+                    options = {"source_id": request.form.get("source_id", ""),
+                               "unit_id": request.form.get("unit_id", "")}
+                    draft = (project_current_store.paragraph_draft(
+                        current_store, project_root, revision=request.form.get("snapshot_id", ""), **options)
+                        if current_store else project_edit.paragraph_draft(
+                            project_root, snapshot_id=request.form.get("snapshot_id", ""), **options))
                     return paper_content(draft_text=draft)
                 try:
                     tables = json.loads(request.form.get("tables", "[]"))
@@ -3267,18 +3586,24 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                         imported_text = text
                     except UnicodeDecodeError as error:
                         raise ValueError("Clear text must be UTF-8; draft was not saved") from error
-                project_edit.correct(project_root, snapshot_id=request.form.get("snapshot_id", ""),
-                    source_id=request.form.get("source_id", ""), unit_id=request.form.get("unit_id", ""),
+                options = dict(source_id=request.form.get("source_id", ""), unit_id=request.form.get("unit_id", ""),
                     text=text,
                     bibliography={key: request.form.get(key, "") for key in project_edit.BIB_FIELDS},
                     source_url=request.form.get("source_url", ""), tables=tables,
                     reviewer=request.form.get("reviewer", ""), reason=request.form.get("reason", ""),
-                    checked=request.form.get("checked") == "yes",
                     whole_document=request.form.get("scope", "page") == "document")
+                if current_store:
+                    current_paper_edit("save", revision=request.form.get("snapshot_id", ""), **options)
+                else:
+                    project_edit.correct(project_root, snapshot_id=request.form.get("snapshot_id", ""),
+                                         checked=request.form.get("checked") == "yes", **options)
         except (ValueError, ValidationError) as error:
             diagnostic("web_correction_rejected", exception_type=type(error).__name__)
+            if current_store and (current_store / "markdown-transaction.json").exists():
+                raise ValueError("Interrupted Git Markdown update") from error
             return paper_content(str(error), 400, draft_text=imported_text)
-        store.clear_cache()
+        if not current_store:
+            store.clear_cache()
         return redirect(paper_url(collections.publication(request.form.get("doi", ""))), code=303)
 
     def batch_action():
@@ -3287,7 +3612,10 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             raise ValueError("Project settings are not enabled")
         if not hmac.compare_digest(request.form.get("token", ""), provide_token):
             return Response("Batch form expired; reload the page.", status=403, mimetype="text/plain")
+        queue_root = current_store or project_root
         try:
+            if current_store:
+                project_current_store.project_view(current_store)
             with discovery_lock:
                 action = request.form.get("action", "")
                 if action == "pause":
@@ -3297,27 +3625,29 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     return redirect("/library/batch", code=303)
                 require_idle_project()
                 if action in {"toggle", "page", "all", "clear"}:
-                    job = project_batch.load(project_root)
+                    job = project_batch.load(queue_root)
                     if action == "clear":
                         for item in job["items"].values():
                             item["selected"] = False
-                        project_batch.save(project_root, job)
+                        project_batch.save(queue_root, job)
                     else:
                         view = {name: request.form.get(name, "asc" if name == "order" else "")
                                 for name in project_index.VIEW_FIELDS}
                         offset = int(request.form.get("offset", "0"))
                         if action == "toggle":
                             doi = request.form.get("doi", "")
-                            result = project_index.library_page(project_root, doi, select_all=True)
+                            result = project_index.library_page(project_root, doi, select_all=True,
+                                                                current_store=current_store)
                             rows = [row for row in result["rows"] if row["doi"] == doi]
                             if not rows:
                                 raise ValueError("Paper no longer exists in Library")
                             selected = not job["items"].get(doi, {}).get("selected", False)
                         else:
                             result = project_index.library_page(
-                                project_root, offset=offset, **view, select_all=action == "all")
+                                project_root, offset=offset, **view, select_all=action == "all",
+                                current_store=current_store)
                             rows, selected = result["rows"], True
-                        job = project_batch.select(project_root, rows, selected)
+                        job = project_batch.select(queue_root, rows, selected)
                         if action == "toggle" and request.headers.get("Accept") == "application/json":
                             item = job["items"].get(doi)
                             if item is None:
@@ -3337,21 +3667,23 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                                 if action == "toggle" else "")
                     return redirect("/library?" + urlencode(params) + fragment, code=303)
                 if action == "find-all":
-                    awaiting = [paper for paper in project_library.status(project_root)["papers"]
+                    status = (project_index._current_status(project_current_store.read(current_store))
+                              if current_store else project_library.status(project_root))
+                    awaiting = [paper for paper in status["papers"]
                                 if paper["status"] == "awaiting_pdf"]
                     if not awaiting:
                         raise ValueError("No Core papers are awaiting PDF")
                     rows = [{**paper, "status": "Awaiting PDF"} for paper in awaiting]
-                    job = project_batch.select(project_root, rows, True)
+                    job = project_batch.select(queue_root, rows, True)
                     dois = {paper["doi"] for paper in awaiting}
                     if all(job["items"][doi]["status"] in {
                             "downloaded", "local_found", "extraction_failed", "extracted"} for doi in dois):
                         return redirect("/library/batch", code=303)
-                    job = project_batch.prepare_locate(project_root, dois=dois)
+                    job = project_batch.prepare_locate(queue_root, dois=dois)
                 elif action == "locate":
-                    job = project_batch.prepare_locate(project_root)
+                    job = project_batch.prepare_locate(queue_root)
                 elif action == "resume-locate":
-                    job = project_batch.resume_locate(project_root, worker_id=batch_worker_id)
+                    job = project_batch.resume_locate(queue_root, worker_id=batch_worker_id)
                 elif action in {"accept", "reject-suggestion"}:
                     offset = int(request.form.get("offset", "0"))
                     if not 0 <= offset <= retrieval.MAX_OFFSET:
@@ -3361,15 +3693,15 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                         raise ValueError("Invalid confirmation position")
                     doi = request.form.get("doi", "")
                     if action == "accept":
-                        project_batch.accept_pdf(project_root, pdf_data_root, doi,
+                        project_batch.accept_pdf(queue_root, pdf_data_root, doi,
                                                  request.form.get("file:" + doi, ""))
                     else:
-                        project_batch.reject_suggestion(project_root, doi, request.form.get("suggestion", ""))
+                        project_batch.reject_suggestion(queue_root, doi, request.form.get("suggestion", ""))
                     return redirect("/library/batch/confirm?" + urlencode({
                         "offset": offset, "notice": "accepted" if action == "accept" else "rejected"})
                         + f"#pair-{position}", code=303)
                 elif action == "extract-accepted":
-                    job = project_batch.prepare_accepted(project_root, pdf_data_root)
+                    job = project_batch.prepare_accepted(queue_root, pdf_data_root)
                 elif action == "extract":
                     choices = [(doi, request.form.get("file:" + doi, ""))
                                for doi in request.form.getlist("confirm")]
@@ -3379,7 +3711,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                             raise ValueError("Invalid confirmation page")
                         return redirect("/library/batch/confirm?" + urlencode({
                             "offset": offset, "notice": "confirm-needed"}), code=303)
-                    job = project_batch.prepare_extract(project_root, pdf_data_root, choices)
+                    job = project_batch.prepare_extract(queue_root, pdf_data_root, choices)
                 else:
                     raise ValueError("Unknown batch action")
                 batch_state["pause"].clear()
@@ -3387,19 +3719,24 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 def work():
                     project_batch.run(project_root, pdf_data_root, job, batch_state["pause"],
                         worker_id=batch_worker_id,
+                        current_store=current_store, markdown_repository=experimental_markdown_repository,
                         on_error=lambda error: diagnostic("web_batch_pdf_failed", exception_type=type(error).__name__))
-                    store.clear_cache()
+                    if not current_store:
+                        store.clear_cache()
 
                 thread = threading.Thread(target=work, daemon=True)
                 batch_state["thread"] = thread
                 try:
                     thread.start()
                 except RuntimeError as error:
-                    project_batch.record_worker_error(project_root, error, "launching_worker", None)
+                    project_batch.record_worker_error(queue_root, error, "launching_worker", None)
                     raise ValueError("The PDF worker could not start. See Batch diagnostics in the review queue.") from error
             return redirect("/library/batch", code=303)
         except ValueError as error:
             diagnostic("web_batch_pdf_rejected", exception_type=type(error).__name__)
+            if current_store and any((current_store / name).exists() for name in (
+                    "membership-transaction.json", "markdown-transaction.json")):
+                raise
             response = page("Batch PDF request rejected",
                 f'<p role="alert">{escape(str(error))}</p>'
                 '<p><a href="/library/batch">Review queue</a> | '
@@ -3440,12 +3777,14 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         from .build import project_batch
         if not project_root:
             raise ValueError("Project settings are not enabled")
+        if current_store:
+            project_current_store.project_view(current_store)
         if set(request.args) - ({"offset", "notice"} if confirmation else {"offset"}):
             raise ValueError("Unknown batch parameter")
         offset = int(request.args.get("offset", "0"))
         if not 0 <= offset <= 1000000:
             raise ValueError("Invalid batch page")
-        job = project_batch.load(project_root)
+        job = project_batch.load(current_store or project_root)
         running = batch_running()
         if confirmation:
             if running:
@@ -3616,16 +3955,17 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
 
     def project_library_page():
         from .build import project_batch, project_index
-        if not (project_root / "project.json").is_file():
+        if not current_store and not (project_root / "project.json").is_file():
             return redirect("/settings")
         if set(request.args) - {*project_index.VIEW_FIELDS, "offset", "page", "limit"}:
             raise ValueError("Unsupported project library filter")
         offset, limit = library_pagination()
         view = {name: request.args.get(name, "asc" if name == "order" else "")
                 for name in project_index.VIEW_FIELDS}
-        result = project_index.library_page(project_root, offset=offset, limit=limit, **view)
+        result = project_index.library_page(project_root, offset=offset, limit=limit,
+                                            current_store=current_store, **view)
         pagination = library_pager(result["matching"], offset, limit)
-        job = project_batch.load(project_root)
+        job = project_batch.load(current_store or project_root)
         selected_count = sum(item["selected"] for item in job["items"].values())
         def filter_select(name, label, options, selected):
             return (f'<label class="visually-hidden" for="library-{name}">{label}</label>'
@@ -3651,7 +3991,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         core_count = result["core_count"]
         papers = result["core"]
         body = (
-            f"<p>{core_count} core papers; {result['total'] - core_count} additional discovered records.</p>"
+            (f"<p>{core_count} Core papers; {result['total'] - core_count} other records.</p>"
+             if current_store else
+             f"<p>{core_count} core papers; {result['total'] - core_count} additional discovered records.</p>")
             + help_note("Library records and PDF status", "<p>Records with a DOI are combined across searches; records without a DOI retain provider identities.</p>"
             "<p>References without a supplied title are listed last. Their provider metadata may contain "
             "only a DOI or partial citation; this does not mean the PDF is unavailable.</p>"
@@ -3671,10 +4013,10 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             '<button>Apply filters</button><a href="/library">Clear filters and sorting</a></form>'
             '<p class="meta">Click a column heading to sort. Column filters combine with the global search '
             'and apply to all papers, not just this page. Missing metadata is shown as a dash and sorts last.</p>'
-            f'<p><span id="batch-selected-count">{selected_count}</span> papers marked for PDF location. '
+            + (f'<p><span id="batch-selected-count">{selected_count}</span> papers marked for PDF location. '
             f'<a href="/discovery?{escape(urlencode({**view, "library_offset": offset}), quote=True)}#batch-pdfs">'
-            'Manage PDFs for these results</a>.</p>'
-            f"<p>{result['matching']} matching records.</p>"
+            'Manage PDFs for these results</a>.</p>')
+            + f"<p>{result['matching']} matching records.</p>"
             '<div class="table-scroll library-table-scroll" role="region" aria-label="Library papers" tabindex="0">'
             '<table class="library-table"><caption class="visually-hidden">Library papers with sortable columns '
             'and filters</caption><thead><tr>'
@@ -4010,7 +4352,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             raise ValueError("Unknown query parameter")
         if project_root and metadata_running():
             return redirect("/settings/metadata-progress")
-        if project_root and not (project_root / "registry/active.json").exists():
+        if project_root and not current_store and not (project_root / "registry/active.json").exists():
             return page("Publication metadata" if request.path == "/publications" else "Literature coverage",
                         '<section class="panel"><h3>Set up your metadata catalog</h3>'
                         '<ol><li><a href="/settings">Initialize the project</a>, then attach at least one PDF '
@@ -4021,8 +4363,35 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                         'Configure/update metadata catalog to publish the saved bibliography.</li></ol>'
                         '<p>Discovery alone saves search results; it does not configure a metadata catalog. '
                         'Catalog setup does not download PDFs or add full-text evidence.</p></section>')
-        current = snapshot(request)
-        if project_root:
+        if current_store:
+            from .build import project_library
+            current = store.current()
+            local_metadata = ((current.entries["metadata"], current.snapshots["metadata"])
+                              if "metadata" in current.snapshots else
+                              project_library.current_metadata(current_store))
+            metadata_ids = project_library.metadata_collections(project_root) if not local_metadata else []
+            if local_metadata and "metadata" not in current.snapshots:
+                entry, metadata = local_metadata
+                document = {**current.document, "collections": [*current.document["collections"], entry]}
+                current = collections.CollectionSnapshot(
+                    document, {**current.snapshots, "metadata": metadata}, {"core", "metadata"}, ["core"])
+            elif not local_metadata and metadata_ids:
+                metadata_store = collections.CollectionStore(
+                    project_root / "registry", allowed_profiles=profiles,
+                    allowed_collections=["core", *metadata_ids], defaults=["core"])
+                metadata_current = metadata_store.current()
+                entries = [entry for entry in metadata_current.document["collections"] if entry["id"] in metadata_ids]
+                document = {**current.document, "collections": [*current.document["collections"], *entries]}
+                current = collections.CollectionSnapshot(
+                    document, {**current.snapshots, **{cid: metadata_current.snapshots[cid] for cid in metadata_ids}},
+                    {"core", *metadata_ids}, ["core"])
+            if request.args.get("snapshot_id"):
+                collections.digest(request.args["snapshot_id"])
+                if request.args["snapshot_id"] != current.release_id:
+                    raise collections.SnapshotUnavailable("Metadata or published evidence changed")
+        else:
+            current = snapshot(request)
+        if project_root and not current_store:
             from .build import project_library
             metadata_ids = project_library.metadata_collections(project_root)
             if metadata_ids:
@@ -4105,7 +4474,18 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         body = help_note("About this page", "<p>" + description + "</p><p>Provisional metadata only. "
                          "Not researcher-approved, not full-text evidence. "
                          "A reported abstract or full-text location is not acquisition or permission.</p>") + form
-        if project_root:
+        if current_store:
+            body += (('<p>This current-store catalog includes completed searches from both project directories. '
+                      'Update it after new searches. ' if local_metadata else
+                      '<p>The normal project’s existing metadata catalog, if configured, is used read-only. '
+                      'New current-store discovery searches are not included until you update the catalog. ')
+                     + ('This current-store catalog is enabled for the matching current-store MCP configuration. '
+                        if allow_current_metadata and local_metadata else
+                        'MCP metadata authorization is enabled, but the normal-project fallback catalog is not exposed. '
+                        if allow_current_metadata else
+                        'The current-store MCP configuration does not authorize metadata. ')
+                     + '<a href="/discovery#metadata-catalog">Configure/update metadata catalog</a>.</p>')
+        elif project_root:
             body += ('<p>To configure or update this catalog, '
                      '<a href="/discovery#metadata-catalog">open Manage library</a>.</p>')
         if store and len(visible) == 1:
@@ -4122,7 +4502,11 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             import json
             if project_root:
                 from .build import project_library
-                core_papers = project_library.status(project_root)["papers"]
+                if current_store:
+                    from .build import project_index
+                    core_papers = project_index._current_status(project_current_store.read(current_store))["papers"]
+                else:
+                    core_papers = project_library.status(project_root)["papers"]
                 available = sum(paper["status"] != "awaiting_pdf" for paper in core_papers)
                 body += (
                     '<section class="panel"><h3>Core full-text evidence</h3>'
@@ -4181,10 +4565,11 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             body += "<p>No authorized discovery catalog has identifier-matched records for this collection.</p>"
         elif not result["items"]:
             body += "<p class=\"empty-state\">No metadata catalog records in this selection. "
-            if catalog_collections:
+            if catalog_collections and not current_store:
                 body += "Choose All metadata catalogs or a metadata catalog in the Collection filter. "
-            else:
-                body += "No metadata catalog is configured among the authorized collections. "
+            elif not catalog_collections:
+                body += ("No metadata catalog is configured in the normal project. " if current_store else
+                         "No metadata catalog is configured among the authorized collections. ")
             body += 'This does not mean the <a href="/library">source library</a> is empty.</p>'
         return page("Literature coverage" if tool == "catalog_status" else "Publication metadata", body)
 
@@ -4204,21 +4589,23 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                                 status=409, mimetype="text/plain")
             from .build import project_library
             job = {"status": "running", "message": "Preparing metadata catalog update"}
-            collections.atomic_json(project_root, "metadata-job.json", job)
+            job_root = current_store or project_root
+            collections.atomic_json(job_root, "metadata-job.json", job)
 
             def progress(message):
                 job["message"] = message
-                collections.atomic_json(project_root, "metadata-job.json", job)
+                collections.atomic_json(job_root, "metadata-job.json", job)
 
             def work():
                 try:
-                    report = project_library.configure_metadata(project_root, progress=progress)
+                    options = {"current_store": current_store} if current_store else {}
+                    report = project_library.configure_metadata(project_root, progress=progress, **options)
                     job.update(status="complete", message="Metadata catalog updated", report=report)
                 except (OSError, ValueError, KeyError, TypeError, sqlite3.Error,
                         releases.ReleaseError, ValidationError, literature.DiscoveryError) as error:
                     diagnostic("web_metadata_failed", exception_type=type(error).__name__)
                     job.update(status="failed", message=str(error))
-                collections.atomic_json(project_root, "metadata-job.json", job)
+                collections.atomic_json(job_root, "metadata-job.json", job)
 
             thread = threading.Thread(target=work, daemon=True)
             metadata_state["thread"] = thread
@@ -4228,10 +4615,11 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
     def metadata_progress():
         if not project_root:
             raise ValueError("Project metadata setup is not enabled")
-        path = project_root / "metadata-job.json"
+        job_root = current_store or project_root
+        path = job_root / "metadata-job.json"
         if not path.is_file():
             return redirect("/discovery#metadata-catalog")
-        job = releases.read_json(releases.safe_file(project_root, path.name).read_bytes())
+        job = releases.read_json(releases.safe_file(job_root, path.name).read_bytes())
         running = job["status"] == "running" and metadata_running()
         message = job["message"]
         if job["status"] == "running" and not running:
@@ -4261,7 +4649,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         web_url = request.url_root.rstrip("/")
         sample_query = "YOUR_SEARCH_TERM"
         evidence_ids = []
-        if store:
+        if current_store:
+            evidence_ids = ["core"]
+        elif store:
             if project_root and not (project_root / "registry/active.json").is_file():
                 evidence_ids = list(store.defaults)
             else:
@@ -4283,7 +4673,11 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         mcp_arguments = ["make", "mcp"]
         if project_root:
             mcp_arguments.append("PROJECT_ROOT=" + str(project_root))
-        if store:
+        if current_store:
+            mcp_arguments.append("CURRENT_STATE=" + str(current_store))
+            if allow_current_metadata:
+                mcp_arguments.append("CURRENT_METADATA=1")
+        elif store:
             mcp_arguments.extend(["COLLECTION_REGISTRY=" + str(store.root),
                                   "COLLECTIONS=" + " ".join(sorted(store.allowed)),
                                   "DEFAULT_COLLECTIONS=" + " ".join(store.defaults)])
@@ -4309,8 +4703,12 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             "Search for a topic in the core papers, retrieve source context for a matching passage, and explain what that "
             "passage supports. Cite the publication DOI/PMID, source/unit IDs, checksum, release/snapshot and "
             "original page/Office locator. Preserve denominators, uncertainty, cohort overlap and extraction/OCR "
-            "warnings. For bibliography lookups, use get_publication in a kind='catalog' collection from "
-            "list_collections, keeping the same snapshot_id, even if the publication_id came from evidence. "
+            "warnings. "
+            + ("This current-state endpoint does not authorize a metadata catalog; do not assume one is available. "
+               if current_store and not allow_current_metadata else
+               "For bibliography lookups, use get_publication in a kind='catalog' collection from "
+               "list_collections, keeping the same snapshot_id, even if the publication_id came from evidence. ")
+            +
             "No matching passage is not proof of no evidence. Do not invent references or file links."
             " To read a whole retained PDF, use get_source_document with the source_id from its citation. "
             "Follow next_offset until null with the same source, collection and snapshot. Preserve the "
@@ -4325,7 +4723,10 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             "<pre>make setup\n" + escape(mcp_command) + "</pre>"
             + help_note("Starting MCP", "<p>Use this start command to serve the same evidence configuration as this website. "
             "Initialize the project and attach at least one PDF before starting MCP. "
-            "<code>PROJECT_ROOT</code> selects research data; <code>CLIENT_PROJECT</code> selects "
+            + ("<code>CURRENT_STATE</code> selects the same current paper store as this website; "
+               "old pinned requests become unavailable when published evidence changes. " if current_store else
+               "<code>PROJECT_ROOT</code> selects research data; ")
+            + "<code>CLIENT_PROJECT</code> selects "
             "the directory where Claude Code's connection is registered.</p>")
             + "<p>Leave MCP running. Use another terminal for the commands below.</p>"
             "<h3>2. Connect</h3>"
@@ -4498,7 +4899,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 + "</ul>" + "".join(warnings) + "</details>"
                 + '<pre class="reading" id="document-text">' + "\n\n".join(text) + "</pre>"
                 + "<details><summary>Copy document citation</summary>"
-                + copy_field("citation", "Citation and stable link", citation)
+                + copy_field("citation", "Citation and current link" if current_store else "Citation and stable link", citation)
                 + '<p id="copy-status" role="status" aria-live="polite"></p></details>')
         return page("Read whole document", body, reader_script=True)
 
@@ -4559,7 +4960,8 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if project_root and relationship:
             from .build import project_index
             papers = {collections.publication(row["doi"]) for row in
-                      project_index.library_page(project_root, relationship=relationship, select_all=True)["rows"]
+                      project_index.library_page(project_root, relationship=relationship, select_all=True,
+                                                 current_store=current_store)["rows"]
                       if row["doi"]}
             selected = contracts.request("search_evidence", arguments)
             result, references = current._search(scope["collections"], selected, papers=papers)
@@ -4594,6 +4996,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                      + ("search scope" if project_root else "collection") + '. This is not proof of no evidence.</p>')
         params = {**pin, "query": query, **({"relationship": relationship} if project_root else
                                         {"collection": cid} if store else {})}
+        if current_store:
+            body += ('<p>Reader links identify the current published evidence. They stop working when '
+                     'published evidence changes; start a new search for the latest version.</p>')
         body += '<nav class="pager">'
         for position, label in ((max(0, offset - 5) if offset else None, "Previous results"),
                                 (response["result"]["next_offset"], "Next results")):
@@ -4653,8 +5058,13 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             if position is not None:
                 body += f'<a href="{escape(reader_url(pin, cid, unit, offset=position), quote=True)}">{label}</a> '
         units = sorted(evidence.source_units(source_id), key=quality_order)
-        position = next(index for index, item in enumerate(units) if item["id"] == unit_id)
-        for adjacent, label in ((position - 1, "Previous retained location"), (position + 1, "Next retained location")):
+        spans = unit.get("passage_context", {}).get("source_spans", [])
+        source_ids = {span["unit_id"] for span in spans} if spans else {unit_id}
+        positions = [index for index, item in enumerate(units) if item["id"] in source_ids]
+        if not positions or len(positions) != len(source_ids):
+            raise releases.ReleaseError("Reader passage refers to missing source locations")
+        for adjacent, label in ((min(positions) - 1, "Previous retained location"),
+                                (max(positions) + 1, "Next retained location")):
             if 0 <= adjacent < len(units):
                 body += f'<a href="{escape(reader_url(pin, cid, units[adjacent]), quote=True)}">{label}</a> '
         body += '</nav>'
@@ -4662,12 +5072,14 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             body += (f'<p><a class="button secondary" href="{escape(document_reader_url(pin, cid, source_id), quote=True)}">'
                      'Read whole document</a> - all retained pages in one continuous view.</p>')
         if project_root and cid == "core":
-            body += (f'<p><a href="{escape(paper_url(collections.publication(source["doi"])) + "#" + unit_id, quote=True)}">'
+            page_id = units[min(positions)]["id"]
+            body += (f'<p><a href="{escape(paper_url(collections.publication(source["doi"])) + "#" + page_id, quote=True)}">'
                      'View and correct this page in the active evidence version</a></p>')
         body += '<details><summary>Copy citation and excerpt</summary>'
         body += help_note("Copying citations", "<p>These fields are selectable even if clipboard access is unavailable. "
                               "The excerpt includes only this text slice; follow Next text slice to read more.</p>")
-        for key, label, value in (("citation", "Citation and stable link", citation), ("excerpt", "Cited excerpt", excerpt)):
+        for key, label, value in (("citation", "Citation and current link" if current_store else "Citation and stable link", citation),
+                                  ("excerpt", "Cited excerpt", excerpt)):
             body += copy_field(key, label, value)
         body += '<p id="copy-status" role="status" aria-live="polite"></p></details>'
         article_url = publication_url(source["doi"])
@@ -4689,11 +5101,15 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         return Response(READER_SCRIPT, mimetype="text/javascript")
 
     def quality_page(error=None, status_code=200):
-        if store and store.public_quality_root is not None:
+        if store and not current_store and store.public_quality_root is not None:
             raise releases.AccessDeniedError("Operator quality pages are development-only")
         if set(request.args) - {"collection", "snapshot_id", "finding", "offset", "text_offset", "show", "kind", "unit_id", "unit_offset", "notice"}:
             raise ValueError("Unknown quality parameter")
-        if project_root:
+        if current_store:
+            current, _ = project_current_store.editorial_collection(current_store)
+            if not error and request.args.get("snapshot_id") and request.args["snapshot_id"] != current.release_id:
+                raise collections.SnapshotUnavailable("Editorial drafts changed; reload Data quality")
+        elif project_root:
             from .build import project_text
             workspace = project_text.editorial_store(project_root)
             current = (workspace.load(request.args["snapshot_id"]) if request.args.get("snapshot_id")
@@ -4787,6 +5203,11 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     "or edit extracted data. "
                     "Reviews require comparison with the original; known errors must be repaired, not waived. "
                     "Original files are accessed at their publication source, never served here.</p></details>")
+            if current_store:
+                body += ('<p>Reviews and inventories are stored separately in this current-state store; '
+                         'records present at preparation may have been copied from the normal project. '
+                         'The two sets do not synchronize. '
+                         'Back up this store’s quality directory separately from paper-state exports.</p>')
         if selected:
             finding = next((item for item in report["findings"] if item["id"] == selected), None)
             if finding is None:
@@ -4927,12 +5348,14 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                 elif finding["code"] == "missing_unit":
                     body += ('<details><summary>Add missing page text</summary>'
                              '<p>Enter the complete transcription after comparing with the original PDF. '
-                             'Saving creates and activates a new version, preserving previous evidence.</p>'
+                             + ('Saving changes the draft only; publish separately to update AI evidence.</p>'
+                                if current_store else
+                                'Saving creates and activates a new version, preserving previous evidence.</p>')
                              + action_form("repair", operator_fields
                                  + '<label>Complete page text <textarea name="text" required maxlength="1000000">'
                                  + escape(request.form.get("text", "")) + '</textarea></label>'
                                  '<label><input type="checkbox" name="checked" value="yes" required> '
-                                 'I checked this transcription against the original PDF and want to save a new version.</label>',
+                                 'I checked this transcription against the original PDF and want to save it.</label>',
                                  "Save missing page") + '</details>')
             elif unit_id or finding["code"] == "missing_unit":
                 body += '<p>Text editing is available in private project libraries.</p>'
@@ -4989,7 +5412,9 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
             "review": "Comparison recorded. This does not imply scientific validation.",
             "problem": "Extraction error recorded; it remains a blocker until corrected.",
             "inventory": "Location inventory saved. Text still needs comparison with the original.",
-            "repair": "Missing page saved in a new evidence version. Previous evidence is preserved.",
+            "repair": ("Missing page saved in the draft. Publish separately to update AI evidence."
+                       if current_store else
+                       "Missing page saved in a new evidence version. Previous evidence is preserved."),
         }
         notice = request.args.get("notice", "")
         if notice and notice not in notices:
@@ -5003,14 +5428,19 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         return response
 
     def quality_action():
-        if store and store.public_quality_root is not None:
+        if store and not current_store and store.public_quality_root is not None:
             raise releases.AccessDeniedError("Operator quality actions are development-only")
         if not hmac.compare_digest(request.form.get("token", ""), provide_token):
             return Response("Quality form expired; reload the page.", status=403, mimetype="text/plain")
         try:
-            with discovery_lock:
+            if current_store:
+                from .build import literature_update
+            with discovery_lock, (literature_update.writer_lock(current_store) if current_store else nullcontext()):
                 require_idle_project()
-                if project_root:
+                revisions = None
+                if current_store:
+                    current, revisions = project_current_store.editorial_collection(current_store)
+                elif project_root:
                     from .build import project_text
                     current = project_text.editorial_store(project_root).current()
                 else:
@@ -5081,12 +5511,16 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
                     from .build import project_edit
                     source = next(item for item in evidence._bundle["sources"] if item["id"] == finding["source_id"])
                     bibliography = source.get("bibliography") or {}
-                    project_edit.correct(project_root, snapshot_id=current.release_id, source_id=source["id"],
-                        unit_id=None, missing_locator=finding["locator"], text=request.form.get("text", ""),
+                    arguments = dict(source_id=source["id"], unit_id=None, missing_locator=finding["locator"],
+                        text=request.form.get("text", ""),
                         bibliography={key: bibliography.get(key) or "" for key in project_edit.BIB_FIELDS},
-                        source_url=source["url"] or "", tables=[], reviewer=reviewer, reason=note,
-                        checked=request.form.get("checked") == "yes")
-                    store.clear_cache()
+                        source_url=source["url"] or "", tables=[], reviewer=reviewer, reason=note)
+                    if current_store:
+                        current_paper_edit("save", revision=revisions[source["id"]], **arguments)
+                    else:
+                        project_edit.correct(project_root, snapshot_id=current.release_id,
+                                             checked=True, **arguments)
+                        store.clear_cache()
                 else:
                     raise ValueError("Unknown quality action")
         except releases.AccessDeniedError:
@@ -5097,6 +5531,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         return redirect("/quality?" + urlencode({"collection": cid, "notice": action}), code=303)
 
     app = Flask(__name__, static_folder=None)
+    app.config["CURRENT_STATE_EDITOR"] = bool(current_store)
     app.extensions["citation_discovery"] = discovery_state
     app.extensions["metadata_update"] = metadata_state
     app.extensions["core_purge"] = purge_state
@@ -5166,7 +5601,7 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
     app.add_url_rule("/settings/purge-progress", "purge_progress", purge_progress, methods=["GET"])
     app.add_url_rule("/library/provide", "provide", provide, methods=["POST"])
     app.config["MAX_CONTENT_LENGTH"] = 65 * 1024 * 1024
-    if can_provide() and (data_root / "releases/provided-sources/ledger.json").exists():
+    if not current_store and can_provide() and (data_root / "releases/provided-sources/ledger.json").exists():
         from .build import provided_sources
         if provided_sources.pending(data_root):
             start_provider()
@@ -5181,13 +5616,33 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         origin = request.headers.get("origin")
         if origin is not None and origin not in local_origins:
             return Response("Untrusted origin", status=403, mimetype="text/plain")
+        if current_store:
+            if request.method == "GET" and request.path == "/":
+                return redirect("/library", code=303)
+            allowed = {
+                "GET": {"/healthz", "/library", "/discovery", "/search", "/sources", "/read", "/document", "/reader.js", "/connect", "/quality",
+                        "/settings", "/settings/pdf-progress", "/library/paper", "/library/edit",
+                        "/library/batch", "/library/batch/confirm", "/library.js", "/publications", "/coverage",
+                        "/settings/metadata-progress",
+                        "/library/paper/pdf", "/library/paper/pdf-page", "/style.css", "/appearance.js",
+                        "/help.js", "/paper-editor.js", "/rag-editor.js", "/paper-editor-licenses.txt"},
+                "POST": {"/library/edit", "/library/paper/publication", "/library/paper/rag", "/library/batch", "/quality",
+                         "/settings/add-papers", "/settings/import-papers", "/settings/attach-pdf",
+                         "/settings/find-pdf", "/settings/git-markdown", "/settings/openalex-key",
+                         "/settings/configure-metadata", "/discovery"},
+            }
+            if request.path not in allowed.get(request.method, set()) and not (
+                    request.method == "GET" and request.endpoint == "api"):
+                return Response("Not available in the experimental current-state editor.", status=404,
+                                mimetype="text/plain")
         if request.endpoint == "health":
             return None
         pause_batch = (batch_running() and request.path == "/library/batch"
                        and request.method == "POST" and request.form.get("action") == "pause")
         if pdf_running() and request.method != "GET" and not pause_batch:
             return error_response("PDF search is running; retry after it finishes.", "project_busy", 503)
-        if purge_running() and request.path not in {"/settings/purge-progress", "/style.css"}:
+        if purge_running() and request.path not in {"/settings/purge-progress", "/style.css",
+                                                    "/appearance.js", "/help.js"}:
             if request.method == "GET" and not request.path.startswith("/api/"):
                 return redirect("/settings/purge-progress")
             return error_response("Permanent core-paper removal is running; retry after it finishes.",
@@ -5199,9 +5654,13 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
         if request.path in {"/search", "/read", "/document"}:
             response = page("Evidence request could not be completed",
                             f"<p>{escape(message)}</p><p>Check the query, collection and source link. "
-                            "Unavailable snapshots are not silently replaced with current evidence. "
-                            '<a href="/search">Start a new search</a> against the active snapshot, '
-                            "or ask the operator to restore the requested snapshot. Search needs at least one word or number.</p>")
+                            + ("Old reader links are not retained after published evidence changes. "
+                               '<a href="/search">Start a new search</a> against current published evidence. '
+                               if current_store else
+                               "Unavailable snapshots are not silently replaced with current evidence. "
+                               '<a href="/search">Start a new search</a> against the active snapshot, '
+                               "or ask the operator to restore the requested snapshot. ")
+                            + "Search needs at least one word or number.</p>")
             response.status_code = status
             return response
         return Response(message, status=status, mimetype="text/plain")
@@ -5227,10 +5686,30 @@ def create_app(*, release=None, registry=None, profiles, allowed_collections=Non
 
     def invalid_input(error):
         diagnostic("web_rejected", exception_type=type(error).__name__)
+        if current_store and (current_store / "markdown-transaction.json").exists():
+            return error_response("Git Markdown refresh was interrupted. Stop this editor and run "
+                                  "recover-current-markdown with the original repository; the paper may already "
+                                  + ("have tracking enabled." if request.endpoint == "configure_git_markdown"
+                                     else "have been attached." if request.endpoint in {"attach_project_pdf", "batch_action", "batch_page", "batch_confirm"}
+                                     else "have been saved."), "markdown_recovery_required", 503)
+        if current_store and (current_store / "membership-transaction.json").exists():
+            return error_response("Paper membership update was interrupted. Stop this editor and run "
+                                  "recover-current-store; the paper may already have been attached.",
+                                  "membership_recovery_required", 503)
         return error_response("Invalid request or unavailable collection.", "invalid_input", 400)
 
     def unavailable(error):
         diagnostic("web_unavailable", exception_type=type(error).__name__)
+        if current_store and (current_store / "markdown-transaction.json").exists():
+            return error_response("Git Markdown refresh was interrupted. Stop this editor and run "
+                                  "recover-current-markdown with the original repository; the paper may already "
+                                  + ("have tracking enabled." if request.endpoint == "configure_git_markdown"
+                                     else "have been attached." if request.endpoint in {"attach_project_pdf", "batch_action", "batch_page", "batch_confirm"}
+                                     else "have been saved."), "markdown_recovery_required", 503)
+        if current_store and (current_store / "membership-transaction.json").exists():
+            return error_response("Paper membership update was interrupted. Stop this editor and run "
+                                  "recover-current-store; the paper may already have been attached.",
+                                  "membership_recovery_required", 503)
         return error_response("Evidence unavailable; check operator logs.", "unavailable", 503)
 
     for exception in (retrieval.RetrievalError, ValidationError, ValueError):
@@ -5259,6 +5738,7 @@ def main():
     roots = parser.add_mutually_exclusive_group(required=True)
     roots.add_argument("--release", type=Path)
     roots.add_argument("--registry", type=Path)
+    roots.add_argument("--current-state", type=Path, help="Experimental isolated current-state editor")
     parser.add_argument("--allow-profile", required=True, action="append", choices=sorted(releases.PROFILES))
     parser.add_argument("--allow-collection", action="append")
     parser.add_argument("--default-collection", action="append")
@@ -5269,14 +5749,27 @@ def main():
     parser.add_argument("--project-root", type=Path, help="Enable project initialization and reset settings")
     parser.add_argument("--pdf-data-root", type=Path, default=Path("releases/pdf-data"),
                         help="Shared local PDF folder offered in project settings")
+    parser.add_argument("--experimental-markdown-repository", type=Path,
+                        help="Separate Git repository root for experimental current-state Markdown views")
+    parser.add_argument("--confirm-markdown-rights", action="store_true",
+                        help="Confirm authorization to place paper text in that Git repository and its remote")
+    parser.add_argument("--allow-current-metadata", action="store_true",
+                        help="Authorize the current-store catalog for evidence API snapshot consistency")
     args = parser.parse_args()
     try:
         app = create_app(release=args.release, registry=args.registry, profiles=set(args.allow_profile),
                          allowed_collections=args.allow_collection, default_collections=args.default_collection,
                          port=args.port, mcp_url=args.mcp_url, data_root=args.data_root, quality_root=args.quality_root,
-                         project_root=args.project_root, pdf_data_root=args.pdf_data_root)
+                         project_root=args.project_root, pdf_data_root=args.pdf_data_root,
+                         current_store=args.current_state,
+                         experimental_markdown_repository=args.experimental_markdown_repository,
+                         confirm_markdown_rights=args.confirm_markdown_rights,
+                         allow_current_metadata=args.allow_current_metadata)
     except (OSError, ValueError, sqlite3.Error, ValidationError) as error:
-        diagnostic("web_startup_failed", exception_type=type(error).__name__)
+        fields = {"exception_type": type(error).__name__}
+        if args.current_state and isinstance(error, ValueError):
+            fields["message"] = str(error)
+        diagnostic("web_startup_failed", **fields)
         return 1
     diagnostic("web_starting", url=f"http://127.0.0.1:{args.port}")
     app.run(host="127.0.0.1", port=args.port, debug=False, use_reloader=False)

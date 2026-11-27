@@ -26,7 +26,7 @@ from test_releases import fixture_bundle
 @contextmanager
 def running_server(root, release, profiles=("synthetic",), store=None, extra=(), python=None, tls=False,
                    collection_registry=None, allowed_collections=(), default_collections=(),
-                   startup_timeout=15):
+                   startup_timeout=15, current_state=None):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -38,7 +38,8 @@ def running_server(root, release, profiles=("synthetic",), store=None, extra=(),
     with tempfile.TemporaryFile(mode="w+") as log:
         process = subprocess.Popen([
             python or sys.executable, "-m", "research_library.http_server",
-            *(["--registry", str(collection_registry)] if collection_registry else
+            *(["--current-state", str(current_state)] if current_state else
+              ["--registry", str(collection_registry)] if collection_registry else
               ["--store", str(store)] if store else ["--release", str(release)]),
             *(argument for cid in allowed_collections for argument in ("--allow-collection", cid)),
             *(argument for cid in default_collections for argument in ("--default-collection", cid)),

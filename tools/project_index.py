@@ -38,29 +38,77 @@ def discovery_titles(graph):
     }
 
 
-def _state(root):
-    paths = [root / "project.json", root / "registry/active.json", root / "editorial/active.json"]
+def discovery_runs(root, current_store=None):
+    folders = [Path(root) / "discovery"]
+    if current_store is not None:
+        folders.append(Path(current_store) / "discovery")
+    runs = {}
+    for folder in folders:
+        if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
+            raise ValueError("Invalid discovery directory")
+        for path in sorted(folder.iterdir()) if folder.exists() else []:
+            if (not path.is_dir() or path.is_symlink() or len(path.name) != 32
+                    or any(c not in "0123456789abcdef" for c in path.name)
+                    or not (path / "job.json").is_file()):
+                continue
+            if path.name in runs:
+                raise ValueError("Duplicate discovery run ID across project and current store")
+            runs[path.name] = path
+    return runs
+
+
+def _state(root, *, current_state=None, current_store=None):
+    paths = ([] if current_state is not None else
+             [root / "project.json", root / "registry/active.json", root / "editorial/active.json"])
     searches = []
-    discovery = root / "discovery"
-    for folder in sorted(discovery.iterdir()) if discovery.exists() else []:
-        if (not folder.is_dir() or folder.is_symlink() or len(folder.name) != 32
-                or any(c not in "0123456789abcdef" for c in folder.name)
-                or not (folder / "job.json").is_file()):
-            continue
+    for folder in discovery_runs(root, current_store).values():
         job = releases.read_json(releases.safe_file(folder, "job.json").read_bytes())
         searches.append((folder.name, job))
         if (folder / "neighborhood.json").is_file():
             paths.append(releases.safe_file(folder, "neighborhood.json"))
     signature = releases.encode({
         "version": 5,
-        "files": [[str(path.relative_to(root)), project_purge._file_version(path)]
+        "files": [[str(path), project_purge._file_version(path)]
                   for path in paths if path.exists()],
+        **({"current_state": releases.sha256(releases.encode({
+            "papers": current_state["project"]["papers"], "status": _current_status(current_state)}))}
+           if current_state is not None else {}),
     }).decode()
     return signature, searches
 
 
-def _rebuild(root, destination, signature, searches):
-    status = project_library.status(root)
+def _current_status(state):
+    from . import project_text
+
+    project = state["project"]
+    editorial = state["editorial"]["bundle"] if state["editorial"] else project_text.empty_bundle()
+    published = state["published"]["bundle"] if state["published"] else project_text.empty_bundle()
+    sources = {source["doi"].lower(): source for source in editorial["sources"]}
+    def per_source(bundle):
+        result = {source["id"]: {**project_text.empty_bundle(), "sources": [source]}
+                  for source in bundle["sources"]}
+        for section in ("units", "tables"):
+            for item in bundle[section]:
+                result[item["citation"]["source_id"]][section].append(item)
+        return result
+
+    editorial_papers, published_papers = per_source(editorial), per_source(published)
+
+    def row(doi, title):
+        source = sources.get(doi)
+        return {"doi": doi, "title": ((source.get("bibliography") or {}).get("title") or title)
+                if source else title,
+                "status": (project_text.publication_state(
+                               editorial_papers[source["id"]],
+                               published_papers.get(source["id"], project_text.empty_bundle()), source["id"])
+                           if source else "awaiting_pdf")}
+
+    return {"papers": [row(doi, entry["title"]) for doi, entry in sorted(project["papers"].items())],
+            "discovered": [row(doi, doi) for doi in sorted(sources) if doi not in project["papers"]]}
+
+
+def _rebuild(root, destination, signature, searches, *, current_state=None, current_store=None):
+    status = project_library.status(root) if current_state is None else _current_status(current_state)
     extracted = {paper["doi"]: LABELS[paper["status"]] for paper in status["discovered"]}
     extracted_titles = {paper["doi"]: paper["title"] for paper in status["discovered"]}
     with closing(sqlite3.connect(destination)) as connection:
@@ -87,8 +135,9 @@ def _rebuild(root, destination, signature, searches):
                 collections.publication(paper["doi"]), paper["doi"], paper["title"], 1,
                 LABELS[paper["status"]], int(not paper["title"]), paper["title"].casefold(),
                 (paper["title"] + " " + paper["doi"]).casefold()))
+        folders = discovery_runs(root, current_store)
         for run, _ in searches:
-            path = root / "discovery" / run / "neighborhood.json"
+            path = folders[run] / "neighborhood.json"
             if not path.is_file():
                 continue
             graph = releases.read_json(releases.safe_file(path.parent, path.name).read_bytes())
@@ -132,6 +181,14 @@ def _rebuild(root, destination, signature, searches):
                 WHERE id=?4
             """, metadata)
             del graph, titles, records, connections
+        if current_state is not None:
+            for paper in status["discovered"]:
+                title, doi = paper["title"], paper["doi"]
+                connection.execute("""
+                    INSERT OR IGNORE INTO papers (id,doi,title,core,status,untitled,sort_title,search_text)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (collections.publication(doi), doi, title, 0, LABELS[paper["status"]],
+                      int(not title), title.casefold(), (title + " " + doi).casefold()))
         connection.execute("""
             UPDATE papers SET library_groups=rtrim(
                 CASE WHEN core=1 THEN 'Core papers; ' ELSE '' END ||
@@ -149,9 +206,16 @@ def _rebuild(root, destination, signature, searches):
         connection.commit()
 
 
+def _index_path(root, current_store):
+    if current_store is None:
+        return root / "library-index.sqlite"
+    identity = releases.sha256(releases.encode(str(Path(current_store).absolute())))
+    return root / ("library-index-current-" + identity + ".sqlite")
+
+
 def library_page(root, query="", offset=0, limit=50, *, relationship="", status="", title_filter="", doi_filter="",
                  first_author_filter="", year_filter="", journal_filter="", sort="", order="asc", select_all=False,
-                 paper_id=None):
+                 paper_id=None, current_store=None):
     root = Path(root).absolute()
     if offset < 0 or not 1 <= limit <= 100:
         raise ValueError("Invalid Library pagination")
@@ -164,9 +228,14 @@ def library_page(root, query="", offset=0, limit=50, *, relationship="", status=
                       "year": year_filter, "journal": journal_filter}
     if year_filter and not re.fullmatch(r"\d{4}", year_filter):
         raise ValueError("Publication year must be four digits")
-    path = root / "library-index.sqlite"
+    path = _index_path(root, current_store)
     with literature_update.writer_lock(root):
-        signature, searches = _state(root)
+        if current_store is not None:
+            from . import project_current_store
+            current_state = project_current_store.read(current_store)
+        else:
+            current_state = None
+        signature, searches = _state(root, current_state=current_state, current_store=current_store)
         if path.is_symlink():
             raise ValueError("Symlinked Library index")
         current = None
@@ -178,8 +247,9 @@ def library_page(root, query="", offset=0, limit=50, *, relationship="", status=
             descriptor, temporary = tempfile.mkstemp(prefix=".library-index-", suffix=".sqlite", dir=root)
             os.close(descriptor)
             try:
-                _rebuild(root, temporary, signature, searches)
-                if _state(root)[0] != signature:
+                _rebuild(root, temporary, signature, searches, current_state=current_state, current_store=current_store)
+                latest_state = project_current_store.read(current_store) if current_store is not None else None
+                if _state(root, current_state=latest_state, current_store=current_store)[0] != signature:
                     raise ValueError("Project changed while indexing Library; reload to retry")
                 os.replace(temporary, path)
             finally:
@@ -230,20 +300,26 @@ def library_page(root, query="", offset=0, limit=50, *, relationship="", status=
                 row["relations"] = {(link["direction"], link["seed"]) for link in links}
                 row["runs"] = {link["run"] for link in links}
     return {"rows": rows, "total": total, "core_count": core_count, "matching": matching,
-            "searches": searches, "core": project_library.load(root)["papers"]}
+            "searches": searches, "core": (current_state["project"] if current_state is not None
+                                            else project_library.load(root))["papers"]}
 
 
-def paper_detail(root, identity, *, include_metadata=True):
+def paper_detail(root, identity, *, include_metadata=True, current_store=None):
     """Return one exact Library record and its saved, one-hop citation relationships."""
     root = Path(root).absolute()
-    result = library_page(root, paper_id=identity)
+    with literature_update.writer_lock(root):
+        return _paper_detail(root, identity, include_metadata=include_metadata, current_store=current_store)
+
+
+def _paper_detail(root, identity, *, include_metadata, current_store):
+    result = library_page(root, paper_id=identity, current_store=current_store)
     if not result["rows"]:
         raise ValueError("Paper no longer exists in Library")
     paper = result["rows"][0]
     related = {"references": {}, "citing": {}}
     runs = set(paper["runs"])
     records = []
-    with closing(sqlite3.connect((root / "library-index.sqlite").as_uri() + "?mode=ro", uri=True)) as connection:
+    with closing(sqlite3.connect(_index_path(root, current_store).as_uri() + "?mode=ro", uri=True)) as connection:
         connection.row_factory = sqlite3.Row
         links = connection.execute("""
             SELECT c.paper,c.seed,c.direction,p.title,p.doi

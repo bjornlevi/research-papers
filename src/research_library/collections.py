@@ -1,6 +1,7 @@
 """Independent evidence collections, immutable registry snapshots and scoped search."""
 
 import argparse
+from abc import ABC, abstractmethod
 from contextlib import closing
 from copy import deepcopy
 from datetime import date
@@ -327,7 +328,28 @@ class CollectionSnapshot:
         return response
 
 
-class CollectionStore:
+class CollectionEndpoint(ABC):
+    """A read-only collection endpoint supporting pinned requests."""
+
+    @abstractmethod
+    def current(self):
+        pass
+
+    @abstractmethod
+    def load(self, snapshot_id):
+        pass
+
+    def call(self, tool, arguments):
+        selected = contracts.request(tool, arguments)
+        snapshot = self.load(selected["snapshot_id"]) if "snapshot_id" in selected else self.current()
+        if (selected.get("offset", 0) > 0 or tool not in
+                ("search_evidence", "list_sources", "list_publications", "catalog_status",
+                 "corpus_status", "list_collections")) and "snapshot_id" not in selected:
+            raise retrieval.RetrievalError("Pin snapshot_id for pagination and record retrieval")
+        return snapshot.call(tool, arguments)
+
+
+class CollectionStore(CollectionEndpoint):
     """One operator writer; immutable registries plus an atomic active pointer."""
 
     def __init__(self, root, *, allowed_profiles, allowed_collections, defaults=None, public_quality_root=None):
@@ -469,15 +491,6 @@ class CollectionStore:
     def clear_cache(self):
         with self._lock:
             self._cached = None
-
-    def call(self, tool, arguments):
-        selected = contracts.request(tool, arguments)
-        snapshot = self.load(selected["snapshot_id"]) if "snapshot_id" in selected else self.current()
-        if (selected.get("offset", 0) > 0 or tool not in
-                ("search_evidence", "list_sources", "list_publications", "catalog_status",
-                 "corpus_status", "list_collections")) and "snapshot_id" not in selected:
-            raise retrieval.RetrievalError("Pin snapshot_id for pagination and record retrieval")
-        return snapshot.call(tool, arguments)
 
     def publish(self, document):
         self.validate_document(document)

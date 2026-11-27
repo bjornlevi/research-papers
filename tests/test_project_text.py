@@ -105,8 +105,14 @@ class ProjectTextTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
-    def test_git_markdown_tracking_backfills_and_keeps_each_version(self):
+    def test_git_markdown_tracking_keeps_current_files_and_preserves_old_exports(self):
         subprocess.run(["git", "init", "-q", str(self.root.parent)], check=True)
+        staged_file = self.root.parent / "already-staged.txt"
+        staged_file.write_text("Preserve the user's staging.\n")
+        subprocess.run(["git", "-C", str(self.root.parent), "add", "--", staged_file.name], check=True)
+        old = self.root.parent / "project-markdown" / literature_text.slug(self.source) / ("draft-" + "a" * 64 + ".md")
+        old.parent.mkdir(parents=True)
+        old.write_text("Older retained export.\n")
         client = web_server.create_app(registry=self.root / "registry", project_root=self.root,
             profiles={"private_context"}, allowed_collections={"core"}, default_collections=["core"]).test_client()
         settings = client.get("/settings", base_url="http://localhost:8080").get_data(as_text=True)
@@ -122,8 +128,13 @@ class ProjectTextTests(unittest.TestCase):
         self.assertEqual(enabled.status_code, 200)
         self.assertIn("1 current versions exported", enabled.get_data(as_text=True))
         output = self.root.parent / "project-markdown"
-        initial = next(output.glob("*/draft-*.md"))
+        initial = output / literature_text.slug(self.source) / "draft.md"
         self.assertIn("Drafttoken original article page 1", initial.read_text())
+        index_name = "project-markdown/index.md"
+        subprocess.run(["git", "-C", str(self.root.parent), "add", "--", index_name], check=True)
+        staged_index = subprocess.run(
+            ["git", "-C", str(self.root.parent), "show", ":" + index_name],
+            capture_output=True, text=True, check=True).stdout
         project_library.register(self.root, [{"doi": "10.0000/extracted", "title": "Extracted article"}])
         extracted_pdf = self.root.parent / "extracted.pdf"
         native_text = "Freshly extracted synthetic page with enough native text for this fixture."
@@ -132,12 +143,14 @@ class ProjectTextTests(unittest.TestCase):
             pdf.save(extracted_pdf)
         attached = project_library.attach(self.root, "10.0000/extracted", extracted_pdf, identity_confirmed=True)
         self.assertIsNone(attached["ocr"])
-        extracted = next(output.glob("*/extracted-*.md"))
+        sources = project_text.editorial_store(self.root).current().snapshots["core"]._bundle["sources"]
+        extracted_source = next(value for value in sources if value["doi"] == "10.0000/extracted")
+        extracted = output / literature_text.slug(extracted_source) / "draft.md"
         self.assertIn(native_text, extracted.read_text())
         self.assertEqual(subprocess.run(
             ["git", "-C", str(self.root.parent), "ls-files", "--error-unmatch",
              extracted.relative_to(self.root.parent).as_posix()],
-            capture_output=True, check=False).returncode, 0)
+            capture_output=True, check=False).returncode, 1)
 
         current = project_text.editorial_store(self.root).current()
         project_edit.correct(
@@ -149,8 +162,8 @@ class ProjectTextTests(unittest.TestCase):
                 "units": [None, None], "rows": [["Count", 3]], "footnotes": ["Synthetic fixture."],
             }], reviewer="Synthetic admin", reason="Track markdown versions", checked=False)
         current = project_text.editorial_store(self.root).current()
-        latest_draft_path = (output / literature_text.slug(self.source)
-                             / f"draft-{current.snapshots['core'].release_id}.md")
+        latest_draft_path = output / literature_text.slug(self.source) / "draft.md"
+        self.assertEqual(latest_draft_path, initial)
         self.assertTrue(latest_draft_path.is_file())
         latest_draft = latest_draft_path.read_text()
         self.assertIn("Edited markdown with a structured table.", latest_draft)
@@ -159,21 +172,59 @@ class ProjectTextTests(unittest.TestCase):
         self.assertEqual(subprocess.run(
             ["git", "-C", str(self.root.parent), "ls-files", "--error-unmatch",
              latest_draft_path.relative_to(self.root.parent).as_posix()],
-            capture_output=True, check=False).returncode, 0)
+            capture_output=True, check=False).returncode, 1)
         self.assertIn(initial.name, (output / "index.md").read_text())
+        self.assertEqual(old.read_text(), "Older retained export.\n")
 
         current = project_text.editorial_store(self.root).current()
-        publication = project_text.publish(
+        project_text.publish(
             self.root, snapshot_id=current.release_id, source_id=self.source["id"],
             reviewer="Synthetic admin", reason="Publish tracked markdown", checked=True)
-        published = (output / literature_text.slug(self.source)
-                     / f"published-{publication['release']}.md")
+        published = output / literature_text.slug(self.source) / "published.md"
         self.assertIn("Edited markdown with a structured table.", published.read_text())
+        self.assertIn("Content identity:", published.read_text())
         self.assertEqual(subprocess.run(
             ["git", "-C", str(self.root.parent), "ls-files", "--error-unmatch",
              published.relative_to(self.root.parent).as_posix()],
-            capture_output=True, check=False).returncode, 0)
+            capture_output=True, check=False).returncode, 1)
         self.assertIn("project-markdown", str(published))
+        staged_names = subprocess.run(
+            ["git", "-C", str(self.root.parent), "diff", "--cached", "--name-only"],
+            capture_output=True, text=True, check=True).stdout.splitlines()
+        self.assertEqual(staged_names, [staged_file.name, index_name])
+        self.assertEqual(subprocess.run(
+            ["git", "-C", str(self.root.parent), "show", ":" + index_name],
+            capture_output=True, text=True, check=True).stdout, staged_index)
+        status = subprocess.run(
+            ["git", "-C", str(self.root.parent), "status", "--short", "--untracked-files=all"],
+            capture_output=True, text=True, check=True).stdout
+        self.assertIn("AM " + index_name, status)
+        for path in (initial, extracted, latest_draft_path, published):
+            self.assertIn("?? " + path.relative_to(self.root.parent).as_posix(), status)
+
+        published_text = published.read_text()
+        current = project_text.editorial_store(self.root).current()
+        unit = current.snapshots["core"].document_units(self.source["id"])[0]
+        project_edit.correct(
+            self.root, snapshot_id=current.release_id, source_id=self.source["id"], unit_id=unit["id"],
+            text="Second draft remains unpublished.",
+            bibliography={key: value or "" for key, value in self.source["bibliography"].items()},
+            source_url=self.source["url"], tables=[], reviewer="Synthetic admin",
+            reason="Revise draft", checked=False)
+        self.assertIn("Second draft remains unpublished.", initial.read_text())
+        self.assertEqual(published.read_text(), published_text)
+        project_text.publish(self.root, snapshot_id=project_text.editorial_store(self.root).current().release_id,
+                             source_id=self.source["id"], reviewer="Synthetic admin",
+                             reason="Publish revision", checked=True)
+        self.assertIn("Second draft remains unpublished.", published.read_text())
+        self.assertEqual(set(path.name for path in published.parent.glob("*.md")),
+                         {"draft.md", "published.md", old.name})
+        project_text.unpublish(self.root, snapshot_id=project_library.store(self.root).current().release_id,
+                               source_id=self.source["id"], reviewer="Synthetic admin",
+                               reason="Withdraw", checked=True)
+        self.assertIn("not currently published", published.read_text())
+        self.assertIn("Second draft remains unpublished.", initial.read_text())
+        self.assertEqual(old.read_text(), "Older retained export.\n")
 
         disabled = client.post("/settings/git-markdown",
                                data={"token": token, "enabled": "false"},
@@ -181,6 +232,34 @@ class ProjectTextTests(unittest.TestCase):
         self.assertEqual(disabled.status_code, 200)
         self.assertTrue(initial.is_file())
         self.assertTrue(published.is_file())
+        self.assertEqual(old.read_text(), "Older retained export.\n")
+
+    def test_git_markdown_refuses_unmanaged_current_files(self):
+        subprocess.run(["git", "init", "-q", str(self.root.parent)], check=True)
+        directory = self.root.parent / "project-markdown" / literature_text.slug(self.source)
+        directory.mkdir(parents=True)
+        target = directory / "draft.md"
+        target.write_text("Personal file, not a generated view.\n")
+        snapshot = project_text.editorial_store(self.root).current().snapshots["core"]
+        with self.assertRaisesRegex(ValueError, "not generated"):
+            project_text.export_git_markdown(
+                self.root, snapshot._bundle, source_id=self.source["id"],
+                kind="draft", release_id=snapshot.release_id, force=True)
+        self.assertEqual(target.read_text(), "Personal file, not a generated view.\n")
+
+    def test_git_markdown_reenable_clears_stale_publication_view(self):
+        subprocess.run(["git", "init", "-q", str(self.root.parent)], check=True)
+        project_library.set_git_markdown_tracking(self.root, True)
+        self.publish()
+        published = self.root.parent / "project-markdown" / literature_text.slug(self.source) / "published.md"
+        previous = published.read_text()
+        project_library.set_git_markdown_tracking(self.root, False)
+        project_text.unpublish(self.root, snapshot_id=project_library.store(self.root).current().release_id,
+                               source_id=self.source["id"], reviewer="Tester", reason="Withdraw", checked=True)
+        self.assertEqual(published.read_text(), previous)
+        project_library.set_git_markdown_tracking(self.root, True)
+        self.assertIn("not currently published", published.read_text())
+        self.assertTrue((published.parent / "draft.md").is_file())
 
     def test_visual_editor_assets_fallback_and_safe_markdown_reading(self):
         markdown = ("## Checked heading\n\n**Bold** and *italic* [source](https://example.org/paper)\n\n"
@@ -783,6 +862,31 @@ class ProjectTextTests(unittest.TestCase):
         self.assertEqual(project_chunks.suggest_terms(after, [[1, 1], [2, 2]], [old]),
                          ({"2": "synonym"}, []))
         self.assertEqual(project_chunks.suggest_terms(after, [[1, 2]], [old]), ({}, [old]))
+
+    def test_rag_term_review_requires_current_anchors_not_old_snapshots(self):
+        draft = {"content_identity": "old", "plans": {"page": {"labels": {"1": "term"}}}}
+        with patch.object(project_library, "store", side_effect=AssertionError("Historical registry read")):
+            for identity in ("old", "new"):
+                with self.subTest(identity=identity):
+                    with self.assertRaisesRegex(ValueError, "passage anchors"):
+                        project_chunks.review_current_terms(draft, identity)
+            for anchor in ({}, {"digest": "bad", "excerpt": "text", "page": 1},
+                           {"digest": "a" * 64, "excerpt": "text", "page": 0}):
+                with self.subTest(anchor=anchor):
+                    with self.assertRaises(ValueError):
+                        project_chunks.review_current_terms(draft | {"term_anchors": {"1": anchor}}, "new")
+            anchor = {"digest": "a" * 64, "excerpt": "source passage", "page": 1}
+            valid = draft | {"term_anchors": {"1": anchor}}
+            self.assertEqual(project_chunks.review_current_terms(valid, "old"), [])
+            self.assertEqual(project_chunks.review_current_terms(valid, "new"), [{"terms": "term", **anchor}])
+            multiple = valid | {"plans": {"page1": {"labels": {"1": "term"}},
+                                         "page2": {"labels": {"2": "other"}}}}
+            with self.assertRaisesRegex(ValueError, "passage anchors"):
+                project_chunks.review_current_terms(multiple, "new")
+            second = {"digest": "b" * 64, "excerpt": "another passage", "page": 2}
+            multiple["term_anchors"] = {"1": anchor, "2": second}
+            self.assertEqual(project_chunks.review_current_terms(multiple, "new"),
+                             [{"terms": "term", **anchor}, {"terms": "other", **second}])
 
     def test_unpublish_preserves_editorial_history_other_sources_and_old_snapshots(self):
         project_library.register(self.root, [{"doi": "10.0000/other", "title": "Other source"}])
